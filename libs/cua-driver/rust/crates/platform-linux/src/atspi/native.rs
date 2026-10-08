@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use atspi::proxy::accessible::AccessibleProxy;
+use atspi::proxy::application::ApplicationProxy;
 use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::{CoordType, Interface, State, StateSet};
 use atspi_connection::AccessibilityConnection;
@@ -6181,7 +6182,12 @@ async fn web_document_origin_for_visited(
     combined
 }
 
+fn is_renderer_local_origin((x, y): (i32, i32)) -> bool {
+    (-2..=2).contains(&x) && (-2..=2).contains(&y)
+}
+
 fn screen_extent_rebase(
+    toolkit_name: Option<&str>,
     x11_origin: (i32, i32),
     accessible_frame_extents: (i32, i32, i32, i32),
     top_level: Option<(i32, i32, i32, i32)>,
@@ -6197,11 +6203,28 @@ fn screen_extent_rebase(
     if top_level == Some(accessible_frame_extents) {
         return None;
     }
-    if frame_x.abs() <= 2 && frame_y.abs() <= 2 {
+    // GTK can legitimately put a decorated frame at the screen origin. Its
+    // Screen coordinates are already absolute, so geometry alone cannot
+    // always distinguish it from Chromium's renderer-local provider.
+    if toolkit_name.is_some_and(|name| name.trim().eq_ignore_ascii_case("chromium"))
+        && is_renderer_local_origin((frame_x, frame_y))
+    {
         Some((x11_origin.0 - frame_x, x11_origin.1 - frame_y))
     } else {
         None
     }
+}
+
+async fn application_toolkit_name(acc: &AccessibleProxy<'_>) -> Option<String> {
+    let reference = call(acc.get_application()).await?.ok()?;
+    let builder = ApplicationProxy::builder(acc.inner().connection())
+        .cache_properties(atspi::zbus::proxy::CacheProperties::No)
+        .destination(reference.name_as_str()?.to_owned())
+        .ok()?
+        .path(reference.path_as_str().to_owned())
+        .ok()?;
+    let application = call(builder.build()).await?.ok()?;
+    call(application.toolkit_name()).await?.ok()
 }
 
 fn rebase_renderer_window_offset(
@@ -6314,11 +6337,10 @@ async fn element_bounds_for_visited(
     };
     // Chromium on X11 labels its component extents as Screen while
     // returning coordinates relative to the renderer frame. Rebase
-    // those values by comparing the top-level accessible frame with
-    // the actual X11 window origin. Correct screen-coordinate providers
-    // produce a zero delta; Chromium's local (0,0) frame produces the
-    // required window-origin delta. GTK's explicit Window-coordinate
-    // path above remains authoritative when available.
+    // those values only for the Chromium toolkit: a native decorated window
+    // at the screen origin has the same apparent geometry but already-correct
+    // Screen coordinates. GTK's explicit Window-coordinate path above remains
+    // authoritative when available.
     let screen_rebase = if offset.is_none() && !crate::wayland::is_wayland() && xid != 0 {
         let x11_origin = bounded_blocking(move || x11_window_origin(xid))
             .await
@@ -6347,8 +6369,14 @@ async fn element_bounds_for_visited(
                 },
                 _ => None,
             };
-            accessible_frame
-                .and_then(|frame_extents| screen_extent_rebase(origin, frame_extents, top_level))
+            if let Some(frame_extents) =
+                accessible_frame.filter(|extents| is_renderer_local_origin((extents.0, extents.1)))
+            {
+                let toolkit_name = application_toolkit_name(&frame.acc).await;
+                screen_extent_rebase(toolkit_name.as_deref(), origin, frame_extents, top_level)
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -7081,52 +7109,77 @@ mod coord_tests {
 
     #[test]
     fn screen_extents_are_rebased_from_accessible_frame_to_x11_origin() {
+        let chromium = Some("Chromium");
         let frame = Some((600, 50, 800, 600));
         assert_eq!(
-            screen_extent_rebase((604, 80), (0, 0, 792, 566), frame),
+            screen_extent_rebase(chromium, (604, 80), (0, 0, 792, 566), frame),
             Some((604, 80))
         );
         assert_eq!(
-            screen_extent_rebase((604, 100), (604, 80, 792, 566), frame),
+            screen_extent_rebase(Some("chromium"), (5, 29), (0, 0, 640, 480), None),
+            Some((5, 29))
+        );
+        assert_eq!(
+            screen_extent_rebase(chromium, (604, 100), (604, 80, 792, 566), frame),
             None
         );
         assert_eq!(
-            screen_extent_rebase((604, 80), (604, 80, 792, 566), frame),
+            screen_extent_rebase(chromium, (604, 80), (604, 80, 792, 566), frame),
             None
         );
     }
 
     #[test]
     fn sentinel_frame_extents_are_not_a_renderer_origin() {
+        let chromium = Some("Chromium");
         assert_eq!(
-            screen_extent_rebase((155, 149), (-1, -1, -1, -1), None),
+            screen_extent_rebase(chromium, (155, 149), (-1, -1, -1, -1), None),
             None
         );
-        assert_eq!(screen_extent_rebase((155, 149), (0, 0, 0, 0), None), None);
+        assert_eq!(
+            screen_extent_rebase(chromium, (155, 149), (0, 0, 0, 0), None),
+            None
+        );
     }
 
     #[test]
     fn a_renderer_local_frame_at_the_corner_keeps_its_rebase() {
+        let chromium = Some("Chromium");
         assert_eq!(
-            screen_extent_rebase((5, 29), (0, 0, 640, 480), Some((0, 0, 650, 514))),
+            screen_extent_rebase(chromium, (5, 29), (0, 0, 640, 480), Some((0, 0, 650, 514))),
             Some((5, 29))
         );
         assert_eq!(
-            screen_extent_rebase((5, 56), (0, 0, 640, 480), Some((0, 27, 650, 514))),
+            screen_extent_rebase(chromium, (5, 56), (0, 0, 640, 480), Some((0, 27, 650, 514))),
             Some((5, 56))
-        );
-        assert_eq!(
-            screen_extent_rebase((5, 29), (0, 0, 640, 480), None),
-            Some((5, 29))
         );
     }
 
     #[test]
     fn a_gtk_frame_matching_its_window_manager_frame_at_the_corner_is_not_rebased() {
         assert_eq!(
-            screen_extent_rebase((5, 29), (0, 0, 650, 514), Some((0, 0, 650, 514))),
+            screen_extent_rebase(
+                Some("Chromium"),
+                (5, 29),
+                (0, 0, 650, 514),
+                Some((0, 0, 650, 514))
+            ),
             None
         );
+    }
+
+    #[test]
+    fn native_and_unknown_toolkits_keep_screen_coordinates_at_the_origin() {
+        for toolkit in [Some("GTK"), Some("GAIL"), Some("Qt"), Some("VCL"), None] {
+            assert_eq!(
+                screen_extent_rebase(toolkit, (5, 29), (0, 0, 640, 480), None),
+                None
+            );
+            assert_eq!(
+                screen_extent_rebase(toolkit, (604, 100), (604, 80, 792, 566), None),
+                None
+            );
+        }
     }
 
     #[test]
