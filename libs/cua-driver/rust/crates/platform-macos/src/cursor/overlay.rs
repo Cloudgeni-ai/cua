@@ -390,8 +390,8 @@ fn seed_start_if_sentinel(key: &CursorKey, target_x: f64, target_y: f64) -> bool
 /// completes and the spring overshoot begins.
 ///
 /// Mirrors Swift's `AgentCursor.shared.animateAndWait(to:)`.
-/// Returns immediately (no animation) only when the overlay is disabled for
-/// this cursor. A brand-new cursor still at the off-screen sentinel is first
+/// Returns immediately (no animation) only when the overlay is disabled or
+/// hidden for this cursor. A brand-new cursor still at the off-screen sentinel is first
 /// seeded on-screen via [`seed_start_if_sentinel`] so its FIRST action glides
 /// in (it previously snapped silently via `ClickPulse`, invisible on a pure-AX
 /// run).
@@ -413,13 +413,17 @@ pub async fn animate_cursor_to_target(key: CursorKey, x: f64, y: f64, target: Op
     // should-animate check passes on the first action just like later ones.
     seed_start_if_sentinel(&key, x, y);
 
-    // Check whether animation should run for THIS cursor. A disabled cursor
-    // never animates; an absent cursor (seed found nothing to prime) is skipped.
+    // Check whether animation should run for THIS cursor. A disabled or
+    // hidden cursor never animates: hiding it must not make every action wait
+    // for an invisible glide. An absent cursor (seed found nothing to prime)
+    // is skipped.
     let should_animate = {
         let guard = RENDER.lock().unwrap();
         matches!(
             guard.as_ref().and_then(|m| m.cursors.get(&key)),
-            Some(rs) if rs.core.cfg.enabled && cursor_overlay::render_state::is_placed(rs.core.pos)
+            Some(rs) if rs.core.cfg.enabled
+                && rs.core.visible
+                && cursor_overlay::render_state::is_placed(rs.core.pos)
         )
     };
     if !should_animate {
