@@ -397,6 +397,31 @@ async fn a_menu_bar_item_token_runs_as_invoke_menu() {
     );
 }
 
+#[tokio::test]
+async fn a_refused_menu_bar_token_stops_the_batch_when_refinding_is_off() {
+    let harness = Harness::new();
+    crate::window_state_view::remember_for_test(
+        "s0000a0e2",
+        80,
+        90,
+        "- [0] AXWindow \"Doc\"\n- [27] AXMenuBar\n  - [700] AXMenuBarItem \"Sheet\"\n    - [701] AXMenu\n      - [771] AXMenuItem \"Delete Sheet\"\n",
+    );
+    let refused = "Background input refused (element_outside_target_window): the addressed element could not be proven to belong to window 90";
+    let result = harness
+        .run(json!({
+            "refind_stale": false,
+            "steps": [{"tool": "click", "args": {"pid": 80, "window_id": 90, "element_token": "s0000a0e2:771", "fail_message": refused}}]
+        }))
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(harness.hits("invoke_menu"), 0, "{}", text(&result));
+    assert!(
+        text(&result).contains("element_outside_target_window"),
+        "{}",
+        text(&result)
+    );
+}
+
 // ── stale element targets ────────────────────────────────────────────────
 
 /// A window whose list re-renders on every click: element handles from an

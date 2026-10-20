@@ -178,7 +178,8 @@ impl Tool for RunStepsTool {
                 invalidate later element targets, so put element-targeted actions before the \
                 actions that reshuffle the window, or target later steps by role/name. A token \
                 that went stale is retried once on the element with the same role and label, if \
-                exactly one matches (`refind_stale:false` stops the batch at it instead).\n\n\
+                exactly one matches, and a refused token click on a menu-bar item runs as invoke_menu \
+                (`refind_stale:false` turns both off and stops the batch at that step instead).\n\n\
                 Returns per-step status (`ok` or the error message) and, when `observe` is \
                 given, ONE bounded get_window_state read after the last executed step (after a \
                 failure caused by a dialog holding focus, that dialog is read, even without \
@@ -273,7 +274,7 @@ impl Tool for RunStepsTool {
                     },
                     "refind_stale": {
                         "type": "boolean",
-                        "description": "When a step's element token went stale, retry it once on the element with the same role and label if exactly one matches. false stops the batch at that step with the stale-token error. Default true."
+                        "description": "When a step's element token went stale, retry it once on the element with the same role and label if exactly one matches, and run a refused token click on a menu-bar item as invoke_menu. false turns both off and stops the batch at that step with the stale-token error. Default true."
                     },
                     "observe": {
                         "type": "object",
@@ -990,7 +991,9 @@ async fn run_step(
 
         let mut result = registry.invoke(tool, args.clone()).await;
         let mut refound_note = None;
-        if result.is_error == Some(true) && tool == "click" {
+        // Both fallbacks act on what an older snapshot said the token was;
+        // `refind_stale:false` keeps the step to the exact element it named.
+        if result.is_error == Some(true) && tool == "click" && refind_stale {
             if let Some((menu_args, note)) = menu_bar_route(&args, &result) {
                 report["refound"] = json!(note);
                 result = registry.invoke("invoke_menu", menu_args).await;
