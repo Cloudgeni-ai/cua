@@ -178,7 +178,7 @@ impl Tool for RunStepsTool {
                 invalidate later element targets, so put element-targeted actions before the \
                 actions that reshuffle the window, or target later steps by role/name. A token \
                 that went stale is retried once on the element with the same role and label, if \
-                exactly one matches.\n\n\
+                exactly one matches (`refind_stale:false` stops the batch at it instead).\n\n\
                 Returns per-step status (`ok` or the error message) and, when `observe` is \
                 given, ONE bounded get_window_state read after the last executed step (after a \
                 failure caused by a dialog holding focus, that dialog is read, even without \
@@ -271,6 +271,10 @@ impl Tool for RunStepsTool {
                         "type": "boolean",
                         "description": "When a step is refused because its target ignores background input (Electron, LibreOffice and other toolkits), retry it once with delivery_mode:\"foreground\": the window is activated and the pointer may move. Default false."
                     },
+                    "refind_stale": {
+                        "type": "boolean",
+                        "description": "When a step's element token went stale, retry it once on the element with the same role and label if exactly one matches. false stops the batch at that step with the stale-token error. Default true."
+                    },
                     "observe": {
                         "type": "object",
                         "description": "Optional end-of-batch observation: arguments for ONE get_window_state call. `pid` and `window_id` default to those of the last step that names both. Defaults to since=\"latest\" (only what changed since your last read of that window with the same query/max_elements/max_depth; a full read when there is none), include_screenshot=false and max_elements=250; pass include_screenshot=true to see the window, or since=null for a full read. Omit to read nothing. {} observes the last window."
@@ -345,6 +349,8 @@ struct Plan {
     default_window: WindowSpec,
     /// Retry a step refused for background delivery once in the foreground.
     foreground_fallback: bool,
+    /// Retry a step whose element token went stale on the same role and label.
+    refind_stale: bool,
     session: Option<String>,
 }
 
@@ -467,6 +473,11 @@ impl Plan {
                     "`foreground_fallback` must be true or false",
                 ))
             }
+        };
+        let refind_stale = match object.get("refind_stale") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => return Err(PlanError::batch("`refind_stale` must be true or false")),
         };
 
         // Reads the batch ends with are what `observe` is for: a trailing
@@ -612,6 +623,7 @@ impl Plan {
             tail_reads,
             default_window,
             foreground_fallback,
+            refind_stale,
             session,
         })
     }
@@ -694,6 +706,7 @@ impl Plan {
                         &mut context,
                         &mut last_window,
                         self.foreground_fallback,
+                        self.refind_stale,
                     ),
                 )
                 .await
@@ -841,6 +854,7 @@ async fn run_step(
     context: &mut WindowSpec,
     last_window: &mut Option<Window>,
     foreground_fallback: bool,
+    refind_stale: bool,
 ) -> StepOutcome {
     let label = step.label();
     let step_has_no_action = step.action.is_none();
@@ -983,7 +997,7 @@ async fn run_step(
                 refound_note = Some(note);
             }
         }
-        if result.is_error == Some(true) && refound_note.is_none() {
+        if result.is_error == Some(true) && refound_note.is_none() && refind_stale {
             if let Some((retry, note)) = refind_stale_target(locator, &args, &result).await {
                 report["refound"] = json!(note);
                 result = registry.invoke(tool, retry).await;

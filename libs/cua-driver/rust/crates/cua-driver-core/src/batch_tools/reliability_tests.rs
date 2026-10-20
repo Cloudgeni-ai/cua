@@ -535,6 +535,34 @@ async fn a_stale_element_token_is_found_again_by_its_role_and_label() {
 }
 
 #[tokio::test]
+async fn a_stale_token_stops_the_batch_when_refinding_is_off() {
+    let (registry, state) = rerender_registry(vec![("AXButton", "Delete")]);
+    crate::window_state_view::remember_for_test(
+        "s0000002e",
+        42,
+        7,
+        "- [0] AXWindow \"Daymark\"\n  - [5] AXButton \"Delete\" [actions=[press]]\n",
+    );
+    let result = registry
+        .invoke(
+            super::super::RUN_STEPS_TOOL,
+            json!({
+                "refind_stale": false,
+                "steps": [{"tool": "click", "args": {"pid": 42, "window_id": 7, "element_token": "s0000002e:5"}}]
+            }),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert!(
+        text(&result).contains("element_outside_target_window"),
+        "{}",
+        text(&result)
+    );
+    assert!(!text(&result).contains("went stale"), "{}", text(&result));
+    assert!(state.lock().unwrap().clicked.is_empty());
+}
+
+#[tokio::test]
 async fn a_stale_token_is_not_retried_when_its_label_is_ambiguous_or_unknown() {
     let (registry, state) = rerender_registry(vec![("AXButton", "OK"), ("AXButton", "OK")]);
     crate::window_state_view::remember_for_test(
