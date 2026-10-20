@@ -39,6 +39,8 @@ impl Tool for Probe {
         }
         if args["fail"] == true {
             ToolResult::error(format!("{} refused: probe asked to fail", self.def.name))
+        } else if let Some(report) = args["window_report"].as_str() {
+            ToolResult::text(format!("{} done\n\n{report}", self.def.name))
         } else {
             ToolResult::text(format!("{} done", self.def.name))
         }
@@ -75,6 +77,7 @@ impl Harness {
                             "text": {"type": "string"},
                             "fail": {"type": "boolean"},
                             "fail_message": {"type": "string"},
+                            "window_report": {"type": "string"},
                             "element_token": {"type": "string"},
                             "value": {"type": "string"},
                             "key": {"type": "string"},
@@ -239,6 +242,28 @@ async fn runs_steps_in_order_and_reports_each() {
     assert_eq!(tools, ["set_value", "type_text", "press_key"]);
     assert_eq!(structured.get("observation"), None);
     assert_eq!(harness.hits("get_window_state"), 0, "no observe, no read");
+}
+
+#[tokio::test]
+async fn each_step_keeps_the_windows_its_action_reported_opening() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"pid": 42, "window_id": 7, "steps": [
+            {"tool": "click", "args": {"element_token": "s1:1"}},
+            {"tool": "click", "args": {
+                "element_token": "s1:2",
+                "window_report": "🪟 Action opened new window(s): App (\"Save\")."
+            }},
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let steps = result.structured_content.unwrap()["steps"].clone();
+    assert_eq!(steps[0].get("window_changes"), None);
+    assert_eq!(steps[1]["message"], "click done");
+    assert_eq!(
+        steps[1]["window_changes"],
+        json!(["🪟 Action opened new window(s): App (\"Save\")."])
+    );
 }
 
 #[tokio::test]

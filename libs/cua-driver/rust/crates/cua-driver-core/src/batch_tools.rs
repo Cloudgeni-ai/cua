@@ -1022,6 +1022,13 @@ async fn run_step(
         }
         report["ok"] = json!(ok);
         report["message"] = json!(message);
+        // The step's message keeps only the first line of the tool's text.
+        // The windows the action opened are reported further down; keep that
+        // report, so a caller can tell which window a step left in front.
+        let changes = window_changes(&result);
+        if ok && !changes.is_empty() {
+            report["window_changes"] = json!(changes);
+        }
         if !ok {
             if let Some(code) = result
                 .structured_content
@@ -1950,6 +1957,32 @@ fn bounded_message(result: &ToolResult) -> String {
     }
     message
 }
+
+/// The window-change report lines of an action result ("🪟 Action opened new
+/// window(s): …"), each bounded like a step message.
+fn window_changes(result: &ToolResult) -> Vec<String> {
+    result
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .flat_map(str::lines)
+        .map(str::trim)
+        .filter(|line| line.starts_with(WINDOW_CHANGE_MARKER))
+        .map(|line| {
+            let mut bounded: String = line.chars().take(MESSAGE_LIMIT).collect();
+            if line.chars().count() > MESSAGE_LIMIT {
+                bounded.push_str("...");
+            }
+            bounded
+        })
+        .collect()
+}
+
+/// How platform adapters start a window-change report line.
+const WINDOW_CHANGE_MARKER: &str = "🪟 ";
 
 #[cfg(test)]
 mod tests;
