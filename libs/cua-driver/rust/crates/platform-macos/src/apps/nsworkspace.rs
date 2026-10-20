@@ -45,6 +45,7 @@ const fn fourcc(s: &[u8; 4]) -> u32 {
 
 const K_CORE_EVENT_CLASS: u32 = fourcc(b"aevt"); // kCoreEventClass
 const K_AE_OPEN_APPLICATION: u32 = fourcc(b"oapp"); // kAEOpenApplication
+const K_AE_REOPEN_APPLICATION: u32 = fourcc(b"rapp"); // kAEReopenApplication
 const K_AUTO_GENERATE_RETURN_ID: i16 = -1; // kAutoGenerateReturnID
 const K_ANY_TRANSACTION_ID: i32 = 0; // kAnyTransactionID
 
@@ -230,7 +231,18 @@ fn build_configuration(cfg: &OpenConfig) -> Retained<NSWorkspaceOpenConfiguratio
 
         if let Some(bid) = &cfg.apple_event_bundle_id {
             if !bid.is_empty() {
-                let event = apple_event::open_application_event(bid);
+                // An app that is already running gets `rapp`, as LaunchServices
+                // and the Dock send: a document app shows its window (or Open
+                // panel) again instead of ignoring a second `oapp`. A launch
+                // that forces a new instance starts a fresh process, so `oapp`.
+                let reopen =
+                    !cfg.creates_new_instance && !running_pids_for_bundle(bid).is_empty();
+                let event_id = if reopen {
+                    K_AE_REOPEN_APPLICATION
+                } else {
+                    K_AE_OPEN_APPLICATION
+                };
+                let event = apple_event::application_event(bid, event_id);
                 config.setAppleEvent(Some(&event));
             }
         }
@@ -535,15 +547,16 @@ mod tests {
 /// is not exposed by `objc2-foundation 0.2.2`.
 mod apple_event {
     use super::{
-        NSAppleEventDescriptor, NSString, Retained, K_AE_OPEN_APPLICATION, K_ANY_TRANSACTION_ID,
-        K_AUTO_GENERATE_RETURN_ID, K_CORE_EVENT_CLASS,
+        NSAppleEventDescriptor, NSString, Retained, K_ANY_TRANSACTION_ID, K_AUTO_GENERATE_RETURN_ID,
+        K_CORE_EVENT_CLASS,
     };
     use objc2::msg_send_id;
     use objc2::rc::Allocated;
     use objc2::ClassType;
 
-    /// Build an `aevt/oapp` AppleEvent addressed to the bundle id `bid`.
-    pub fn open_application_event(bid: &str) -> Retained<NSAppleEventDescriptor> {
+    /// Build an `aevt/<event_id>` AppleEvent (`oapp` or `rapp`) addressed to
+    /// the bundle id `bid`.
+    pub fn application_event(bid: &str, event_id: u32) -> Retained<NSAppleEventDescriptor> {
         let target_string = NSString::from_str(bid);
         let target: Retained<NSAppleEventDescriptor> =
             unsafe { NSAppleEventDescriptor::descriptorWithBundleIdentifier(&target_string) };
@@ -554,7 +567,7 @@ mod apple_event {
             let event: Retained<NSAppleEventDescriptor> = msg_send_id![
                 alloc,
                 initWithEventClass: K_CORE_EVENT_CLASS,
-                eventID: K_AE_OPEN_APPLICATION,
+                eventID: event_id,
                 targetDescriptor: &*target,
                 returnID: K_AUTO_GENERATE_RETURN_ID,
                 transactionID: K_ANY_TRANSACTION_ID,
