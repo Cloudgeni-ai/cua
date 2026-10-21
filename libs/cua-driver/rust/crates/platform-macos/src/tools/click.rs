@@ -337,7 +337,7 @@ fn def() -> &'static ToolDef {
                 "capture_id": { "type": "string", "description": "Optional capture ID from get_window_state or get_desktop_state. With x,y it is consumed atomically; stale or mismatched captures are refused." },
                 "x":             { "type": "number",  "description": "X in screenshot pixels (get_window_state PNG, or get_desktop_state PNG for a desktop target)." },
                 "y":             { "type": "number",  "description": "Y in screenshot pixels from the image selected by target." },
-                "action":        { "type": "string",  "description": "AX action: press (default), show_menu, pick, confirm, cancel, open, show_alternate_ui, show_default_ui. show_alternate_ui reveals hover-only controls on an element that lists it, without the pointer." },
+                "action":        { "type": "string",  "description": "AX action: press (default), show_menu, pick, confirm, cancel, open, show_alternate_ui, show_default_ui, focus. show_alternate_ui reveals hover-only controls on an element that lists it, without the pointer. focus gives an element the keyboard focus (AXFocused) without pressing it; keys sent afterwards go to it." },
                 "button":        {
                     "type": "string",
                     "enum": ["left", "right", "middle"],
@@ -718,6 +718,38 @@ impl Tool for ClickTool {
                     .with_structured(serde_json::json!({ "path": "cgevent", "verified": false, "effect": "unverifiable" })),
                     Ok(Err(e)) => ToolResult::error(format!("Middle-click failed: {e}")),
                     Err(e)     => ToolResult::error(format!("Task error: {e}")),
+                };
+            }
+
+            // focus on an element sets AXFocused and reads it back. It is a
+            // semantic write, not a press: no cursor glide, no click pulse.
+            if effective_action == "focus" {
+                let focus_guard = element_guard.clone();
+                let focused = tokio::task::spawn_blocking(move || {
+                    let element = focus_guard.as_ptr() as usize;
+                    let _ = crate::input::ax_actions::focus_element(element);
+                    crate::input::ax_actions::element_has_keyboard_focus(pid, element)
+                })
+                .await
+                .unwrap_or(false);
+                return if focused {
+                    ToolResult::text(format!("✅ Focused element [{idx}]."))
+                        .with_structured(serde_json::json!({
+                            "path": "ax",
+                            "verified": true,
+                            "effect": "applied"
+                        }))
+                } else {
+                    ToolResult::error(format!(
+                        "click(action=focus): element [{idx}] did not take the keyboard focus \
+                         (AXFocused is not settable on it, or the app moved the focus elsewhere)."
+                    ))
+                    .with_structured(serde_json::json!({
+                        "code": "focus_refused",
+                        "path": "ax",
+                        "verified": true,
+                        "effect": "no_effect"
+                    }))
                 };
             }
 
@@ -1928,13 +1960,13 @@ mod selection_fallback_tests {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-/// Check `click`'s `action` before any dispatch. Element clicks take the
-/// AX action names `map_action` knows. A pixel click also takes `focus`: the
+/// Check `click`'s `action` before any dispatch. Clicks take the AX action
+/// names `map_action` knows, and `focus`, which sets AXFocused instead of
+/// pressing: on an element it focuses that element; on a pixel it is the
 /// background focus rung that pixel `type_text`, `press_key` and `scroll`
-/// use to put the keyboard focus on a point (`focus_by_pixel`). It sets
-/// AXFocused on the element under the point instead of pressing it.
-fn validate_click_action(action: &str, element_target: bool) -> anyhow::Result<()> {
-    if !element_target && action == "focus" {
+/// use to put the keyboard focus on a point (`focus_by_pixel`).
+fn validate_click_action(action: &str, _element_target: bool) -> anyhow::Result<()> {
+    if action == "focus" {
         return Ok(());
     }
     crate::input::ax_actions::map_action(action).map(|_| ())
@@ -1946,12 +1978,13 @@ mod tests {
 
     /// The pixel focus rung keeps working after unknown AX action names
     /// started refusing: background pixel typing into Electron depended on it.
+    /// An element can be focused too.
     #[test]
     fn pixel_click_accepts_the_internal_focus_action() {
         assert!(validate_click_action("focus", false).is_ok());
         assert!(validate_click_action("press", false).is_ok());
         assert!(validate_click_action("show_alternate_ui", true).is_ok());
-        assert!(validate_click_action("focus", true).is_err());
+        assert!(validate_click_action("focus", true).is_ok());
         assert!(validate_click_action("hover", false).is_err());
     }
 
