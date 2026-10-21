@@ -737,7 +737,7 @@ impl Tool for ClickTool {
                         .with_structured(serde_json::json!({
                             "path": "ax",
                             "verified": true,
-                            "effect": "applied"
+                            "effect": "confirmed"
                         }))
                 } else {
                     ToolResult::error(format!(
@@ -748,7 +748,7 @@ impl Tool for ClickTool {
                         "code": "focus_refused",
                         "path": "ax",
                         "verified": true,
-                        "effect": "no_effect"
+                        "effect": "refused"
                     }))
                 };
             }
