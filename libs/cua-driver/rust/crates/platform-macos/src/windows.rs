@@ -92,6 +92,36 @@ pub(crate) fn visible_windows_with_space_snapshot() -> WindowEnumeration {
     )
 }
 
+/// Every app's windows a person works in: normal windows plus floating
+/// panels and modal panels (dialogs such as a first-run or sign-in window,
+/// which apps raise to the modal-panel level). Menus, tooltips, the Dock and
+/// status items sit on other levels and stay out.
+pub(crate) fn app_windows_with_space_snapshot(on_screen_only: bool) -> WindowEnumeration {
+    let on_screen = if on_screen_only {
+        kCGWindowListOptionOnScreenOnly
+    } else {
+        0
+    };
+    enumerate_windows(
+        on_screen | kCGWindowListExcludeDesktopElements,
+        LayerFilter::AppLevels,
+        None,
+        true,
+    )
+}
+
+/// On-screen windows on the app levels of [`app_windows_with_space_snapshot`],
+/// without the Space snapshot. Cheap enough to poll.
+pub(crate) fn visible_app_windows() -> Vec<WindowInfo> {
+    enumerate_windows(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        LayerFilter::AppLevels,
+        None,
+        false,
+    )
+    .windows
+}
+
 pub(crate) fn pid_windows_with_space_snapshot(pid: i32, on_screen_only: bool) -> WindowEnumeration {
     let on_screen = if on_screen_only {
         kCGWindowListOptionOnScreenOnly
@@ -164,8 +194,22 @@ pub(crate) fn all_windows_any_layer() -> Vec<WindowInfo> {
 enum LayerFilter {
     /// Normal application windows only — what `list_windows` reports.
     ZeroOnly,
+    /// The levels an app's own working windows use: normal (0), floating
+    /// panels (3) and modal panels (8).
+    AppLevels,
     /// Every layer, accessory windows included.
     AnyLayer,
+}
+
+/// `NSFloatingWindowLevel` and `NSModalPanelWindowLevel`.
+const APP_PANEL_LAYERS: [i32; 2] = [3, 8];
+
+fn layer_admitted(layers: LayerFilter, layer: i32) -> bool {
+    match layers {
+        LayerFilter::ZeroOnly => layer == 0,
+        LayerFilter::AppLevels => layer == 0 || APP_PANEL_LAYERS.contains(&layer),
+        LayerFilter::AnyLayer => true,
+    }
 }
 
 fn enumerate_windows(
@@ -264,8 +308,7 @@ fn enumerate_windows(
         let layer = get_num("kCGWindowLayer") as i32;
         let is_on_screen = get_bool("kCGWindowIsOnscreen");
 
-        // Only include layer-0 windows, unless the caller asked for every layer.
-        if layer != 0 && layers == LayerFilter::ZeroOnly {
+        if !layer_admitted(layers, layer) {
             continue;
         }
         if pid_filter.is_some_and(|wanted| wanted != pid) {

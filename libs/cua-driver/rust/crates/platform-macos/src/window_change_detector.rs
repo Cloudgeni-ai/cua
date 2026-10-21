@@ -606,15 +606,13 @@ impl Snapshot {
     }
 }
 
-/// The host's visible layer-0 windows.
+/// The host's visible app windows: normal windows and the floating and modal
+/// panels an action can open (a dialog is raised to the modal-panel level).
 fn host_windows() -> Vec<WindowInfo> {
-    windows::visible_windows()
-        .into_iter()
-        .filter(|w| w.layer == 0)
-        .collect()
+    windows::visible_app_windows()
 }
 
-/// One live observation for the poll loop: layer-0 windows and the frontmost pid.
+/// One live observation for the poll loop: app windows and the frontmost pid.
 fn observe_host() -> (Vec<WindowInfo>, Option<i32>) {
     (host_windows(), apps::frontmost_pid())
 }
