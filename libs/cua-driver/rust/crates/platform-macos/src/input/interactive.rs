@@ -301,7 +301,7 @@ impl NativeInputState {
                 crate::apps::activate_pid(self.config.pid);
             }
             // Paid once when opening the session, never on the event hot path.
-            thread::sleep(std::time::Duration::from_millis(40));
+            crate::timing::sleep(std::time::Duration::from_millis(40));
         }
         Ok(())
     }

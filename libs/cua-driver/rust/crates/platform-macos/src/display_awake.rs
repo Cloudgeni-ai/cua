@@ -128,7 +128,7 @@ fn release_when_idle(idle: Duration) {
             remaining(held.last_activity.elapsed(), idle)
         };
         match wait {
-            Some(wait) => std::thread::sleep(wait),
+            Some(wait) => crate::timing::sleep(wait),
             None => {
                 release_now();
                 return;

@@ -111,7 +111,7 @@ fn dispatch_with_ax_oracle(
     // run-loop turn. Keep this bounded and reuse the exact retained element so
     // a focus move cannot become false confirmation from a different control.
     if before.is_some() {
-        std::thread::sleep(std::time::Duration::from_millis(60));
+        crate::timing::sleep(std::time::Duration::from_millis(60));
     }
     let after = element_ptr.and_then(|ptr| read_ax_key_state(pid, window_id, ptr));
     if owns_element {
@@ -190,7 +190,7 @@ fn with_confirmed_key_focus<T>(
             if std::time::Instant::now() >= deadline {
                 return Err(KeyFocusUnconfirmed.into());
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::timing::sleep(std::time::Duration::from_millis(10));
         }
     }
     dispatch()

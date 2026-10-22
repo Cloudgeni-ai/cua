@@ -265,12 +265,12 @@ pub fn post_window_key_records(pid: pid_t, current: Option<u32>, target: u32) ->
         let mut defocus = focus_record(current);
         defocus[0x8A] = 0x02;
         ok &= send(&defocus);
-        std::thread::sleep(KEY_RECORD_SETTLE);
+        crate::timing::sleep(KEY_RECORD_SETTLE);
     }
     let mut focus = focus_record(target);
     focus[0x8A] = 0x01;
     ok &= send(&focus);
-    std::thread::sleep(KEY_RECORD_SETTLE);
+    crate::timing::sleep(KEY_RECORD_SETTLE);
     for event_kind in [0x01, 0x02] {
         ok &= send(&make_key_window_record(target, event_kind));
     }
@@ -282,10 +282,10 @@ pub fn post_window_key_records(pid: pid_t, current: Option<u32>, target: u32) ->
 /// trails the post; a never-active LibreOffice shows it last, when a focused
 /// element appears. The caller re-reads and decides.
 fn await_key_focus(pid: pid_t, target: u32, budget: std::time::Duration) {
-    std::thread::sleep(KEY_RECORD_SETTLE);
+    crate::timing::sleep(KEY_RECORD_SETTLE);
     let deadline = std::time::Instant::now() + budget;
     while !key_focus_of_pid(pid).settled_on(target) && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        crate::timing::sleep(std::time::Duration::from_millis(40));
     }
 }
 
@@ -511,8 +511,27 @@ fn get_connection_psn_fn() -> Option<GetConnectionPSNFn> {
 }
 
 fn post_event_record_to_fn() -> Option<PostEventRecordToFn> {
+    // Every path that posts a focus record looks the poster up first. The
+    // capability probe also looks it up without posting; that only makes the
+    // next press prime its window again.
+    note_key_record();
     static SYM: OnceLock<Option<PostEventRecordToFn>> = OnceLock::new();
     *SYM.get_or_init(|| find_sym(b"SLPSPostEventRecordTo\0").map(|p| unsafe { as_fn(p) }))
+}
+
+/// Advanced before every focus or defocus record the driver posts to a
+/// process. Equal values before and after a span prove the driver moved no
+/// window's key status in between.
+static KEY_RECORD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current focus-record generation (see [`KEY_RECORD_GENERATION`]).
+pub fn key_record_generation() -> u64 {
+    KEY_RECORD_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Advance [`KEY_RECORD_GENERATION`] for a focus record about to be posted.
+pub(crate) fn note_key_record() {
+    KEY_RECORD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 fn get_front_process_fn() -> Option<GetFrontProcessFn> {
@@ -1387,7 +1406,7 @@ fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
         if std::time::Instant::now() >= deadline {
             return false;
         }
-        std::thread::sleep(ACTIVATION_POLL_INTERVAL);
+        crate::timing::sleep(ACTIVATION_POLL_INTERVAL);
     }
 }
 
@@ -1493,7 +1512,7 @@ pub fn with_foreground_hid_activation(
     }
 
     let result = action();
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::timing::sleep(std::time::Duration::from_millis(40));
 
     if prev_ok {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
@@ -1617,7 +1636,7 @@ mod tests {
                     let _nested = foreground_turn();
                     let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
                     max_inside.fetch_max(now, Ordering::SeqCst);
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    crate::timing::sleep(std::time::Duration::from_millis(5));
                     inside.fetch_sub(1, Ordering::SeqCst);
                 })
             })

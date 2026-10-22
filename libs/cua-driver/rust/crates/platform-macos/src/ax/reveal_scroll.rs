@@ -341,7 +341,7 @@ unsafe fn reveal_in(
         // A real frame: measure the move on the element itself.
         let before = nodes[index].0;
         perform_action(elements[index], "AXScrollToVisible");
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        crate::timing::sleep(std::time::Duration::from_millis(150));
         let after = element_screen_rect(elements[index]).unwrap_or(before);
         let moved = match direction {
             "down" => before[1] - after[1],
@@ -363,7 +363,7 @@ unsafe fn reveal_in(
             .position(|(rect, leaf)| *leaf && real_size(*rect) && contains(viewport, *rect));
         let reference_before = reference.map(|at| nodes[at].0);
         perform_action(elements[pick.index], "AXScrollToVisible");
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        crate::timing::sleep(std::time::Duration::from_millis(150));
         let after = element_screen_rect(elements[pick.index]);
         let reference_after = reference.and_then(|at| element_screen_rect(elements[at]));
         let shown =

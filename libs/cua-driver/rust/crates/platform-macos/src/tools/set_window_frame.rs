@@ -264,7 +264,7 @@ fn mutate_and_verify(input: &SetWindowFrameInput) -> Result<FrameOutcome, String
 
                     let mut observed = None;
                     for attempt in 0..20 {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        crate::timing::sleep(std::time::Duration::from_millis(50));
 
                         // Tahoe can settle either mutation while rolling the other one
                         // back. Correct only the component that still differs so the two

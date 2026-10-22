@@ -79,7 +79,7 @@ pub fn reveal_alternate_ui(pid: i32, window_id: u32, x: f64, y: f64) -> Option<A
             visible: copy_bool_attr(target, "AXAlternateUIVisible"),
             elements_before,
             elements_after: {
-                std::thread::sleep(std::time::Duration::from_millis(150));
+                crate::timing::sleep(std::time::Duration::from_millis(150));
                 subtree_size(target, SUBTREE_DEPTH)
             },
         };

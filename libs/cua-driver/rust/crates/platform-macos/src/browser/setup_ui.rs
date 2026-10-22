@@ -90,7 +90,7 @@ fn await_exact_value(
         if Instant::now() >= deadline {
             return Err(value);
         }
-        std::thread::sleep(poll);
+        crate::timing::sleep(poll);
     }
 }
 
@@ -977,7 +977,7 @@ fn press_pixel_checkbox(
             delivery,
             crate::input::mouse::WindowClickDelivery::Foreground
         ) {
-            std::thread::sleep(Duration::from_millis(60));
+            crate::timing::sleep(Duration::from_millis(60));
             if crate::apps::frontmost_pid() != Some(pid) {
                 anyhow::bail!("the approved browser lost foreground before the setup click");
             }
@@ -1045,7 +1045,7 @@ fn press_pixel_checkbox(
                 delivery,
             )?;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        crate::timing::sleep(Duration::from_millis(100));
         Ok(())
     };
     if background {
@@ -1093,11 +1093,11 @@ fn toggle_checkbox_by_keyboard(
     };
     let toggled = with_background_key_window(pid, window_id, || {
         let focused = unsafe { set_bool_attr_true(checkbox as AXUIElementRef, "AXFocused") };
-        std::thread::sleep(Duration::from_millis(60));
+        crate::timing::sleep(Duration::from_millis(60));
         focused == kAXErrorSuccess && crate::input::keyboard::press_key(pid, "space", &[]).is_ok()
     });
     release_actionable_nodes(&tree.nodes);
-    std::thread::sleep(Duration::from_millis(150));
+    crate::timing::sleep(Duration::from_millis(150));
     toggled
 }
 
@@ -1179,7 +1179,7 @@ impl SetupUiHandle {
                                     pid,
                                     window_id,
                                     || {
-                                        std::thread::sleep(Duration::from_millis(60));
+                                        crate::timing::sleep(Duration::from_millis(60));
                                         if crate::apps::frontmost_pid() != Some(pid) {
                                             anyhow::bail!(
                                                 "the approved browser lost foreground before the rollback click"
@@ -1188,7 +1188,7 @@ impl SetupUiHandle {
                                         crate::input::mouse::click_at_xy_desktop_preserving_cursor(
                                             x, y,
                                         )?;
-                                        std::thread::sleep(Duration::from_millis(60));
+                                        crate::timing::sleep(Duration::from_millis(60));
                                         Ok(())
                                     },
                                 )
@@ -1196,7 +1196,7 @@ impl SetupUiHandle {
                                 if !restored {
                                     return false;
                                 }
-                                std::thread::sleep(Duration::from_millis(100));
+                                crate::timing::sleep(Duration::from_millis(100));
                                 continue;
                             } else {
                                 None
@@ -1246,7 +1246,7 @@ impl SetupUiHandle {
                                     Ok(fronted) => self.foregrounded_window |= fronted,
                                     Err(_) => return false,
                                 }
-                                std::thread::sleep(Duration::from_millis(100));
+                                crate::timing::sleep(Duration::from_millis(100));
                                 continue;
                             }
                         }
@@ -1267,7 +1267,7 @@ impl SetupUiHandle {
             if Instant::now() >= deadline {
                 return false;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            crate::timing::sleep(Duration::from_millis(100));
         }
     }
 
@@ -1456,7 +1456,7 @@ fn set_remote_debugging(
                     Ok(Some(element)) => break (created, element),
                     Ok(None) if Instant::now() < deadline => {
                         release_actionable_nodes(&created.nodes);
-                        std::thread::sleep(Duration::from_millis(100));
+                        crate::timing::sleep(Duration::from_millis(100));
                     }
                     Ok(None) => {
                         release_actionable_nodes(&initial.nodes);
@@ -1596,7 +1596,7 @@ fn set_remote_debugging(
                 && with_background_key_window(pid, window_id, || {
                     let _ = unsafe { perform_action(omnibox as AXUIElementRef, "AXPress") };
                     let _ = unsafe { set_bool_attr_true(omnibox as AXUIElementRef, "AXFocused") };
-                    std::thread::sleep(Duration::from_millis(60));
+                    crate::timing::sleep(Duration::from_millis(60));
                     let typed = crate::input::keyboard::press_key(pid, "a", &["cmd"])
                         .and_then(|()| crate::input::keyboard::type_text(pid, descriptor.setup_url))
                         .is_ok()
@@ -1615,7 +1615,7 @@ fn set_remote_debugging(
                         if showing_setup_page() {
                             return true;
                         }
-                        std::thread::sleep(Duration::from_millis(100));
+                        crate::timing::sleep(Duration::from_millis(100));
                     }
                     false
                 });
@@ -1629,7 +1629,7 @@ fn set_remote_debugging(
                         Ok(Some(element)) => break Ok(Some((popup, element))),
                         Ok(None) if Instant::now() < deadline => {
                             release_actionable_nodes(&popup.nodes);
-                            std::thread::sleep(Duration::from_millis(50));
+                            crate::timing::sleep(Duration::from_millis(50));
                         }
                         Ok(None) => {
                             release_actionable_nodes(&popup.nodes);
@@ -1668,7 +1668,7 @@ fn set_remote_debugging(
                             pid,
                             window_id,
                             || {
-                                std::thread::sleep(Duration::from_millis(60));
+                                crate::timing::sleep(Duration::from_millis(60));
                                 if crate::apps::frontmost_pid() != Some(pid) {
                                     anyhow::bail!(
                                         "the approved browser lost foreground before setup navigation"
@@ -1696,7 +1696,7 @@ fn set_remote_debugging(
                                 let _ = unsafe {
                                     set_bool_attr_true(omnibox as AXUIElementRef, "AXFocused")
                                 };
-                                std::thread::sleep(Duration::from_millis(60));
+                                crate::timing::sleep(Duration::from_millis(60));
                                 let focused_element = unsafe { focused_element_of_pid(pid) };
                                 let exact_focus = focused_element.is_some_and(|element| {
                                     let matches = is_same_element(element as usize, omnibox);
@@ -1709,7 +1709,7 @@ fn set_remote_debugging(
                                     );
                                 }
                                 crate::input::keyboard::press_key_global("a", &["cmd"])?;
-                                std::thread::sleep(Duration::from_millis(30));
+                                crate::timing::sleep(Duration::from_millis(30));
                                 crate::input::keyboard::type_text(pid, descriptor.setup_url)?;
                                 // The omnibox applies queued keystrokes
                                 // asynchronously; a single fixed-delay read
@@ -1731,7 +1731,7 @@ fn set_remote_debugging(
                                     );
                                 }
                                 crate::input::keyboard::press_key_global("return", &[])?;
-                                std::thread::sleep(Duration::from_millis(100));
+                                crate::timing::sleep(Duration::from_millis(100));
                                 Ok(())
                             },
                         )
@@ -1850,14 +1850,14 @@ fn set_remote_debugging(
                                 pid,
                                 window_id,
                                 || {
-                                    std::thread::sleep(Duration::from_millis(60));
+                                    crate::timing::sleep(Duration::from_millis(60));
                                     if crate::apps::frontmost_pid() != Some(pid) {
                                         anyhow::bail!(
                                             "the approved browser lost foreground before the setup click"
                                         );
                                     }
                                     crate::input::mouse::click_at_xy_desktop_preserving_cursor(x, y)?;
-                                    std::thread::sleep(Duration::from_millis(60));
+                                    crate::timing::sleep(Duration::from_millis(60));
                                     Ok(())
                                 },
                             )
@@ -1992,7 +1992,7 @@ fn set_remote_debugging(
                 ),
             ));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        crate::timing::sleep(Duration::from_millis(100));
     }
 }
 

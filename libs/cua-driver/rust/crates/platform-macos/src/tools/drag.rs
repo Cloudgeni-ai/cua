@@ -776,9 +776,9 @@ impl DragTool {
 fn await_drag_session_end(pid: i32) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while !drag_image_windows(pid).is_empty() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        crate::timing::sleep(std::time::Duration::from_millis(50));
     }
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    crate::timing::sleep(std::time::Duration::from_millis(150));
 }
 
 /// Current hardware pointer location in global display points.

@@ -231,7 +231,7 @@ fn wait_for_exact_window(pid: i32, window_id: u32) -> ExactWindowObservation {
         if now >= deadline {
             return observation;
         }
-        std::thread::sleep(VERIFY_POLL);
+        crate::timing::sleep(VERIFY_POLL);
     }
 }
 
@@ -512,7 +512,7 @@ impl Tool for BringToFrontTool {
             if Instant::now() >= deadline {
                 break false;
             }
-            std::thread::sleep(VERIFY_POLL);
+            crate::timing::sleep(VERIFY_POLL);
         };
         let structured = json!({
             "status": if activated { "activated" } else if request_accepted { "partial" } else { "failed" },

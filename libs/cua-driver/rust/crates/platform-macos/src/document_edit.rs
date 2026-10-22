@@ -147,7 +147,7 @@ pub unsafe fn ensure_marked_after_ax_write(
     if !crate::input::skylight::activate_without_raise_with(pid, own, false) {
         return DocumentEdited::NotMarked;
     }
-    std::thread::sleep(Duration::from_millis(120));
+    crate::timing::sleep(Duration::from_millis(120));
     let sent = send_net_zero_edit(pid, element, caret_to_end);
     if let Some(previous) = previous {
         crate::input::skylight::activate_without_raise_with(pid, previous, false);
@@ -190,7 +190,7 @@ unsafe fn send_net_zero_edit(
         return DocumentEdited::NotMarked;
     }
     // Let the two keys land, then check they cancelled out.
-    std::thread::sleep(Duration::from_millis(150));
+    crate::timing::sleep(Duration::from_millis(150));
     if copy_string_attr(element, "AXValue") == before {
         DocumentEdited::Marked
     } else {

@@ -135,7 +135,7 @@ pub fn run_script(script: &str, args: &[&str], timeout: Duration) -> Result<Stri
                     ),
                 });
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Ok(None) => crate::timing::sleep(Duration::from_millis(25)),
             Err(error) => {
                 return Err(ScriptRefusal {
                     code: "automation_failed",
@@ -270,7 +270,7 @@ pub fn finder_rename(path: &Path, new_name: &str) -> Result<std::path::PathBuf, 
                 ),
             });
         }
-        std::thread::sleep(Duration::from_millis(50));
+        crate::timing::sleep(Duration::from_millis(50));
     }
 }
 
@@ -425,7 +425,7 @@ pub fn wait_for_new_mtime(
         if Instant::now() >= deadline {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        crate::timing::sleep(Duration::from_millis(50));
     }
 }
 

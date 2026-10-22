@@ -1014,7 +1014,7 @@ fn render_loop(
             // Sleep remainder of frame budget.
             let elapsed = Instant::now().duration_since(last_tick);
             if let Some(remaining) = target_frame_ms.checked_sub(elapsed) {
-                std::thread::sleep(remaining);
+                crate::timing::sleep(remaining);
             }
         }
     }

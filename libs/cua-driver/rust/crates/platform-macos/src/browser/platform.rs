@@ -375,7 +375,7 @@ fn watch_self_activation(pid: i32, front: i32, stop: &std::sync::atomic::AtomicB
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(2));
+        crate::timing::sleep(Duration::from_millis(2));
     }
 }
 
@@ -1428,7 +1428,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             || super::consent_ui::dismiss(pid, window_id),
             || super::setup_ui::disable(pid, window_id, descriptor),
             || visible_consent_surfaces(pid),
-            || std::thread::sleep(Duration::from_millis(100)),
+            || crate::timing::sleep(Duration::from_millis(100)),
         );
         if let Some(previous) = previous_front {
             restore_front_app_if_browser_front(i64::from(previous), request.pid);
@@ -1454,7 +1454,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 || super::consent_ui::dismiss(pid, window_id),
                 |error| super::setup_ui::abort_pending(pid, window_id, error),
                 || visible_consent_surfaces(pid),
-                || std::thread::sleep(Duration::from_millis(100)),
+                || crate::timing::sleep(Duration::from_millis(100)),
             )
         })
         .await

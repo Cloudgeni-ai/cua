@@ -235,8 +235,7 @@ fn build_configuration(cfg: &OpenConfig) -> Retained<NSWorkspaceOpenConfiguratio
                 // and the Dock send: a document app shows its window (or Open
                 // panel) again instead of ignoring a second `oapp`. A launch
                 // that forces a new instance starts a fresh process, so `oapp`.
-                let reopen =
-                    !cfg.creates_new_instance && !running_pids_for_bundle(bid).is_empty();
+                let reopen = !cfg.creates_new_instance && !running_pids_for_bundle(bid).is_empty();
                 let event_id = if reopen {
                     K_AE_REOPEN_APPLICATION
                 } else {
@@ -456,7 +455,7 @@ fn wait_for_launch_signal<T>(
         let wait = poll_interval.min(deadline.saturating_duration_since(now));
 
         if callback_disconnected {
-            std::thread::sleep(wait);
+            crate::timing::sleep(wait);
             continue;
         }
 
@@ -547,8 +546,8 @@ mod tests {
 /// is not exposed by `objc2-foundation 0.2.2`.
 mod apple_event {
     use super::{
-        NSAppleEventDescriptor, NSString, Retained, K_ANY_TRANSACTION_ID, K_AUTO_GENERATE_RETURN_ID,
-        K_CORE_EVENT_CLASS,
+        NSAppleEventDescriptor, NSString, Retained, K_ANY_TRANSACTION_ID,
+        K_AUTO_GENERATE_RETURN_ID, K_CORE_EVENT_CLASS,
     };
     use objc2::msg_send_id;
     use objc2::rc::Allocated;

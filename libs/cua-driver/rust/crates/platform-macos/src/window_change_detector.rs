@@ -504,7 +504,7 @@ impl Snapshot {
         observe: &mut impl FnMut() -> (Vec<WindowInfo>, Option<i32>),
     ) -> Result<Changes, Self> {
         loop {
-            std::thread::sleep(poll_interval);
+            crate::timing::sleep(poll_interval);
             if let Some(changes) = self.observe_once(observe) {
                 return Ok(changes);
             }
@@ -537,7 +537,7 @@ impl Snapshot {
             .name("cua-window-watch".into())
             .spawn(move || {
                 loop {
-                    std::thread::sleep(poll_interval);
+                    crate::timing::sleep(poll_interval);
                     if !still_mine() {
                         return;
                     }
@@ -560,7 +560,7 @@ impl Snapshot {
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if !remaining.is_zero() {
-                    std::thread::sleep(remaining);
+                    crate::timing::sleep(remaining);
                 }
                 let mut tail = lock(&TAIL);
                 if tail.as_ref().is_some_and(|tail| tail.id == id) {
@@ -1023,7 +1023,7 @@ mod tests {
         opened.store(true, Ordering::SeqCst);
         let wait_until = Instant::now() + Duration::from_secs(2);
         while lock(&LATE).is_none() && Instant::now() < wait_until {
-            std::thread::sleep(Duration::from_millis(10));
+            crate::timing::sleep(Duration::from_millis(10));
         }
         let mut next =
             WindowChangeDetector::capture_from(HashSet::from([1, 2]), Some(7), false, None);
@@ -1057,9 +1057,9 @@ mod tests {
             },
         );
         end_tail();
-        std::thread::sleep(Duration::from_millis(40));
+        crate::timing::sleep(Duration::from_millis(40));
         let after_end = observations.load(Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(80));
+        crate::timing::sleep(Duration::from_millis(80));
         assert_eq!(observations.load(Ordering::SeqCst), after_end);
         assert!(lock(&LATE).is_none());
     }

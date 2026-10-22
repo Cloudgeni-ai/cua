@@ -293,7 +293,7 @@ fn walk_tree_with_web_content(
                 {
                     LaunchStep::Retry(pause) => {
                         release_all(top_level);
-                        std::thread::sleep(pause);
+                        crate::timing::sleep(pause);
                         continue;
                     }
                     // Still unresolved because the app never finished

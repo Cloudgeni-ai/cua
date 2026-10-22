@@ -268,7 +268,7 @@ fn watch_order_after_action(target: i32, front: i32, order: bool, epoch: u64) {
             let mut restores = 0;
             let mut reverts = 0;
             loop {
-                std::thread::sleep(ORDER_POLL);
+                crate::timing::sleep(ORDER_POLL);
                 let current = watching
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -320,7 +320,7 @@ fn wait_for_menu_window(pid: i32, budget: Duration) {
         {
             return;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        crate::timing::sleep(Duration::from_millis(1));
     }
 }
 
@@ -780,7 +780,7 @@ fn schedule_idle_teardown() {
     let _ = std::thread::Builder::new()
         .name("cua-key-focus-guard-idle".into())
         .spawn(|| {
-            std::thread::sleep(TAIL + Duration::from_secs(1));
+            crate::timing::sleep(TAIL + Duration::from_secs(1));
             let mut st = lock();
             let now = Instant::now();
             st.guarded

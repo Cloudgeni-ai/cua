@@ -216,9 +216,7 @@ fn layer_admitted(layers: LayerFilter, layer: i32) -> bool {
 /// (System Settings' Accessibility agent holds a 0x0 floating window), not
 /// something a person can see or act on.
 fn panel_without_area(layers: LayerFilter, layer: i32, bounds: &WindowBounds) -> bool {
-    layers == LayerFilter::AppLevels
-        && layer != 0
-        && (bounds.width < 1.0 || bounds.height < 1.0)
+    layers == LayerFilter::AppLevels && layer != 0 && (bounds.width < 1.0 || bounds.height < 1.0)
 }
 
 fn enumerate_windows(
@@ -641,7 +639,7 @@ fn poll_until_no_menu(
         if std::time::Instant::now() >= deadline {
             return Some(false);
         }
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        crate::timing::sleep(std::time::Duration::from_millis(40));
     }
 }
 
@@ -736,19 +734,35 @@ mod tests {
     #[test]
     fn app_levels_admit_normal_floating_and_modal_panel_windows_only() {
         for layer in [0, 3, 8] {
-            assert!(layer_admitted(LayerFilter::AppLevels, layer), "layer {layer}");
+            assert!(
+                layer_admitted(LayerFilter::AppLevels, layer),
+                "layer {layer}"
+            );
         }
         // Menus (101), the Dock (20), status items (25) and tooltips stay out.
         for layer in [20, 24, 25, 101, 1000] {
-            assert!(!layer_admitted(LayerFilter::AppLevels, layer), "layer {layer}");
+            assert!(
+                !layer_admitted(LayerFilter::AppLevels, layer),
+                "layer {layer}"
+            );
         }
         assert!(!layer_admitted(LayerFilter::ZeroOnly, 8));
     }
 
     #[test]
     fn panel_windows_without_area_are_skipped() {
-        let empty = WindowBounds { x: 0., y: 630., width: 0., height: 0. };
-        let dialog = WindowBounds { x: 428., y: 96., width: 1064., height: 885. };
+        let empty = WindowBounds {
+            x: 0.,
+            y: 630.,
+            width: 0.,
+            height: 0.,
+        };
+        let dialog = WindowBounds {
+            x: 428.,
+            y: 96.,
+            width: 1064.,
+            height: 885.,
+        };
         assert!(panel_without_area(LayerFilter::AppLevels, 3, &empty));
         assert!(!panel_without_area(LayerFilter::AppLevels, 8, &dialog));
         // Normal windows keep the existing behaviour, area or not.

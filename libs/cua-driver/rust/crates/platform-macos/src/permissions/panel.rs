@@ -165,13 +165,13 @@ pub fn pump_run_loop_briefly(seconds: f64) {
     if MainThreadMarker::new().is_none() {
         // Not the main thread — pumping someone else's run loop is
         // wrong. Just sleep.
-        std::thread::sleep(std::time::Duration::from_secs_f64(seconds.max(0.0)));
+        crate::timing::sleep(std::time::Duration::from_secs_f64(seconds.max(0.0)));
         return;
     }
     unsafe {
         let run_loop: *mut AnyObject = msg_send![class!(NSRunLoop), currentRunLoop];
         if run_loop.is_null() {
-            std::thread::sleep(std::time::Duration::from_secs_f64(seconds.max(0.0)));
+            crate::timing::sleep(std::time::Duration::from_secs_f64(seconds.max(0.0)));
             return;
         }
         // `[NSDate dateWithTimeIntervalSinceNow:seconds]` builds the
@@ -180,7 +180,7 @@ pub fn pump_run_loop_briefly(seconds: f64) {
         // timers — including TCC notification taps.
         let date: *mut AnyObject = msg_send![class!(NSDate), dateWithTimeIntervalSinceNow: seconds];
         if date.is_null() {
-            std::thread::sleep(std::time::Duration::from_secs_f64(seconds.max(0.0)));
+            crate::timing::sleep(std::time::Duration::from_secs_f64(seconds.max(0.0)));
             return;
         }
         let default_mode = ns_string("NSDefaultRunLoopMode");

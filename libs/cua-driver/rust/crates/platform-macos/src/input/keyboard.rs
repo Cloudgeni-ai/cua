@@ -26,7 +26,7 @@ fn key_gap() -> std::time::Duration {
 }
 
 fn key_gap_sleep() {
-    std::thread::sleep(key_gap());
+    crate::timing::sleep(key_gap());
 }
 
 fn is_screen_sharing_bundle_id(bundle_id: &str) -> bool {
@@ -132,7 +132,7 @@ pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> a
 
         // Additional inter-character delay on top of the internal key gap.
         if inter_char_delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms));
+            crate::timing::sleep(std::time::Duration::from_millis(inter_char_delay_ms));
         } else {
             key_gap_sleep();
         }
@@ -401,7 +401,7 @@ pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<
         down.post(CGEventTapLocation::HID);
         key_gap_sleep();
         up.post(CGEventTapLocation::HID);
-        std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms).max(key_gap()));
+        crate::timing::sleep(std::time::Duration::from_millis(inter_char_delay_ms).max(key_gap()));
     }
     Ok(())
 }
@@ -434,7 +434,7 @@ pub fn type_text_physical_global(text: &str, inter_char_delay_ms: u64) -> anyhow
         }
         let extra = std::time::Duration::from_millis(inter_char_delay_ms).saturating_sub(key_gap());
         if !extra.is_zero() {
-            std::thread::sleep(extra);
+            crate::timing::sleep(extra);
         }
     }
     Ok(())

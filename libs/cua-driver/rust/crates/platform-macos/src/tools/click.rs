@@ -174,7 +174,7 @@ fn settled_value(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(now) = read().filter(|now| shows(now)) {
-            std::thread::sleep(stability);
+            crate::timing::sleep(stability);
             if read().as_deref() == Some(now.as_str()) {
                 return Some(now);
             }
@@ -182,7 +182,7 @@ fn settled_value(
         if std::time::Instant::now() >= deadline {
             return None;
         }
-        std::thread::sleep(poll);
+        crate::timing::sleep(poll);
     }
 }
 
@@ -733,12 +733,13 @@ impl Tool for ClickTool {
                 .await
                 .unwrap_or(false);
                 return if focused {
-                    ToolResult::text(format!("✅ Focused element [{idx}]."))
-                        .with_structured(serde_json::json!({
+                    ToolResult::text(format!("✅ Focused element [{idx}].")).with_structured(
+                        serde_json::json!({
                             "path": "ax",
                             "verified": true,
                             "effect": "confirmed"
-                        }))
+                        }),
+                    )
                 } else {
                     ToolResult::error(format!(
                         "click(action=focus): element [{idx}] did not take the keyboard focus \
@@ -847,6 +848,8 @@ impl Tool for ClickTool {
             // and stomp default for a non-default session).
             let ck = cursor_key.clone();
             let selection_modifiers = modifiers.clone();
+            // The blocking thread below does not inherit the batch marker.
+            let in_batch = cua_driver_core::step_pacing::in_batch();
             let result = focus_guard::with_focus_suppressed(
                 if foreground { None } else { Some(pid) },
                 prior_front,
@@ -865,9 +868,9 @@ impl Tool for ClickTool {
                                     &ck,
                                     selection_pixel,
                                     &selection_modifiers,
-                                    foreground,
+                                    AxClickDelivery::Foreground,
                                 )?);
-                                std::thread::sleep(std::time::Duration::from_millis(150));
+                                crate::timing::sleep(std::time::Duration::from_millis(150));
                                 Ok(())
                             };
                             let fronted = if has_modifiers {
@@ -896,7 +899,7 @@ impl Tool for ClickTool {
                                 &ck,
                                 selection_pixel,
                                 &selection_modifiers,
-                                false,
+                                AxClickDelivery::Background { in_batch },
                             )
                             .map(|outcome| (outcome, false))
                         }
@@ -1541,13 +1544,70 @@ fn press_needs_key_window(action: &str, front_pid: Option<i32>, pid: i32, native
 /// Make the target window AppKit-key without raising it, activating the app
 /// or taking key status from the user's window (the focus record only, as the
 /// background pixel click does), then let AppKit settle.
-fn prime_key_window_for_background_press(pid: i32, window_id: u32, action: &str) {
+fn prime_key_window_for_background_press(pid: i32, window_id: u32, action: &str, in_batch: bool) {
     let native = !super::type_text::is_browser_pid(pid)
         && !crate::browser::electron_js::ElectronJs::is_electron(pid);
-    if press_needs_key_window(action, apps::frontmost_pid(), pid, native)
-        && crate::input::skylight::activate_without_raise_with(pid, window_id, false)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(80));
+    let front = apps::frontmost_pid();
+    if !press_needs_key_window(action, front, pid, native) {
+        return;
+    }
+    let primed = PrimedKeyWindow {
+        pid,
+        window_id,
+        front,
+        activation_epoch: crate::window_change_detector::intentional_epoch(),
+    };
+    if in_batch && primed.reuse() {
+        return;
+    }
+    if crate::input::skylight::activate_without_raise_with(pid, window_id, false) {
+        crate::timing::sleep(std::time::Duration::from_millis(80));
+        primed.record();
+    }
+}
+
+/// The window an earlier step of the running batch made key. A batch's
+/// presses on one window need it primed once, provided that since then the
+/// same app stayed in front, the driver activated no app and posted no other
+/// focus record (the record generation is unchanged).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PrimedKeyWindow {
+    pid: i32,
+    window_id: u32,
+    front: Option<i32>,
+    activation_epoch: u64,
+}
+
+static LAST_PRIMED: std::sync::Mutex<Option<(PrimedKeyWindow, u64, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// Steps of a batch follow each other within this; after a longer gap the
+/// window is primed again.
+const PRIMED_KEY_WINDOW_REUSE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+impl PrimedKeyWindow {
+    /// Whether the last press primed this window, recently; renews it if so.
+    fn reuse(self) -> bool {
+        let mut last = LAST_PRIMED.lock().unwrap_or_else(|e| e.into_inner());
+        match last.as_mut() {
+            Some((primed, generation, at))
+                if *primed == self
+                    && *generation == crate::input::skylight::key_record_generation()
+                    && at.elapsed() < PRIMED_KEY_WINDOW_REUSE =>
+            {
+                *at = std::time::Instant::now();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn record(self) {
+        *LAST_PRIMED.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+            self,
+            crate::input::skylight::key_record_generation(),
+            std::time::Instant::now(),
+        ));
     }
 }
 
@@ -1597,6 +1657,14 @@ unsafe fn ancestor_roles(element: AXUIElementRef) -> Vec<String> {
     roles
 }
 
+/// How [`perform_ax_click`] delivers: inside a foreground turn, or to a
+/// background window, as a step of a batch or a direct call.
+#[derive(Clone, Copy)]
+enum AxClickDelivery {
+    Foreground,
+    Background { in_batch: bool },
+}
+
 fn perform_ax_click(
     element: (usize, usize),
     window: (i32, u32),
@@ -1604,8 +1672,9 @@ fn perform_ax_click(
     cursor_key: &str,
     selection_pixel: Option<SelectionPixelTarget>,
     modifiers: &[String],
-    foreground: bool,
+    delivery: AxClickDelivery,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
+    let foreground = matches!(delivery, AxClickDelivery::Foreground);
     let (element_ptr, idx) = element;
     let (pid, window_id) = window;
     let ax_action = crate::input::ax_actions::map_action(action_str)?;
@@ -1681,7 +1750,7 @@ fn perform_ax_click(
             // accepting a candidate, then require the same state to survive a
             // second observation. A modified selection additionally preserves
             // every peer that was selected before delivery.
-            std::thread::sleep(SELECTION_READBACK_SETTLE);
+            crate::timing::sleep(SELECTION_READBACK_SETTLE);
             let deadline = std::time::Instant::now() + SELECTION_READBACK_TIMEOUT;
             let mut last_observation = None;
             loop {
@@ -1694,7 +1763,7 @@ fn perform_ax_click(
                         peers_preserved,
                     );
                     if verified {
-                        std::thread::sleep(SELECTION_READBACK_STABILITY);
+                        crate::timing::sleep(SELECTION_READBACK_STABILITY);
                         if let Some((stable_after, stable_peers_preserved)) = selection.observe() {
                             last_observation = Some((stable_after, stable_peers_preserved));
                             if stable_after == after
@@ -1724,7 +1793,7 @@ fn perform_ax_click(
                 if std::time::Instant::now() >= deadline {
                     break;
                 }
-                std::thread::sleep(SELECTION_READBACK_POLL);
+                crate::timing::sleep(SELECTION_READBACK_POLL);
             }
             if modifiers.is_empty() {
                 anyhow::bail!(
@@ -1747,8 +1816,8 @@ fn perform_ax_click(
     let toggle_before = is_toggle_press(ax_action, &role, &advertised)
         .then(read_value)
         .flatten();
-    if !foreground {
-        prime_key_window_for_background_press(pid, window_id, ax_action);
+    if let AxClickDelivery::Background { in_batch } = delivery {
+        prime_key_window_for_background_press(pid, window_id, ax_action, in_batch);
     }
     let err = unsafe { crate::ax::bindings::perform_action(element, ax_action) };
     if err != crate::ax::bindings::kAXErrorSuccess {
@@ -1979,6 +2048,46 @@ mod tests {
     /// The pixel focus rung keeps working after unknown AX action names
     /// started refusing: background pixel typing into Electron depended on it.
     /// An element can be focused too.
+    /// A batch primes a window once; a different window, front app, driver
+    /// activation or focus record, or a long gap, primes it again.
+    #[test]
+    fn a_batch_reuses_its_primed_key_window_until_focus_moves() {
+        let primed = PrimedKeyWindow {
+            pid: 4242,
+            window_id: 7,
+            front: Some(1),
+            activation_epoch: crate::window_change_detector::intentional_epoch(),
+        };
+        primed.record();
+        assert!(primed.reuse());
+        assert!(!PrimedKeyWindow {
+            window_id: 8,
+            ..primed
+        }
+        .reuse());
+        assert!(!PrimedKeyWindow {
+            front: Some(2),
+            ..primed
+        }
+        .reuse());
+        assert!(!PrimedKeyWindow {
+            activation_epoch: primed.activation_epoch + 1,
+            ..primed
+        }
+        .reuse());
+        assert!(primed.reuse());
+
+        crate::input::skylight::note_key_record();
+        assert!(
+            !primed.reuse(),
+            "a focus record posted since moves key status"
+        );
+
+        primed.record();
+        LAST_PRIMED.lock().unwrap().as_mut().unwrap().2 -= PRIMED_KEY_WINDOW_REUSE;
+        assert!(!primed.reuse(), "a long gap primes again");
+    }
+
     #[test]
     fn pixel_click_accepts_the_internal_focus_action() {
         assert!(validate_click_action("focus", false).is_ok());

@@ -61,7 +61,7 @@ fn glide_hold_up(pacing: StepPacing, glide: Duration) -> Duration {
     runtime.block_on(scope(pacing, async move {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         std::thread::spawn(move || {
-            std::thread::sleep(glide);
+            crate::timing::sleep(glide);
             let _ = tx.send(());
         });
         let started = Instant::now();

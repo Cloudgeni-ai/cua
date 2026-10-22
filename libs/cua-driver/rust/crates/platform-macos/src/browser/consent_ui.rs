@@ -291,7 +291,7 @@ pub fn dismiss(pid: i32, approved_window_id: u32) -> Result<bool, BrowserRefusal
                 "the remote-debugging consent sheet remained after its exact cancel action",
             ));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        crate::timing::sleep(Duration::from_millis(100));
     }
 }
 

@@ -297,7 +297,7 @@ mod tests {
         let delegate = FinishDelegate(signal.clone());
         let started = Instant::now();
         let finisher = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(150));
+            crate::timing::sleep(Duration::from_millis(150));
             delegate.recording_did_finish();
         });
         assert_eq!(signal.wait(Duration::from_secs(10)), Ok(()));
@@ -347,7 +347,7 @@ mod tests {
             let backend = SckitVideoBackendFactory
                 .start(&path)
                 .expect("start sckit recording");
-            thread::sleep(Duration::from_millis(120));
+            crate::timing::sleep(Duration::from_millis(120));
             let meta = backend.stop().expect("stop sckit recording");
             assert!(meta.finalized);
             let len = std::fs::metadata(&path).expect("recording exists").len();

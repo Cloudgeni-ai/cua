@@ -137,7 +137,7 @@ fn focus_hotkey_element(pid: i32, element_ptr: usize) -> anyhow::Result<()> {
         if std::time::Instant::now() >= deadline {
             anyhow::bail!("requested hotkey element did not become focused");
         }
-        std::thread::sleep(HOTKEY_FOCUS_POLL_INTERVAL);
+        crate::timing::sleep(HOTKEY_FOCUS_POLL_INTERVAL);
     }
 }
 

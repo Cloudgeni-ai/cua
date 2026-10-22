@@ -213,7 +213,7 @@ fn click_at_xy_desktop_inner(
     // Re-couple cursor + mouse-delta so the synthesized click hit-tests at the
     // warped point, not the pre-warp one.
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::timing::sleep(std::time::Duration::from_millis(40));
     let result = super::keyboard::with_global_modifier_keys(modifiers, |flags| {
         if !modifiers.is_empty() {
             // Prime AppKit's cursor-tracking state after the physical modifiers
@@ -228,7 +228,7 @@ fn click_at_xy_desktop_inner(
             .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(move) failed"))?;
             moved.set_flags(flags);
             moved.post(CGEventTapLocation::HID);
-            std::thread::sleep(std::time::Duration::from_millis(12));
+            crate::timing::sleep(std::time::Duration::from_millis(12));
         }
 
         for pair_index in 0..count.max(1) {
@@ -240,7 +240,7 @@ fn click_at_xy_desktop_inner(
                 (pair_index + 1) as i64,
             );
             down.post(CGEventTapLocation::HID);
-            std::thread::sleep(std::time::Duration::from_millis(28));
+            crate::timing::sleep(std::time::Duration::from_millis(28));
             let up = CGEvent::new_mouse_event(source.clone(), up_ty, point, btn)
                 .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
             up.set_flags(flags);
@@ -250,7 +250,7 @@ fn click_at_xy_desktop_inner(
             );
             up.post(CGEventTapLocation::HID);
             if count > 1 {
-                std::thread::sleep(std::time::Duration::from_millis(80));
+                crate::timing::sleep(std::time::Duration::from_millis(80));
             }
         }
         Ok(())
@@ -258,7 +258,7 @@ fn click_at_xy_desktop_inner(
 
     // Let AppKit consume the up event before the pointer is restored. The
     // exact foreground guard remains active around this entire helper.
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::timing::sleep(std::time::Duration::from_millis(40));
     if let Some(prior) = prior {
         let _ = CGDisplay::warp_mouse_cursor_position(prior);
         unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
@@ -283,7 +283,7 @@ pub fn move_cursor_desktop(x: f64, y: f64) -> anyhow::Result<()> {
     // instant was occasionally dropped (1 of 5 in the VM check). A second
     // move a moment later is harmless when the first one landed.
     for _ in 0..2 {
-        std::thread::sleep(std::time::Duration::from_millis(15));
+        crate::timing::sleep(std::time::Duration::from_millis(15));
         post_pointer_moved(point)?;
     }
     Ok(())
@@ -314,7 +314,7 @@ pub fn scroll_wheel_desktop(
     use core_graphics::event::{CGEventTapLocation, ScrollEventUnit};
 
     move_cursor_desktop(x, y)?;
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::timing::sleep(std::time::Duration::from_millis(40));
     for _ in 0..ticks.max(1) {
         // AppKit does not reliably consume synthetic LINE-unit events posted
         // through the global HID queue. pynput's proven macOS desktop path uses
@@ -338,7 +338,7 @@ pub fn scroll_wheel_desktop(
         }
         let event = unsafe { CGEvent::from_ptr(event_ref) };
         event.post(CGEventTapLocation::HID);
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        crate::timing::sleep(std::time::Duration::from_millis(30));
     }
     Ok(())
 }
@@ -444,7 +444,7 @@ fn click_at_xy_inner(
             click_group_id,
             post_mode,
         );
-        std::thread::sleep(std::time::Duration::from_millis(12));
+        crate::timing::sleep(std::time::Duration::from_millis(12));
 
         for pair_index in 0..count {
             let click_state = (pair_index + 1) as i64;
@@ -472,7 +472,7 @@ fn click_at_xy_inner(
             // 28 ms down→up gap: an NSButton's mouseDown enters a modal
             // tracking loop that polls for the matching mouseUp; too tight a
             // gap can race the loop's first poll and the click is dropped.
-            std::thread::sleep(std::time::Duration::from_millis(28));
+            crate::timing::sleep(std::time::Duration::from_millis(28));
 
             let up = CGEvent::new_mouse_event(
                 source.clone(),
@@ -496,7 +496,7 @@ fn click_at_xy_inner(
             );
 
             if count > 1 {
-                std::thread::sleep(std::time::Duration::from_millis(80));
+                crate::timing::sleep(std::time::Duration::from_millis(80));
             }
         }
         Ok(())
@@ -523,7 +523,7 @@ pub fn prepare_background_pixel_click(pid: i32, wid: u32) -> bool {
         crate::input::skylight::activate_without_raise_with(pid as libc::pid_t, wid, false);
     // Match Swift's settle interval so AppKit updates its active/key-window
     // routing before the mouseMoved + primer + target stream arrives.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    crate::timing::sleep(std::time::Duration::from_millis(50));
     activated
 }
 
@@ -732,7 +732,7 @@ pub fn click_at_xy_chromium(
         stamp(&event, &step);
         post(&event, &step);
         if step.delay_after_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(step.delay_after_ms));
+            crate::timing::sleep(std::time::Duration::from_millis(step.delay_after_ms));
         }
     }
 
@@ -1045,7 +1045,7 @@ where
             last_point = step.point;
         }
         if step.delay_after_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(step.delay_after_ms));
+            crate::timing::sleep(std::time::Duration::from_millis(step.delay_after_ms));
         }
         if step.kind == Dragged && stopped_at.is_none() && !keep_going() {
             stopped_at = Some(last_point);
@@ -1173,13 +1173,13 @@ where
                 ForegroundDragEventKind::Move => {
                     let _ = CGDisplay::warp_mouse_cursor_position(spec.point);
                     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
-                    std::thread::sleep(std::time::Duration::from_millis(40));
+                    crate::timing::sleep(std::time::Duration::from_millis(40));
                 }
                 ForegroundDragEventKind::Dragged => {
                     let _ = CGDisplay::warp_mouse_cursor_position(spec.point);
                 }
                 ForegroundDragEventKind::Up => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    crate::timing::sleep(std::time::Duration::from_millis(50));
                 }
                 ForegroundDragEventKind::Down => {}
             }
@@ -1202,16 +1202,16 @@ where
 
             match spec.kind {
                 ForegroundDragEventKind::Move => {
-                    std::thread::sleep(std::time::Duration::from_millis(12));
+                    crate::timing::sleep(std::time::Duration::from_millis(12));
                 }
                 ForegroundDragEventKind::Down => {
                     observe(spec.point.x, spec.point.y);
-                    std::thread::sleep(std::time::Duration::from_millis(16));
+                    crate::timing::sleep(std::time::Duration::from_millis(16));
                 }
                 ForegroundDragEventKind::Dragged => {
                     observe(spec.point.x, spec.point.y);
                     if step_delay_ms > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
+                        crate::timing::sleep(std::time::Duration::from_millis(step_delay_ms));
                     }
                 }
                 ForegroundDragEventKind::Up => {}
@@ -1220,7 +1220,7 @@ where
         Ok(())
     })?;
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    crate::timing::sleep(std::time::Duration::from_millis(100));
     Ok(())
 }
 
@@ -1312,7 +1312,7 @@ where
     let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(from_x, from_y));
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
     observe(from_x, from_y);
-    std::thread::sleep(std::time::Duration::from_millis(40));
+    crate::timing::sleep(std::time::Duration::from_millis(40));
 
     super::keyboard::with_global_modifier_keys(modifiers, |flags| {
         for spec in events {
@@ -1335,15 +1335,15 @@ where
 
             match spec.kind {
                 ForegroundDragEventKind::Move => {
-                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    crate::timing::sleep(std::time::Duration::from_millis(30));
                 }
                 ForegroundDragEventKind::Down => {
-                    std::thread::sleep(std::time::Duration::from_millis(16));
+                    crate::timing::sleep(std::time::Duration::from_millis(16));
                 }
                 ForegroundDragEventKind::Dragged => {
                     observe(spec.point.x, spec.point.y);
                     if step_delay_ms > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
+                        crate::timing::sleep(std::time::Duration::from_millis(step_delay_ms));
                     }
                 }
                 ForegroundDragEventKind::Up => {}
@@ -1354,7 +1354,7 @@ where
     // The foreground wrapper restores the previous app immediately after this
     // function returns. Let the target's run loop consume the queued HID
     // gesture, including pointer-capture release, before that restore happens.
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    crate::timing::sleep(std::time::Duration::from_millis(100));
     Ok(())
 }
 
@@ -1537,7 +1537,7 @@ fn right_click_at_xy_inner(
         click_group_id,
         MousePostMode::SkyLightPreferred,
     );
-    std::thread::sleep(std::time::Duration::from_millis(12));
+    crate::timing::sleep(std::time::Duration::from_millis(12));
 
     let down = CGEvent::new_mouse_event(source.clone(), down_type, point, button)
         .map_err(|_| anyhow::anyhow!("mouse down failed"))?;
@@ -1553,7 +1553,7 @@ fn right_click_at_xy_inner(
         3,
         MousePostMode::SkyLightPreferred,
     );
-    std::thread::sleep(std::time::Duration::from_millis(28));
+    crate::timing::sleep(std::time::Duration::from_millis(28));
 
     let up = CGEvent::new_mouse_event(source, up_type, point, button)
         .map_err(|_| anyhow::anyhow!("mouse up failed"))?;
@@ -1757,7 +1757,7 @@ pub fn scroll_wheel_at_xy(
         ),
         MousePostMode::Both,
     );
-    std::thread::sleep(std::time::Duration::from_millis(12));
+    crate::timing::sleep(std::time::Duration::from_millis(12));
 
     for _ in 0..ticks.max(1) {
         // Fresh source per event, matching the click primitives.
@@ -1799,7 +1799,7 @@ pub fn scroll_wheel_at_xy(
         crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
         event.post_to_pid(pid as libc::pid_t);
 
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        crate::timing::sleep(std::time::Duration::from_millis(30));
     }
     Ok(())
 }

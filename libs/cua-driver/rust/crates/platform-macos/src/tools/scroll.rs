@@ -251,7 +251,7 @@ impl Tool for ScrollTool {
                                             amount,
                                         )
                                     };
-                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                    crate::timing::sleep(std::time::Duration::from_millis(100));
                                     Ok(())
                                 },
                             )?;
@@ -380,7 +380,7 @@ impl Tool for ScrollTool {
                         "AXScrollToVisible",
                     );
                 }
-                std::thread::sleep(std::time::Duration::from_millis(40));
+                crate::timing::sleep(std::time::Duration::from_millis(40));
                 let center = unsafe { element_screen_center(element_ptr as AXUIElementRef) };
                 let rect = unsafe {
                     crate::ax::bindings::element_screen_rect(element_ptr as AXUIElementRef)
@@ -665,7 +665,7 @@ impl Tool for ScrollTool {
                 tokio::task::spawn_blocking(move || {
                     for _ in 0..amount {
                         crate::input::keyboard::press_key(pid, &key, &[])?;
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        crate::timing::sleep(std::time::Duration::from_millis(50));
                     }
                     Ok::<(), anyhow::Error>(())
                 })
@@ -801,7 +801,7 @@ unsafe fn scroll_native_text_area(
                 break;
             }
             delivered = true;
-            std::thread::sleep(std::time::Duration::from_millis(30));
+            crate::timing::sleep(std::time::Duration::from_millis(30));
         }
     }
     for button in buttons {

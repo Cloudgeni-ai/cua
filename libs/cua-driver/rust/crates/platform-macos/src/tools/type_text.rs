@@ -1204,7 +1204,7 @@ fn await_front_settled(pid: i32, window_id: u32) -> bool {
         if now >= deadline {
             return false;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        crate::timing::sleep(std::time::Duration::from_millis(20));
     }
 }
 
@@ -1236,7 +1236,7 @@ fn cgevent_type_verified(
     if let Some((ptr, _)) = element_ptr_and_idx {
         let _ = crate::input::ax_actions::focus_element(ptr);
         if settle_ms > 0 && !crate::input::ax_actions::is_element_focused(pid, ptr) {
-            std::thread::sleep(FOCUS_REAPPLY_DELAY);
+            crate::timing::sleep(FOCUS_REAPPLY_DELAY);
             let _ = crate::input::ax_actions::focus_element(ptr);
         }
     }
@@ -1247,7 +1247,7 @@ fn cgevent_type_verified(
     // "i " was dropped). A short sleep here covers that. Background/terminal call
     // sites pass 0 — they have no front transition and must not pay this latency.
     if settle_ms > 0 {
-        std::thread::sleep(std::time::Duration::from_millis(settle_ms));
+        crate::timing::sleep(std::time::Duration::from_millis(settle_ms));
     }
     crate::input::keyboard::type_text_with_delay(pid, text, delay_ms)?;
 
@@ -1287,7 +1287,7 @@ fn await_typed_delivery(
         if std::time::Instant::now() >= deadline {
             return (false, best_partial);
         }
-        std::thread::sleep(DELIVERY_DRAIN_POLL_INTERVAL);
+        crate::timing::sleep(DELIVERY_DRAIN_POLL_INTERVAL);
     }
 }
 
@@ -1454,7 +1454,7 @@ fn type_text_in_key_window(
                     wid,
                     || {
                         if foreground_settle_ms > 0 {
-                            std::thread::sleep(std::time::Duration::from_millis(
+                            crate::timing::sleep(std::time::Duration::from_millis(
                                 foreground_settle_ms,
                             ));
                         }

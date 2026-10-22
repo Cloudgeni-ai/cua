@@ -539,7 +539,7 @@ fn set_value_blocking(
                 if secure || !write_not_applied(verified, changed) {
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                crate::timing::sleep(std::time::Duration::from_millis(100));
                 after = unsafe { copy_string_attr(element, "AXValue") };
                 (verified, changed) = classify_write(
                     before.as_deref(),
@@ -858,10 +858,10 @@ fn dismiss_popup_menu(popup: AXUIElementRef, pid: i32) {
     while popup_menu_is_open(popup) {
         if std::time::Instant::now() >= deadline {
             let _ = crate::input::keyboard::press_key_no_auth(pid, "escape", &[]);
-            std::thread::sleep(POPUP_CLOSE_TIMEOUT);
+            crate::timing::sleep(POPUP_CLOSE_TIMEOUT);
             return;
         }
-        std::thread::sleep(POPUP_POLL_INTERVAL);
+        crate::timing::sleep(POPUP_POLL_INTERVAL);
     }
 }
 
@@ -963,7 +963,7 @@ fn select_chromium_popup_by_typeahead(
     }
     // Focus moves inside the page only: no activation, no window order change.
     unsafe { crate::ax::bindings::set_bool_attr_true(popup, "AXFocused") };
-    std::thread::sleep(POPUP_POLL_INTERVAL);
+    crate::timing::sleep(POPUP_POLL_INTERVAL);
     if unsafe { copy_bool_attr(popup, "AXFocused") } != Some(true) {
         return None;
     }
@@ -990,7 +990,7 @@ fn select_chromium_popup_by_typeahead(
             );
             return None;
         }
-        std::thread::sleep(POPUP_POLL_INTERVAL);
+        crate::timing::sleep(POPUP_POLL_INTERVAL);
     }
 }
 
@@ -1084,7 +1084,7 @@ fn select_popup_option(
                 break;
             }
             release_options(&options);
-            std::thread::sleep(POPUP_POLL_INTERVAL);
+            crate::timing::sleep(POPUP_POLL_INTERVAL);
         }
         if options.is_empty() {
             dismiss_popup_menu(element, pid);
@@ -1231,7 +1231,7 @@ fn set_select_via_js(
                     let _ = child.kill();
                     anyhow::bail!("osascript timed out after 10 seconds");
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                crate::timing::sleep(std::time::Duration::from_millis(50));
             }
             Err(e) => anyhow::bail!("osascript wait error: {e}"),
         }

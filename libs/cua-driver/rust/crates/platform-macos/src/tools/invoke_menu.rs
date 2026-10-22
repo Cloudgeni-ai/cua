@@ -224,7 +224,7 @@ unsafe fn close_opened_menu(
 ) -> Option<bool> {
     // An action that reported an error can still open its menu a moment
     // later; give it the same settle time as a hop before looking.
-    std::thread::sleep(Duration::from_millis(80));
+    crate::timing::sleep(Duration::from_millis(80));
     if crate::windows::new_menu_windows(pid, menus_before)? == 0 {
         return Some(true);
     }
@@ -319,7 +319,7 @@ unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<(), String> {
                 ));
             }
             if depth + 1 != path.len() {
-                std::thread::sleep(Duration::from_millis(80));
+                crate::timing::sleep(Duration::from_millis(80));
             }
         }
         Ok(())
@@ -490,7 +490,7 @@ fn focus_exact_window(pid: i32, window_id: u32) -> Result<(), String> {
         return Err("invoke_menu: target application could not be activated".into());
     }
     if !native_key_requested {
-        std::thread::sleep(Duration::from_millis(120));
+        crate::timing::sleep(Duration::from_millis(120));
     }
 
     focus_ax_window_with_thread_affinity(pid, window_id)?;
@@ -521,7 +521,7 @@ fn focus_exact_window(pid: i32, window_id: u32) -> Result<(), String> {
                 "invoke_menu: target window {window_id} did not become stably key and frontmost"
             ));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        crate::timing::sleep(Duration::from_millis(20));
     }
 }
 
@@ -678,7 +678,7 @@ unsafe fn invoke_path_in_background(
         {
             let mut waited = Duration::ZERO;
             while waited < ENABLE_WAIT && copy_bool_attr(target, "AXEnabled") == Some(false) {
-                std::thread::sleep(ENABLE_POLL);
+                crate::timing::sleep(ENABLE_POLL);
                 waited += ENABLE_POLL;
             }
         }

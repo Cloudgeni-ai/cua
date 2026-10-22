@@ -524,7 +524,7 @@ fn resolve_windows_for_pid(pid: i32) -> Vec<crate::windows::WindowInfo> {
             return found;
         }
         if attempt < 4 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            crate::timing::sleep(std::time::Duration::from_millis(100));
         }
     }
     vec![]

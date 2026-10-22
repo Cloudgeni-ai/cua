@@ -568,7 +568,7 @@ pub fn wait_for_grants(opts: &GateOpts) -> Result<()> {
             }
         }
 
-        std::thread::sleep(opts.poll_interval);
+        crate::timing::sleep(opts.poll_interval);
 
         let new_missing = check_required_permissions();
         if new_missing != last_missing {

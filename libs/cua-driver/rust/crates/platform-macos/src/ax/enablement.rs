@@ -201,7 +201,7 @@ fn pump_bounded(seconds: f64, mut pump: impl FnMut(f64)) {
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
     if !remaining.is_zero() {
-        std::thread::sleep(remaining);
+        crate::timing::sleep(remaining);
     }
 }
 
