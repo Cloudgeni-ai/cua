@@ -59,7 +59,7 @@ pub mod session;
 mod step_latency_bench;
 #[cfg(target_os = "macos")]
 pub mod terminal;
-
+#[cfg(target_os = "macos")]
 pub mod timing;
 #[cfg(target_os = "macos")]
 pub mod tools;
