@@ -850,6 +850,7 @@ impl Tool for ClickTool {
             let selection_modifiers = modifiers.clone();
             // The blocking thread below does not inherit the batch marker.
             let in_batch = cua_driver_core::step_pacing::in_batch();
+            let focus_readback_guard = element_guard.clone();
             let result = focus_guard::with_focus_suppressed(
                 if foreground { None } else { Some(pid) },
                 prior_front,
@@ -932,6 +933,28 @@ impl Tool for ClickTool {
                             .saturating_sub(acted_at.elapsed());
                         tokio::time::sleep(settle).await;
                     }
+                    // Pressing a text field focuses it; that is its whole
+                    // effect, and the field's own focus confirms it.
+                    let focus_confirmed = !selection_verified
+                        && !suspected_noop
+                        && effective_action == "press"
+                        && tokio::task::spawn_blocking(move || {
+                            let element = focus_readback_guard.as_ptr();
+                            let role = unsafe {
+                                crate::ax::bindings::copy_string_attr(
+                                    element as crate::ax::bindings::AXUIElementRef,
+                                    "AXRole",
+                                )
+                            }
+                            .unwrap_or_default();
+                            is_text_entry_role(&role)
+                                && crate::input::ax_actions::element_has_keyboard_focus(
+                                    pid,
+                                    element,
+                                )
+                        })
+                        .await
+                        .unwrap_or(false);
                     msg.push_str(&changes.result_suffix());
                     // AX dispatch went through, but AXPerformAction returning
                     // success does not confirm the on-screen effect (many elements
@@ -950,8 +973,8 @@ impl Tool for ClickTool {
                         } else {
                             "ax"
                         },
-                        "verified": selection_verified,
-                        "effect": if selection_verified {
+                        "verified": selection_verified || focus_confirmed,
+                        "effect": if selection_verified || focus_confirmed {
                             "confirmed"
                         } else if suspected_noop {
                             "suspected_noop"
@@ -959,7 +982,7 @@ impl Tool for ClickTool {
                             "unverifiable"
                         },
                     });
-                    if selection_verified {
+                    if selection_verified || focus_confirmed {
                         structured["evidence"] = serde_json::json!([
                             { "kind": "accessibility_readback" }
                         ]);
@@ -1616,6 +1639,15 @@ impl PrimedKeyWindow {
 /// ancestor) have a DOM focus to settle; waiting on a native field only
 /// delays the result. `ancestor_roles` is read only for a text input pressed
 /// with `AXPress`.
+/// Roles whose press means "put the caret here": a native or web text field,
+/// a text area, a search field or an editable combo box.
+fn is_text_entry_role(role: &str) -> bool {
+    matches!(
+        role,
+        "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox" | "AXSecureTextField"
+    )
+}
+
 fn needs_web_focus_settle(
     ax_action: &str,
     role: &str,
@@ -1949,6 +1981,21 @@ fn perform_ax_click(
     let _ = window_id; // used by caller context
 
     Ok((summary, needs_webkit_delay, suspected_noop, false, false))
+}
+
+#[cfg(test)]
+mod text_entry_role_tests {
+    use super::is_text_entry_role;
+
+    #[test]
+    fn text_inputs_are_text_entry_and_buttons_are_not() {
+        for role in ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"] {
+            assert!(is_text_entry_role(role), "{role}");
+        }
+        for role in ["AXButton", "AXLink", "AXCheckBox", "AXIncrementor", ""] {
+            assert!(!is_text_entry_role(role), "{role}");
+        }
+    }
 }
 
 #[cfg(test)]
