@@ -406,6 +406,17 @@ impl Found {
     pub fn describe(&self) -> String {
         describe_element(&self.element)
     }
+
+    /// When an element of another role stood in for the role named: its own
+    /// role and label, so a caller can say what was used without parsing
+    /// the note.
+    pub fn stand_in(&self) -> Option<Value> {
+        self.role_note.as_ref()?;
+        Some(json!({
+            "role": self.element.get("role").and_then(Value::as_str).unwrap_or_default(),
+            "name": label_of(&self.element),
+        }))
+    }
 }
 
 /// Why a lookup or check did not succeed.

@@ -709,6 +709,9 @@ impl<'a> Api<'a> {
             if let Some(note) = &found.role_note {
                 found_target["role_note"] = json!(note);
             }
+            if let Some(stand_in) = found.stand_in() {
+                found_target["stand_in"] = stand_in;
+            }
             target = Some(found_target);
         } else if window.window_id.is_none()
             && (window.pid.is_some() || window.app.is_some() || window.title.is_some())

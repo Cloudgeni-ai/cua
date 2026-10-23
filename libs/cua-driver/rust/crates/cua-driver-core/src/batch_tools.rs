@@ -953,6 +953,9 @@ async fn run_step(
                         report["target"]["role_note"] = json!(note);
                         notes.push(note.clone());
                     }
+                    if let Some(stand_in) = found.stand_in() {
+                        report["target"]["stand_in"] = stand_in;
+                    }
                     notes.push(format!(
                         "on {} in {}",
                         found.describe(),

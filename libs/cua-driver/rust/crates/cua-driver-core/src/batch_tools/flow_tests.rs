@@ -588,6 +588,10 @@ async fn a_button_named_for_a_link_is_pressed_as_the_link_at_once() {
         .as_str()
         .unwrap()
         .contains("used the link"));
+    assert_eq!(
+        structured["steps"][1]["target"]["stand_in"],
+        json!({"role": "AXLink", "name": "Edit billing"})
+    );
     assert!(structured["steps"][0]["wait_for"]["role_note"]
         .as_str()
         .unwrap()
