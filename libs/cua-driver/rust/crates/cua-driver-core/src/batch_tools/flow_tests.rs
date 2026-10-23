@@ -65,6 +65,11 @@ impl Ui {
                 }
                 rows
             }
+            // A page with two links "Details" and no button of the name.
+            5 => vec![
+                ("AXLink", "Details".into(), None),
+                ("AXLink", "Details".into(), None),
+            ],
             _ => {
                 let mut rows = vec![("AXButton", "Back".into(), None)];
                 if self.finish_delay_reads == 0 {
@@ -670,4 +675,39 @@ async fn a_button_that_appears_after_a_link_of_its_name_is_the_one_pressed() {
     assert!(!message.contains("used the link"), "{message}");
     let structured = result.structured_content.unwrap();
     assert!(structured["steps"][1]["target"]["stand_in"].is_null());
+}
+
+#[tokio::test]
+async fn two_links_of_the_name_fail_a_button_step_once_the_window_settles() {
+    // Neither link is the one meant: the wait does not hold on either, and
+    // the step fails naming both, without waiting out its timeout.
+    for steps in [
+        json!([
+            {"wait_for": {"app": "Demo", "role": "button", "name": "Details", "exact": true,
+                          "enabled": true, "timeout_ms": 10000}},
+            {"click": {"role": "button", "name": "Details", "exact": true}}
+        ]),
+        json!([{"click": {"app": "Demo", "role": "button", "name": "Details", "exact": true}}]),
+    ] {
+        let harness = Harness::new();
+        harness.ui.lock().unwrap().screen = 5;
+        let started = std::time::Instant::now();
+        let result = harness.run(json!({ "steps": steps })).await;
+        let elapsed = started.elapsed();
+        assert_eq!(result.is_error, Some(true), "{}", text(&result));
+        let message = text(&result);
+        assert!(
+            message.contains(
+                "2 elements of other roles have that exact name; name the role of the one \
+                 meant: [1] AXLink \"Details\"; [2] AXLink \"Details\""
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("used the link"), "{message}");
+        assert!(elapsed >= Duration::from_millis(1_400), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+        assert!(harness.calls("click").is_empty(), "nothing pressed");
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["steps"][0]["code"], "ambiguous", "{structured}");
+    }
 }

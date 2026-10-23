@@ -430,8 +430,9 @@ pub(crate) struct Miss {
     pub message: String,
     pub window: Option<Window>,
     /// For a `not_found` whose name is shown only on an element of another
-    /// role: the read's element count, so a poll can tell when the window
-    /// has stopped changing and stop waiting early.
+    /// role, or an `ambiguous` whose name is on several elements of a role
+    /// pressed alike: the read's element count, so a poll can tell when the
+    /// window has stopped changing and stop waiting early.
     pub other_role_only: Option<usize>,
 }
 
@@ -449,14 +450,17 @@ impl Miss {
     /// read, or an ambiguous match, will not fix itself, and retrying a
     /// refused read would only repeat the refusal.
     fn worth_waiting(&self) -> bool {
-        matches!(
-            self.code,
-            "not_found"
-                | "app_not_found"
-                | "window_not_found"
-                | "still_present"
-                | "unexpected_state"
-        )
+        // Several elements of a role pressed alike: the role named may yet
+        // appear, until the window settles.
+        (self.code == "ambiguous" && self.other_role_only.is_some())
+            || matches!(
+                self.code,
+                "not_found"
+                    | "app_not_found"
+                    | "window_not_found"
+                    | "still_present"
+                    | "unexpected_state"
+            )
     }
 
     fn in_window(mut self, window: &Window) -> Self {
@@ -893,7 +897,16 @@ impl<'a> Locator<'a> {
                     stand_in.get_or_insert(found);
                 }
                 Err(miss) if miss.code == "ambiguous" || miss.code == "not_addressable" => {
-                    return Err(miss.in_window(window))
+                    // Several of a role pressed alike: the role named may be
+                    // in another window.
+                    if miss.other_role_only.is_some() {
+                        let size = read.elements.len();
+                        if best_miss.as_ref().is_none_or(|(best, _)| size > *best) {
+                            best_miss = Some((size, miss.in_window(window)));
+                        }
+                        continue;
+                    }
+                    return Err(miss.in_window(window));
                 }
                 Err(miss) => {
                     let size = read.elements.len();
@@ -1184,22 +1197,7 @@ fn pick(read: &Read, spec: &ElementSpec) -> Result<Found, Miss> {
                     alike[0]
                 }
                 Some(OtherRole::PressedAlike(alike)) => {
-                    let listed: Vec<String> = alike
-                        .iter()
-                        .take(CANDIDATES_SHOWN)
-                        .map(|element| describe_element(element))
-                        .collect();
-                    return Err(Miss::new(
-                        "ambiguous",
-                        format!(
-                            "no {} in {}, and {} elements of other roles have that exact \
-                             name; name the role of the one meant: {}",
-                            spec.describe(),
-                            read.window.describe(),
-                            alike.len(),
-                            listed.join("; ")
-                        ),
-                    ));
+                    return Err(several_alike(read, spec, &alike));
                 }
                 other => {
                     let mut miss = Miss::new(
@@ -1349,6 +1347,30 @@ fn role_note_for(spec: &ElementSpec, used: &Value) -> String {
     )
 }
 
+/// Nothing of the role named, and several elements of a role pressed alike
+/// have the exact name: no one of them is the one meant. A poll waits for the
+/// window to settle, as the role named may yet appear.
+fn several_alike(read: &Read, spec: &ElementSpec, alike: &[&Value]) -> Miss {
+    let listed: Vec<String> = alike
+        .iter()
+        .take(CANDIDATES_SHOWN)
+        .map(|element| describe_element(element))
+        .collect();
+    let mut miss = Miss::new(
+        "ambiguous",
+        format!(
+            "no {} in {}, and {} elements of other roles have that exact name; name the role \
+             of the one meant: {}",
+            spec.describe(),
+            read.window.describe(),
+            alike.len(),
+            listed.join("; ")
+        ),
+    );
+    miss.other_role_only = Some(read.elements.len());
+    miss
+}
+
 /// `Ok((observed, role_note))` when the check holds against this read.
 /// `role_note` is set when it held on an element of a role pressed alike
 /// with the one named, because nothing had that role.
@@ -1381,10 +1403,13 @@ fn evaluate(check: &Check, read: &Read) -> Result<(Option<String>, Option<String
     let mut other_role_only = None;
     if !present && !check.gone && check.element.text.is_none() {
         match other_roles(read, &check.element) {
-            Some(OtherRole::PressedAlike(alike)) => {
+            Some(OtherRole::PressedAlike(alike)) if alike.len() == 1 => {
                 structured = alike;
                 substituted = true;
                 present = true;
+            }
+            Some(OtherRole::PressedAlike(alike)) => {
+                return Err(several_alike(read, &check.element, &alike).in_window(&read.window));
             }
             Some(OtherRole::Unlike) => other_role_only = Some(read.elements.len()),
             None => {}
