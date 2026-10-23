@@ -87,7 +87,7 @@ pub unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
 /// Decide an addressed element's ancestry from what was read about it.
 ///
 /// `adopted` is whether the requested window adopts the element's own window
-/// into its tree (see [`element_in_window`]); it only matters when that
+/// into its tree (see [`window_adopts_element`]); it only matters when that
 /// window is another one.
 fn element_ancestry(
     window: Option<u32>,
@@ -97,16 +97,15 @@ fn element_ancestry(
 ) -> ElementAncestry {
     match window {
         Some(id) if id == requested => ElementAncestry::ProvenDescendant,
-        Some(_) if adopted => ElementAncestry::ProvenDescendant,
+        Some(owner_window_id) if adopted => ElementAncestry::AdoptedWindow { owner_window_id },
         Some(owner_window_id) => ElementAncestry::OutsideTargetWindow { owner_window_id },
         None if in_app_menu_bar => ElementAncestry::ProvenDescendant,
         None => ElementAncestry::Unproven,
     }
 }
 
-/// Whether `element` belongs to window `window_id` of `pid`: its own window
-/// is that window (see [`element_window_id`]), or its own window is one the
-/// requested window adopts into its accessibility tree.
+/// Whether window `window_id` of `pid` adopts the window `element` lives in
+/// (`element` being in another window than `window_id`).
 ///
 /// Chrome draws a bubble (Save password?, translate, site permissions,
 /// downloads) as a separate window anchored to the browser window. It lists
@@ -115,22 +114,13 @@ fn element_ancestry(
 /// window. The adoption is why a snapshot of the browser window shows the
 /// bubble, and it is the proof used here: the element's window, or its
 /// content root, must be a child of an element in the requested window's own
-/// tree. An unrelated window of the same app is never adopted, so it stays
-/// outside.
+/// tree. An unrelated window of the same app is never adopted.
 ///
-/// # Safety
-///
-/// `element` must be a valid `AXUIElementRef` for the duration of the call.
-pub unsafe fn element_in_window(pid: i32, element: AXUIElementRef, window_id: u32) -> bool {
-    match element_window_id(element) {
-        Some(id) if id == window_id => true,
-        Some(_) => window_adopts_element(pid, element, window_id),
-        None => false,
-    }
-}
-
-/// Whether window `window_id` of `pid` adopts the window `element` lives in.
-/// See [`element_in_window`].
+/// Adoption proves the element is the requested window's to act on through
+/// accessibility only: the bubble is still its own window, so pointer and key
+/// input stamped for the requested window would land under it (see
+/// [`ElementAncestry::AdoptedWindow`]). Pixel hit-tests and focus checks
+/// therefore keep comparing [`element_window_id`] exactly.
 ///
 /// # Safety
 ///
@@ -360,7 +350,7 @@ fn resolve_owning_window<E>(
 /// Caller must `CFRelease` the returned element.
 pub unsafe fn focused_element_in_window(pid: i32, window_id: u32) -> Option<AXUIElementRef> {
     let element = focused_element_of_pid(pid)?;
-    if element_in_window(pid, element, window_id) {
+    if element_window_id(element) == Some(window_id) {
         Some(element)
     } else {
         CFRelease(element as CFTypeRef);
@@ -556,14 +546,16 @@ mod tests {
     }
 
     #[test]
-    fn element_of_an_adopted_window_belongs_to_the_adopting_window() {
+    fn element_of_an_adopted_window_is_marked_adopted() {
         use super::element_ancestry;
         use cua_driver_core::background_input::ElementAncestry::*;
         // Chrome's Save password? bubble (window 2142) adopted by the
         // browser window (2112) it is anchored to.
         assert_eq!(
             element_ancestry(Some(2142), true, false, 2112),
-            ProvenDescendant
+            AdoptedWindow {
+                owner_window_id: 2142
+            }
         );
         assert_eq!(
             element_ancestry(Some(2142), false, false, 2112),

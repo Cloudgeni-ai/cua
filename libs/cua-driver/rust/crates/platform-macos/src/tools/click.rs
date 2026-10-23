@@ -949,7 +949,8 @@ impl Tool for ClickTool {
                             .unwrap_or_default();
                             is_text_entry_role(&role)
                                 && crate::input::ax_actions::element_has_keyboard_focus(
-                                    pid, element,
+                                    pid,
+                                    element,
                                 )
                         })
                         .await
@@ -1230,7 +1231,7 @@ impl Tool for ClickTool {
                     // Require proven ancestry in the requested window before
                     // acting; otherwise fall through to the routed pixel path
                     // (already gated for this exact window).
-                    if !crate::ax::exact_target::element_in_window(pid, element, hit_test_wid) {
+                    if crate::ax::exact_target::element_window_id(element) != Some(hit_test_wid) {
                         CFRelease(element as _);
                         return Ok(false);
                     }

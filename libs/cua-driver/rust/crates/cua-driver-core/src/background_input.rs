@@ -40,9 +40,17 @@ pub enum ElementAncestry {
     /// The action does not address a retained element.
     NotAddressed,
     /// The live element ascends to an AX window whose CGWindowID is the
-    /// requested one, or to a window the requested one adopts into its own
-    /// accessibility tree (an attached bubble or popover window).
+    /// requested one.
     ProvenDescendant,
+    /// The live element is in another window of the process that the
+    /// requested window adopts into its own accessibility tree: an attached
+    /// bubble or popover (Chrome's Save password? bubble). Semantic AX actions
+    /// reach it; pointer and key input stamped for the requested window would
+    /// land on that window under the bubble, so they are refused.
+    AdoptedWindow {
+        /// The CGWindowID of the attached window the element is in.
+        owner_window_id: u32,
+    },
     /// The live element ascends to a different window of the same process,
     /// one the requested window does not adopt.
     OutsideTargetWindow {
@@ -131,6 +139,7 @@ pub mod refusal_codes {
     pub const MINIMIZED_OR_HIDDEN: &str = "minimized_or_hidden_window";
     pub const SAME_PID_KEYBOARD_AMBIGUITY: &str = "same_pid_keyboard_ambiguity";
     pub const ELEMENT_OUTSIDE_TARGET_WINDOW: &str = "element_outside_target_window";
+    pub const ELEMENT_IN_ATTACHED_WINDOW: &str = "element_in_attached_window";
     pub const SCREEN_LOCKED: &str = "screen_locked";
 }
 
@@ -261,6 +270,21 @@ pub fn decide_background_input(
 
     match facts.element {
         ElementAncestry::NotAddressed | ElementAncestry::ProvenDescendant => {}
+        ElementAncestry::AdoptedWindow { .. } if action == BackgroundAction::AxSemantic => {}
+        ElementAncestry::AdoptedWindow { owner_window_id } => {
+            return refuse(
+                refusal_codes::ELEMENT_IN_ATTACHED_WINDOW,
+                format!(
+                    "the addressed element is in window {owner_window_id}, a bubble or popover \
+                     attached to window {target_window}; pointer and key input sent to window \
+                     {target_window} would land under it, so none was sent. Use an \
+                     accessibility action on the element instead: a single left click on its \
+                     element_token (pressed through accessibility) or set_value",
+                    target_window = target.window_id
+                ),
+                None,
+            );
+        }
         ElementAncestry::OutsideTargetWindow { owner_window_id } => {
             return refuse(
                 refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
@@ -724,6 +748,36 @@ mod tests {
                 assert!(refusal.reason.contains("not to window 700"));
             }
             other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// An element of a bubble the target window adopts takes semantic AX
+    /// actions only: pointer and key input stamped for the target would land
+    /// on the page under the bubble, so every other route is refused and the
+    /// refusal says to use an accessibility action instead.
+    #[test]
+    fn adopted_window_element_takes_only_semantic_actions() {
+        let facts = BackgroundTargetFacts {
+            element: ElementAncestry::AdoptedWindow {
+                owner_window_id: 91,
+            },
+            ..matched_facts()
+        };
+        assert!(decide_background_input(TARGET, &facts, BackgroundAction::AxSemantic).is_execute());
+        for action in ALL_ACTIONS
+            .into_iter()
+            .chain([BackgroundAction::ExactWindowKeys])
+            .filter(|action| *action != BackgroundAction::AxSemantic)
+        {
+            match decide_background_input(TARGET, &facts, action) {
+                BackgroundInputDecision::Refuse(refusal) => {
+                    assert_eq!(refusal.code, refusal_codes::ELEMENT_IN_ATTACHED_WINDOW);
+                    assert!(refusal.reason.contains("window 91, a bubble or popover"));
+                    assert!(refusal.reason.contains("so none was sent"));
+                    assert!(refusal.advice.is_none());
+                }
+                other => panic!("{action:?} expected a refusal, got {other:?}"),
+            }
         }
     }
 

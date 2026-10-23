@@ -328,23 +328,26 @@ impl Tool for ScrollTool {
             // Revealing an element is itself an AX mutation. Prove that the
             // cached element still belongs to the exact requested window before
             // AXScrollToVisible for every direction, then keep the lease for the
-            // stricter pointer revalidation below.
+            // pointer revalidation below. The reveal only serves the wheel, so
+            // unless the scroll goes through accessibility (Electron) the
+            // pointer route must be allowed before anything is revealed: an
+            // element of a bubble the window adopts takes semantic actions but
+            // no wheel, and must not be scrolled into view and then refused.
+            let reveal_route = if electron_background {
+                cua_driver_core::background_input::BackgroundAction::AxSemantic
+            } else {
+                cua_driver_core::background_input::BackgroundAction::WindowPointer
+            };
             let semantic_gate = if !delivery_mode.is_foreground() {
                 if let Some(wid) = window_id {
                     if let Some(lease) = _mutation_lease.as_ref() {
-                        lease
-                            .gate_again(
-                                wid,
-                                Some(element_ptr),
-                                cua_driver_core::background_input::BackgroundAction::AxSemantic,
-                            )
-                            .await
+                        lease.gate_again(wid, Some(element_ptr), reveal_route).await
                     } else {
                         match super::gate_background_window_action(
                             pid,
                             wid,
                             Some(element_ptr),
-                            cua_driver_core::background_input::BackgroundAction::AxSemantic,
+                            reveal_route,
                         )
                         .await
                         {
@@ -476,9 +479,10 @@ impl Tool for ScrollTool {
                             ));
                         }
                     }
-                    // The semantic reveal gate does not authorize pointer
-                    // delivery. Revalidate the stricter route immediately
-                    // before proceeding to wheel dispatch.
+                    // Revalidate the pointer route immediately before wheel
+                    // dispatch. An element target was already revealed, so a
+                    // refusal now is partial, not a clean refusal.
+                    let revealed = pre_focus_ptr.is_some();
                     if let Some(lease) = _mutation_lease.as_ref() {
                         if let Err(refusal_result) = lease
                             .gate_again(
@@ -488,7 +492,7 @@ impl Tool for ScrollTool {
                             )
                             .await
                         {
-                            return refusal_result;
+                            return refused_after_reveal(refusal_result, revealed);
                         }
                     } else {
                         match super::gate_background_window_action(
@@ -500,7 +504,9 @@ impl Tool for ScrollTool {
                         .await
                         {
                             Ok(lease) => _mutation_lease = Some(lease),
-                            Err(refusal_result) => return refusal_result,
+                            Err(refusal_result) => {
+                                return refused_after_reveal(refusal_result, revealed)
+                            }
                         }
                     }
                 }
@@ -830,6 +836,29 @@ unsafe fn collect_ax_buttons(
     }
 }
 
+/// A wheel refused after its element target was already scrolled into view
+/// (`AXScrollToVisible` ran), when `revealed`: the window did change, so the
+/// result says the scroll was partial instead of a refusal that sent nothing.
+fn refused_after_reveal(mut result: ToolResult, revealed: bool) -> ToolResult {
+    if !revealed {
+        return result;
+    }
+    if let Some(Value::Object(map)) = result.structured_content.as_mut() {
+        map.insert("effect".into(), Value::from("partial"));
+        map.insert("revealed".into(), Value::from(true));
+    }
+    for content in &mut result.content {
+        if let cua_driver_core::protocol::Content::Text { text, .. } = content {
+            text.push_str(
+                " The element had already been scrolled into view (AXScrollToVisible), \
+                 so the window may have moved; no wheel was sent.",
+            );
+            break;
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,5 +871,26 @@ mod tests {
         assert_eq!(clamp_amount(1100), AMOUNT_MAX as usize);
         assert_eq!(clamp_amount(0), AMOUNT_MIN as usize);
         assert_eq!(clamp_amount(3), 3);
+    }
+
+    #[test]
+    fn a_wheel_refused_after_its_element_was_revealed_is_partial() {
+        let refusal = || {
+            ToolResult::error("Background input refused (minimized_or_hidden_window): x")
+                .with_structured(serde_json::json!({"effect": "refused", "code": "c"}))
+        };
+        let partial = refused_after_reveal(refusal(), true);
+        let structured = partial.structured_content.as_ref().unwrap();
+        assert_eq!(structured["effect"], "partial");
+        assert_eq!(structured["revealed"], true);
+        assert_eq!(structured["code"], "c");
+        assert!(matches!(
+            &partial.content[0],
+            cua_driver_core::protocol::Content::Text { text, .. }
+                if text.contains("already been scrolled into view")
+        ));
+        // Nothing was revealed for a pixel target: the refusal stays clean.
+        let clean = refused_after_reveal(refusal(), false);
+        assert_eq!(clean.structured_content.unwrap()["effect"], "refused");
     }
 }
