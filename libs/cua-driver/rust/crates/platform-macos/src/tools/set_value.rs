@@ -835,6 +835,9 @@ fn classify_write(
 
 // ── AXIncrement / AXDecrement stepping fallback ──────────────────────────────
 
+/// How long one AXIncrement or AXDecrement may take to show in AXValue.
+const STEP_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Step a numeric control toward `target` using its `AXIncrement` /
 /// `AXDecrement` actions. Used only when direct `AXValue` writes are rejected
 /// (notably SwiftUI's `AXSlider`, which exposes a readable-but-unsettable
@@ -869,9 +872,18 @@ fn step_to_value(element: AXUIElementRef, target: f64) -> bool {
         };
         let _ = unsafe { perform_action(element, action) };
 
-        let next = match unsafe { copy_number_attr(element, "AXValue") } {
-            Some(v) => v,
-            None => return false,
+        // Chrome shows a web range input's new value a moment after the
+        // action, so give each step a short while to show.
+        let deadline = std::time::Instant::now() + STEP_SETTLE;
+        let next = loop {
+            let next = match unsafe { copy_number_attr(element, "AXValue") } {
+                Some(v) => v,
+                None => return false,
+            };
+            if next != current || std::time::Instant::now() >= deadline {
+                break next;
+            }
+            crate::timing::sleep(std::time::Duration::from_millis(10));
         };
 
         // The action didn't move the value — the control can't be stepped (or
