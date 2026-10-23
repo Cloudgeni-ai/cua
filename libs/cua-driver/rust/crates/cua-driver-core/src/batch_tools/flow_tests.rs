@@ -46,6 +46,12 @@ impl Ui {
                 ("AXButton", "OK".into(), None),
                 ("AXButton", "OK".into(), None),
             ],
+            // A web page: "Edit billing" is a link, "Plan" only text.
+            2 => vec![
+                ("AXButton", "Cancel".into(), None),
+                ("AXLink", "Edit billing".into(), None),
+                ("AXStaticText", "Plan".into(), None),
+            ],
             _ => {
                 let mut rows = vec![("AXButton", "Back".into(), None)];
                 if self.finish_delay_reads == 0 {
@@ -543,4 +549,77 @@ async fn a_trailing_get_window_state_in_shorthand_is_the_observation() {
         harness.calls("get_window_state").last().unwrap()["window_id"],
         7
     );
+}
+
+#[tokio::test]
+async fn a_button_named_for_a_link_is_pressed_as_the_link_at_once() {
+    // Every run of a repeated web procedure asked for button "Edit billing",
+    // a link on the page: the step waited its whole timeout, then failed.
+    let harness = Harness::new();
+    harness.ui.lock().unwrap().screen = 2;
+    let started = std::time::Instant::now();
+    let result = harness
+        .run(json!({"steps": [
+            {"wait_for": {"app": "Demo", "role": "button", "name": "Edit billing", "exact": true,
+                          "enabled": true, "timeout_ms": 10000}},
+            {"click": {"role": "button", "name": "Edit billing", "exact": true}}
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    let clicks = harness.calls("click");
+    assert_eq!(clicks.len(), 1);
+    assert!(clicks[0]["element_token"].as_str().unwrap().ends_with(":2"));
+    let message = text(&result);
+    assert!(
+        message.contains(
+            "2. click ok: click Edit billing done; no button \"Edit billing\" (exact) here, \
+             so it used the link of that name, [2] AXLink \"Edit billing\"; name it as role \
+             \"link\" next time; on [2] AXLink \"Edit billing\""
+        ),
+        "{message}"
+    );
+    let structured = result.structured_content.unwrap();
+    assert!(structured["steps"][1]["target"]["role_note"]
+        .as_str()
+        .unwrap()
+        .contains("used the link"));
+    assert!(structured["steps"][0]["wait_for"]["role_note"]
+        .as_str()
+        .unwrap()
+        .contains("used the link"));
+}
+
+#[tokio::test]
+async fn a_wait_for_a_name_shown_only_as_text_stops_once_the_window_settles() {
+    let harness = Harness::new();
+    harness.ui.lock().unwrap().screen = 2;
+    let started = std::time::Instant::now();
+    let result = harness
+        .run(json!({"steps": [
+            {"wait_for": {"app": "Demo", "role": "button", "name": "Plan", "timeout_ms": 10000}},
+            {"click": {"role": "button", "name": "Plan"}}
+        ]}))
+        .await;
+    let elapsed = started.elapsed();
+    assert_eq!(result.is_error, Some(true));
+    let message = text(&result);
+    assert!(message.contains("no button \"Plan\""), "{message}");
+    assert!(
+        message.contains("nearest: [3] AXStaticText \"Plan\""),
+        "{message}"
+    );
+    assert!(
+        message.contains(
+            "the window stopped changing and shows that name only on another kind of element"
+        ),
+        "{message}"
+    );
+    assert!(elapsed >= Duration::from_millis(1_400), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+    assert!(harness.calls("click").is_empty(), "nothing pressed");
 }

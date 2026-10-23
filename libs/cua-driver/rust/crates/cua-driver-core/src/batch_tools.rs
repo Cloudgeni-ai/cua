@@ -889,6 +889,10 @@ async fn run_step(
                     "ok": true,
                     "waited_ms": checked.waited.as_millis() as u64,
                 });
+                if let Some(note) = &checked.role_note {
+                    report["wait_for"]["role_note"] = json!(note);
+                    notes.push(note.clone());
+                }
                 notes.push(format!(
                     "waited {} ms for {}",
                     checked.waited.as_millis(),
@@ -945,6 +949,10 @@ async fn run_step(
                         "window": found.window.to_json(),
                         "element": found.describe(),
                     });
+                    if let Some(note) = &found.role_note {
+                        report["target"]["role_note"] = json!(note);
+                        notes.push(note.clone());
+                    }
                     notes.push(format!(
                         "on {} in {}",
                         found.describe(),
@@ -1098,12 +1106,17 @@ async fn run_step(
                 if !check.window.is_empty() && step_has_no_action {
                     *context = check.window.clone();
                 }
-                checked.push(json!({
+                let mut held = json!({
                     "ok": true,
                     "check": check.describe(),
                     "observed": outcome.observed,
                     "waited_ms": outcome.waited.as_millis() as u64,
-                }));
+                });
+                if let Some(note) = &outcome.role_note {
+                    held["role_note"] = json!(note);
+                    notes.push(note.clone());
+                }
+                checked.push(held);
             }
             Err(miss) => {
                 if let Some(window) = &miss.window {

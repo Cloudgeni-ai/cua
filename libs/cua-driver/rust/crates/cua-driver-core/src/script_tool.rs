@@ -646,11 +646,17 @@ impl<'a> Api<'a> {
         let check = Check::parse(&Value::Object(args), locate::DEFAULT_WAIT_TIMEOUT_MS)
             .map_err(|message| HostError::new(message, "invalid_args"))?;
         match self.locator.check(&check, &WindowSpec::default()).await {
-            Ok(checked) => Ok(json!({
-                "ok": true,
-                "observed": checked.observed,
-                "waited_ms": checked.waited.as_millis() as u64,
-            })),
+            Ok(checked) => {
+                let mut held = json!({
+                    "ok": true,
+                    "observed": checked.observed,
+                    "waited_ms": checked.waited.as_millis() as u64,
+                });
+                if let Some(note) = checked.role_note {
+                    held["role_note"] = json!(note);
+                }
+                Ok(held)
+            }
             Err(miss) => Err(HostError::new(
                 format!("{} did not hold: {}", check.describe(), miss.message),
                 miss.code,
@@ -698,7 +704,12 @@ impl<'a> Api<'a> {
                 "element_token".into(),
                 json!(found.token().unwrap_or_default()),
             );
-            target = Some(json!({"window": found.window.to_json(), "element": found.describe()}));
+            let mut found_target =
+                json!({"window": found.window.to_json(), "element": found.describe()});
+            if let Some(note) = &found.role_note {
+                found_target["role_note"] = json!(note);
+            }
+            target = Some(found_target);
         } else if window.window_id.is_none()
             && (window.pid.is_some() || window.app.is_some() || window.title.is_some())
             && !args.contains_key("element_token")
