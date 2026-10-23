@@ -581,7 +581,10 @@ fn set_value_blocking(
             };
             // An AX write bypasses NSTextView's edit model, so a document is
             // not marked edited and would never save the new text (DS-07).
-            let document = if changed == Some(true) {
+            // Only text: marking sends the app keystrokes, which a native
+            // slider, stepper or checkbox (a number value) must not receive.
+            let text_value = unsafe { copy_string_attr(element, "AXValue") }.is_some();
+            let document = if changed == Some(true) && text_value {
                 unsafe { crate::document_edit::ensure_marked_after_ax_write(pid, element, true) }
             } else {
                 crate::document_edit::DocumentEdited::NotADocument
