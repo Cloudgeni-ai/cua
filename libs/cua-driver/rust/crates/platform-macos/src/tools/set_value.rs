@@ -23,8 +23,8 @@ use std::sync::Arc;
 use crate::apps;
 use crate::ax::bindings::{
     copy_bool_attr, copy_children, copy_number_attr, copy_string_attr, copy_stringish_attr,
-    copy_url_attr,
-    kAXErrorSuccess, perform_action, set_number_attr, set_string_attr, AXUIElementRef,
+    copy_url_attr, kAXErrorSuccess, perform_action, set_number_attr, set_string_attr,
+    AXUIElementRef,
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
