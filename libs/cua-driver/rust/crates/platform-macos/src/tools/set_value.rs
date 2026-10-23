@@ -216,6 +216,7 @@ impl Tool for SetValueTool {
         // child option which can trigger app activation in some setups.
         let prior_front = apps::frontmost_pid();
         let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let requested = value.clone();
 
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
@@ -240,9 +241,10 @@ impl Tool for SetValueTool {
         let changes = snapshot.detect_async().await;
 
         match result {
-            Ok(Ok(outcome)) if outcome.rejected.is_some() => {
-                rejected_result(element_index, outcome.rejected == Some(true))
-            }
+            Ok(Ok(SetValueOutcome {
+                refusal: Some(refusal),
+                ..
+            })) => refusal_result(element_index, &requested, refusal),
             Ok(Ok(outcome)) if outcome.not_applied && !ax_echo_surface => {
                 let vcl = crate::input::pointer_toolkit::detect(pid)
                     == Some(crate::input::pointer_toolkit::PointerReadingToolkit::Vcl);
@@ -454,10 +456,23 @@ struct SetValueOutcome {
     /// The document's edited mark after the write; `None` outside a
     /// document or when the value did not move.
     document_edited: Option<bool>,
-    /// The control did not take the value and reads empty after the write
-    /// (a web number field given text that is not a number). `Some(true)`
-    /// when the value it held before was written back.
-    rejected: Option<bool>,
+    /// Why the write is refused rather than reported.
+    refusal: Option<Refusal>,
+}
+
+/// A write that ran but must be refused, with what the control holds now.
+#[derive(Debug, PartialEq)]
+enum Refusal {
+    /// The control did not take the value and read empty after the write (a
+    /// web number field given text that is not a number). `restored` when
+    /// the value it held before was written back.
+    Rejected { restored: bool },
+    /// The control kept its value, and the value lies outside its range, so
+    /// it was not stepped either. Nothing changed.
+    OutOfRange { min: f64, max: f64 },
+    /// The control kept its value, and stepping it toward the value stopped
+    /// short, leaving it at `now`.
+    SteppedShort { now: String },
 }
 
 fn apply_surface_trust(outcome: &mut SetValueOutcome, ax_echo_surface: bool) {
@@ -508,7 +523,7 @@ fn set_value_blocking(
             changed: None,
             not_applied: false,
             document_edited: None,
-            rejected: None,
+            refusal: None,
         })
     } else {
         // Default path: write AXValue directly. Numeric controls (AXSlider /
@@ -608,9 +623,15 @@ fn set_value_blocking(
             // stepped there with its increment and decrement actions.
             let mut stepped = false;
             if let Some(target) = numeric_target {
-                if write_not_applied(verified, changed) && step_to_value(element, target) {
-                    stepped = true;
-                    (verified, changed) = read_back();
+                if write_not_applied(verified, changed) {
+                    match step_or_refuse(element, target, before.as_deref()) {
+                        Stepping::Reached => {
+                            stepped = true;
+                            (verified, changed) = read_back();
+                        }
+                        Stepping::Refused(refusal) => return Ok(refused(refusal)),
+                        Stepping::Unmoved => {}
+                    }
                 }
             }
             // A control that reads empty after a value it did not take was
@@ -647,7 +668,7 @@ fn set_value_blocking(
                     changed: None,
                     not_applied: true,
                     document_edited: None,
-                    rejected: Some(restored),
+                    refusal: Some(Refusal::Rejected { restored }),
                 });
             }
             let suffix = match (verified, changed) {
@@ -682,28 +703,31 @@ fn set_value_blocking(
                 // read-back proves nothing either way.
                 not_applied: !secure && write_not_applied(verified, changed),
                 document_edited: document.structured(),
-                rejected: None,
+                refusal: None,
             })
         } else if let Some(target) = numeric_target {
             // Both direct writes failed for a numeric target — fall back to
             // stepping the control via AXIncrement / AXDecrement actions.
-            if step_to_value(element, target) {
-                let after = read_value(element);
-                let (verified, changed) =
-                    classify_write(before.as_deref(), after.as_deref(), value, true);
-                Ok(SetValueOutcome {
-                    detail: format!(
-                        "✅ Set AXValue on [{element_index}] {role} via AXIncrement/AXDecrement stepping."
-                    ),
-                    verified,
-                    changed,
-                    not_applied: false,
-                    document_edited: None,
-                    rejected: None,
-                })
-            } else {
-                anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
+            match step_or_refuse(element, target, before.as_deref()) {
+                Stepping::Refused(refusal) => return Ok(refused(refusal)),
+                Stepping::Unmoved => {
+                    anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
+                }
+                Stepping::Reached => {}
             }
+            let after = read_value(element);
+            let (verified, changed) =
+                classify_write(before.as_deref(), after.as_deref(), value, true);
+            Ok(SetValueOutcome {
+                detail: format!(
+                    "✅ Set AXValue on [{element_index}] {role} via AXIncrement/AXDecrement stepping."
+                ),
+                verified,
+                changed,
+                not_applied: false,
+                document_edited: None,
+                refusal: None,
+            })
         } else {
             anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
         }
@@ -734,24 +758,107 @@ fn left_empty(role: &str, requested: &str, after: Option<&str>) -> bool {
         && after.is_some_and(|after| after.trim().is_empty())
 }
 
-/// The refusal for a value the control did not take and that emptied it.
-fn rejected_result(element_index: usize, restored: bool) -> ToolResult {
-    let state = if restored {
-        "Its previous value was put back, so nothing changed."
-    } else {
-        "It is now empty."
+fn refused(refusal: Refusal) -> SetValueOutcome {
+    SetValueOutcome {
+        detail: String::new(),
+        verified: Some(false),
+        changed: None,
+        not_applied: true,
+        document_edited: None,
+        refusal: Some(refusal),
+    }
+}
+
+/// The result of a write that ran but is refused. `write_not_applied` always
+/// means the control holds what it held before: nothing changed.
+fn refusal_result(element_index: usize, value: &str, refusal: Refusal) -> ToolResult {
+    let (message, code, effect) = match refusal {
+        Refusal::Rejected { restored: true } => (
+            format!(
+                "set_value did not take: element [{element_index}] refused the value and read \
+                 empty after the write. Its previous value was put back, so nothing changed. \
+                 Give it a value it accepts (a number field takes a plain number such as 42 or \
+                 7.5)."
+            ),
+            "write_not_applied",
+            "not_applied",
+        ),
+        Refusal::Rejected { restored: false } => (
+            format!(
+                "set_value did not take: element [{element_index}] refused the value and read \
+                 empty after the write. It is now empty. Give it a value it accepts (a number \
+                 field takes a plain number such as 42 or 7.5)."
+            ),
+            "write_cleared",
+            "cleared",
+        ),
+        Refusal::OutOfRange { min, max } => (
+            format!(
+                "set_value did not take: {} is outside the range of element [{element_index}] \
+                 ({min} to {max}), so nothing changed. Give it a value in that range.",
+                value.trim()
+            ),
+            "write_not_applied",
+            "not_applied",
+        ),
+        Refusal::SteppedShort { now } => (
+            format!(
+                "set_value did not reach {}: element [{element_index}] took no direct value \
+                 write, so it was stepped toward the value with its increment and decrement \
+                 actions, and it stopped short. It now reads {now}, not the value it had \
+                 before.",
+                value.trim()
+            ),
+            "value_not_reached",
+            "partial",
+        ),
     };
-    ToolResult::error(format!(
-        "set_value did not take: element [{element_index}] refused the value and read empty \
-         after the write. {state} Give it a value it accepts (a number field takes a plain \
-         number such as 42 or 7.5)."
-    ))
-    .with_structured(serde_json::json!({
-        "code": "write_not_applied",
+    ToolResult::error(message).with_structured(serde_json::json!({
+        "code": code,
         "path": "ax",
         "verified": false,
-        "effect": if restored { "not_applied" } else { "cleared" },
+        "effect": effect,
     }))
+}
+
+enum Stepping {
+    /// The control reached the value.
+    Reached,
+    /// The control did not move.
+    Unmoved,
+    Refused(Refusal),
+}
+
+/// Step a control that kept its value toward `target`, refusing up front a
+/// value outside the range it reports, and reporting where it stopped when
+/// it moved but did not get there.
+fn step_or_refuse(element: AXUIElementRef, target: f64, before: Option<&str>) -> Stepping {
+    let min = unsafe { copy_number_attr(element, "AXMinValue") };
+    let max = unsafe { copy_number_attr(element, "AXMaxValue") };
+    if let Some((min, max)) = outside_range(target, min, max) {
+        return Stepping::Refused(Refusal::OutOfRange { min, max });
+    }
+    if step_to_value(element, target) {
+        return Stepping::Reached;
+    }
+    match read_value(element) {
+        Some(now) if moved(before, &now) => Stepping::Refused(Refusal::SteppedShort { now }),
+        _ => Stepping::Unmoved,
+    }
+}
+
+/// The range `target` lies outside of, when the control reports a real one
+/// (Chrome reports 0 to 0 for a number field without limits).
+fn outside_range(target: f64, min: Option<f64>, max: Option<f64>) -> Option<(f64, f64)> {
+    match (min, max) {
+        (Some(min), Some(max)) if min < max && (target < min || target > max) => Some((min, max)),
+        _ => None,
+    }
+}
+
+/// Whether a control that read `before` reads something else `now`.
+fn moved(before: Option<&str>, now: &str) -> bool {
+    before.is_some_and(|before| classify_write(None, Some(now), before, true).0 != Some(true))
 }
 
 /// Re-reads (100 ms apart) before an unchanged value counts as not applied.
@@ -1461,8 +1568,9 @@ fn hex_digit(n: u8) -> char {
 mod tests {
     use super::{
         apply_surface_trust, apply_verification_label, classify_write, file_name_needs_rename,
-        is_file_name_cell, is_get_info_name_field, left_empty, not_applied_result, rejected_result,
-        takes_text, write_not_applied, SetValueOutcome, GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
+        is_file_name_cell, is_get_info_name_field, left_empty, moved, not_applied_result,
+        outside_range, refusal_result, takes_text, write_not_applied, Refusal, SetValueOutcome,
+        GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
     };
 
     #[test]
@@ -1479,15 +1587,63 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_value_says_whether_the_old_one_is_back() {
-        let restored = rejected_result(9, true);
+    fn a_refused_value_says_what_the_control_holds_now() {
+        let restored = refusal_result(9, "abc", Refusal::Rejected { restored: true });
         assert_eq!(restored.is_error, Some(true));
         let text = format!("{restored:?}");
         assert!(text.contains("previous value was put back"), "{text}");
-        assert!(text.contains("write_not_applied"), "{text}");
-        let cleared = format!("{:?}", rejected_result(9, false));
+        assert!(text.contains("\"write_not_applied\""), "{text}");
+        assert!(text.contains("\"not_applied\""), "{text}");
+        // write_not_applied means nothing changed: an emptied field says so
+        // with its own code.
+        let cleared = format!(
+            "{:?}",
+            refusal_result(9, "abc", Refusal::Rejected { restored: false })
+        );
         assert!(cleared.contains("It is now empty"), "{cleared}");
-        assert!(cleared.contains("\"cleared\""), "{cleared}");
+        assert!(cleared.contains("\"write_cleared\""), "{cleared}");
+        let range = format!(
+            "{:?}",
+            refusal_result(
+                4,
+                " 150 ",
+                Refusal::OutOfRange {
+                    min: 0.0,
+                    max: 100.0
+                }
+            )
+        );
+        assert!(
+            range.contains("150 is outside the range of element [4] (0 to 100)"),
+            "{range}"
+        );
+        assert!(range.contains("\"write_not_applied\""), "{range}");
+        let short = format!(
+            "{:?}",
+            refusal_result(4, "30", Refusal::SteppedShort { now: "17".into() })
+        );
+        assert!(short.contains("It now reads 17"), "{short}");
+        assert!(short.contains("\"value_not_reached\""), "{short}");
+        assert!(short.contains("\"partial\""), "{short}");
+    }
+
+    #[test]
+    fn stepping_is_refused_outside_a_real_range_and_knows_when_it_moved() {
+        assert_eq!(
+            outside_range(150.0, Some(0.0), Some(100.0)),
+            Some((0.0, 100.0))
+        );
+        assert_eq!(
+            outside_range(-1.0, Some(0.0), Some(100.0)),
+            Some((0.0, 100.0))
+        );
+        assert_eq!(outside_range(100.0, Some(0.0), Some(100.0)), None);
+        // Chrome's number field without limits reports 0 to 0.
+        assert_eq!(outside_range(150.0, Some(0.0), Some(0.0)), None);
+        assert_eq!(outside_range(150.0, None, Some(100.0)), None);
+        assert!(moved(Some("10"), "17"));
+        assert!(!moved(Some("10"), "10.0"));
+        assert!(!moved(None, "17"));
     }
 
     #[test]
@@ -1751,7 +1907,7 @@ mod tests {
             changed: Some(true),
             not_applied: false,
             document_edited: None,
-            rejected: None,
+            refusal: None,
         };
         apply_surface_trust(&mut outcome, true);
         assert_eq!(outcome.verified, Some(false));
@@ -1767,7 +1923,7 @@ mod tests {
             changed: Some(true),
             not_applied: false,
             document_edited: None,
-            rejected: None,
+            refusal: None,
         };
         apply_surface_trust(&mut outcome, false);
         assert_eq!(outcome.verified, Some(true));
@@ -1783,7 +1939,7 @@ mod tests {
             changed: Some(false),
             not_applied: false,
             document_edited: None,
-            rejected: None,
+            refusal: None,
         };
         apply_verification_label(&mut outcome);
         assert_eq!(
