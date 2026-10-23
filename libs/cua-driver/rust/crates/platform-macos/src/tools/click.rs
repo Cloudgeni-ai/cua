@@ -728,7 +728,7 @@ impl Tool for ClickTool {
                 let focused = tokio::task::spawn_blocking(move || {
                     let element = focus_guard.as_ptr() as usize;
                     let _ = crate::input::ax_actions::focus_element(element);
-                    crate::input::ax_actions::element_has_keyboard_focus(pid, element)
+                    crate::input::ax_actions::focus_settled(pid, element)
                 })
                 .await
                 .unwrap_or(false);

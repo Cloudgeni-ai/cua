@@ -229,6 +229,7 @@ impl Tool for SetValueTool {
                         pid,
                         window_id,
                         &value,
+                        ax_echo_surface,
                     )
                 })
                 .await
@@ -239,6 +240,9 @@ impl Tool for SetValueTool {
         let changes = snapshot.detect_async().await;
 
         match result {
+            Ok(Ok(outcome)) if outcome.rejected.is_some() => {
+                rejected_result(element_index, outcome.rejected == Some(true))
+            }
             Ok(Ok(outcome)) if outcome.not_applied && !ax_echo_surface => {
                 let vcl = crate::input::pointer_toolkit::detect(pid)
                     == Some(crate::input::pointer_toolkit::PointerReadingToolkit::Vcl);
@@ -450,6 +454,10 @@ struct SetValueOutcome {
     /// The document's edited mark after the write; `None` outside a
     /// document or when the value did not move.
     document_edited: Option<bool>,
+    /// The control did not take the value and reads empty after the write
+    /// (a web number field given text that is not a number). `Some(true)`
+    /// when the value it held before was written back.
+    rejected: Option<bool>,
 }
 
 fn apply_surface_trust(outcome: &mut SetValueOutcome, ax_echo_surface: bool) {
@@ -477,6 +485,7 @@ fn set_value_blocking(
     pid: i32,
     window_id: u32,
     value: &str,
+    web: bool,
 ) -> anyhow::Result<SetValueOutcome> {
     let element = element_ptr as AXUIElementRef;
 
@@ -499,12 +508,13 @@ fn set_value_blocking(
             changed: None,
             not_applied: false,
             document_edited: None,
+            rejected: None,
         })
     } else {
         // Default path: write AXValue directly. Numeric controls (AXSlider /
         // AXStepper) reject a CFString with -25201 and need a CFNumber; text
-        // fields take a CFString. Try numeric first when the value parses as a
-        // number, then fall back to a string write.
+        // fields take a CFString. A native control tries numeric first when the
+        // value parses as a number, then falls back to a string write.
         // Numeric target carried through so we can step toward it if the
         // direct writes are rejected (SwiftUI AXSlider rejects every AXValue
         // write with -25200 yet exposes a readable AXValue + increment/decrement
@@ -517,6 +527,16 @@ fn set_value_blocking(
         } else {
             value.trim().parse::<f64>().ok()
         };
+        // Web content's number and range inputs take their value as text. A
+        // CFNumber written to a number field (Chrome's AXIncrementor) is
+        // taken with success and empties the field, and text with spaces
+        // around a number does too, so a number goes in as its trimmed text.
+        let number_first = numeric_target.is_some() && !web;
+        let written = if numeric_target.is_some() {
+            value.trim()
+        } else {
+            value
+        };
         // Read the value before writing so an unchanged field can be reported as
         // idempotent rather than silently indistinguishable from a fresh write.
         let before = read_value(element);
@@ -524,16 +544,26 @@ fn set_value_blocking(
         // with success and ignore (Chrome's web fields).
         let mut wrote_number = false;
         let err = match numeric_target {
-            Some(n) => {
+            Some(n) if number_first => {
                 let e = unsafe { set_number_attr(element, "AXValue", n) };
                 if e == kAXErrorSuccess {
                     wrote_number = true;
                     e
                 } else {
-                    unsafe { set_string_attr(element, "AXValue", value) }
+                    unsafe { set_string_attr(element, "AXValue", written) }
                 }
             }
-            None => unsafe { set_string_attr(element, "AXValue", value) },
+            Some(n) => {
+                let e = unsafe { set_string_attr(element, "AXValue", written) };
+                if e == kAXErrorSuccess {
+                    e
+                } else {
+                    let e = unsafe { set_number_attr(element, "AXValue", n) };
+                    wrote_number = e == kAXErrorSuccess;
+                    e
+                }
+            }
+            None => unsafe { set_string_attr(element, "AXValue", written) },
         };
         if err == kAXErrorSuccess {
             let secure = unsafe { copy_string_attr(element, "AXSubrole") }.as_deref()
@@ -564,14 +594,44 @@ fn set_value_blocking(
                 outcome
             };
             let (mut verified, mut changed) = read_back();
-            // A number the control took with success but did not show (a web
-            // number or range input in Chrome) is written again as text.
+            // A number the control took with success but did not show, or
+            // showed as something else (a web number or range input in
+            // Chrome empties), is written again as text.
             if wrote_number
                 && verified != Some(true)
-                && changed != Some(true)
-                && unsafe { set_string_attr(element, "AXValue", value) } == kAXErrorSuccess
+                && unsafe { set_string_attr(element, "AXValue", written) } == kAXErrorSuccess
             {
                 (verified, changed) = read_back();
+            }
+            // A control that reads empty after a value it did not take was
+            // emptied by the write: put back what it held, and say so rather
+            // than report a write that lost the field's value.
+            if !secure
+                && verified == Some(false)
+                && left_empty(&role, value, read_value(element).as_deref())
+            {
+                let restored = match before.as_deref() {
+                    Some(previous) if !previous.trim().is_empty() => {
+                        // A native control took its number as a number.
+                        let err = match previous.trim().parse::<f64>() {
+                            Ok(n) if !web => unsafe { set_number_attr(element, "AXValue", n) },
+                            _ => unsafe { set_string_attr(element, "AXValue", previous) },
+                        };
+                        err == kAXErrorSuccess
+                            && classify_write(None, read_value(element).as_deref(), previous, true)
+                                .0
+                                == Some(true)
+                    }
+                    _ => false,
+                };
+                return Ok(SetValueOutcome {
+                    detail: String::new(),
+                    verified: Some(false),
+                    changed: None,
+                    not_applied: true,
+                    document_edited: None,
+                    rejected: Some(restored),
+                });
             }
             let suffix = match (verified, changed) {
                 (Some(true), Some(false)) => " Value already matched; write was idempotent.",
@@ -600,6 +660,7 @@ fn set_value_blocking(
                 // read-back proves nothing either way.
                 not_applied: !secure && write_not_applied(verified, changed),
                 document_edited: document.structured(),
+                rejected: None,
             })
         } else if let Some(target) = numeric_target {
             // Both direct writes failed for a numeric target — fall back to
@@ -616,6 +677,7 @@ fn set_value_blocking(
                     changed,
                     not_applied: false,
                     document_edited: None,
+                    rejected: None,
                 })
             } else {
                 anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
@@ -638,6 +700,36 @@ fn takes_text(role: &str) -> bool {
         role,
         "AXTextField" | "AXTextArea" | "AXComboBox" | "AXSearchField" | "AXSecureTextField"
     )
+}
+
+/// Whether a write of `requested` left a control that holds a number or a
+/// setting (not text) reading empty: the control refused the value and the
+/// write emptied it. A text field may legitimately read empty, and an
+/// unreadable value says nothing.
+fn left_empty(role: &str, requested: &str, after: Option<&str>) -> bool {
+    !takes_text(role)
+        && !requested.trim().is_empty()
+        && after.is_some_and(|after| after.trim().is_empty())
+}
+
+/// The refusal for a value the control did not take and that emptied it.
+fn rejected_result(element_index: usize, restored: bool) -> ToolResult {
+    let state = if restored {
+        "Its previous value was put back, so nothing changed."
+    } else {
+        "It is now empty."
+    };
+    ToolResult::error(format!(
+        "set_value did not take: element [{element_index}] refused the value and read empty \
+         after the write. {state} Give it a value it accepts (a number field takes a plain \
+         number such as 42 or 7.5)."
+    ))
+    .with_structured(serde_json::json!({
+        "code": "write_not_applied",
+        "path": "ax",
+        "verified": false,
+        "effect": if restored { "not_applied" } else { "cleared" },
+    }))
 }
 
 /// Re-reads (100 ms apart) before an unchanged value counts as not applied.
@@ -1335,9 +1427,52 @@ fn hex_digit(n: u8) -> char {
 mod tests {
     use super::{
         apply_surface_trust, apply_verification_label, classify_write, file_name_needs_rename,
-        is_file_name_cell, is_get_info_name_field, not_applied_result, takes_text,
-        write_not_applied, SetValueOutcome, GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
+        is_file_name_cell, is_get_info_name_field, left_empty, not_applied_result, rejected_result,
+        takes_text, write_not_applied, SetValueOutcome, GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
     };
+
+    #[test]
+    fn a_number_control_left_empty_by_a_value_refused_it() {
+        // Chrome's number field (AXIncrementor) empties on text it cannot read.
+        assert!(left_empty("AXIncrementor", "abc", Some("")));
+        assert!(left_empty("AXSlider", "12", Some(" ")));
+        // Clearing it on purpose, a value it shows, or a value it hides.
+        assert!(!left_empty("AXIncrementor", "", Some("")));
+        assert!(!left_empty("AXIncrementor", "42", Some("42")));
+        assert!(!left_empty("AXIncrementor", "42", None));
+        // A text field may read empty whatever it was given.
+        assert!(!left_empty("AXTextField", "abc", Some("")));
+    }
+
+    #[test]
+    fn a_refused_value_says_whether_the_old_one_is_back() {
+        let restored = rejected_result(9, true);
+        assert_eq!(restored.is_error, Some(true));
+        let text = format!("{restored:?}");
+        assert!(text.contains("previous value was put back"), "{text}");
+        assert!(text.contains("write_not_applied"), "{text}");
+        let cleared = format!("{:?}", rejected_result(9, false));
+        assert!(cleared.contains("It is now empty"), "{cleared}");
+        assert!(cleared.contains("\"cleared\""), "{cleared}");
+    }
+
+    #[test]
+    fn a_web_number_field_reads_back_its_number() {
+        // Chrome reads a number field's value back as a CFNumber: "42" for
+        // "42", 100 for "1e2".
+        assert_eq!(
+            classify_write(Some("5"), Some("42"), "42", true),
+            (Some(true), Some(true))
+        );
+        assert_eq!(
+            classify_write(Some("5"), Some("100"), "1e2", true),
+            (Some(true), Some(true))
+        );
+        assert_eq!(
+            classify_write(Some("5"), Some(""), "42", true),
+            (Some(false), Some(true))
+        );
+    }
 
     #[test]
     fn text_fields_take_numeric_looking_values_as_text() {
@@ -1582,6 +1717,7 @@ mod tests {
             changed: Some(true),
             not_applied: false,
             document_edited: None,
+            rejected: None,
         };
         apply_surface_trust(&mut outcome, true);
         assert_eq!(outcome.verified, Some(false));
@@ -1597,6 +1733,7 @@ mod tests {
             changed: Some(true),
             not_applied: false,
             document_edited: None,
+            rejected: None,
         };
         apply_surface_trust(&mut outcome, false);
         assert_eq!(outcome.verified, Some(true));
@@ -1612,6 +1749,7 @@ mod tests {
             changed: Some(false),
             not_applied: false,
             document_edited: None,
+            rejected: None,
         };
         apply_verification_label(&mut outcome);
         assert_eq!(

@@ -296,6 +296,26 @@ pub fn element_has_keyboard_focus(pid: i32, element_ptr: usize) -> bool {
         || unsafe { copy_bool_attr(element_ptr as AXUIElementRef, "AXFocused") } == Some(true)
 }
 
+/// How long a focus write may take to show in the read-back.
+const FOCUS_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Whether `element_ptr` holds keyboard focus after a focus write, given the
+/// app a moment to apply it. Chrome moves the focus to a web control
+/// asynchronously: a number field reads `AXFocused = false` straight after
+/// the write took, and true a few milliseconds later.
+pub fn focus_settled(pid: i32, element_ptr: usize) -> bool {
+    let deadline = std::time::Instant::now() + FOCUS_SETTLE;
+    loop {
+        if element_has_keyboard_focus(pid, element_ptr) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        crate::timing::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// Set the AXValue of an element (for dropdowns, text fields, etc.).
 pub fn set_ax_value(element_ptr: usize, value: &str) -> anyhow::Result<()> {
     let err = unsafe { set_string_attr(element_ptr as AXUIElementRef, "AXValue", value) };
