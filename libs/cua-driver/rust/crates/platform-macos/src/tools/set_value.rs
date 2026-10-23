@@ -603,6 +603,16 @@ fn set_value_blocking(
             {
                 (verified, changed) = read_back();
             }
+            // A control that took the write with success and kept its value
+            // (Chrome's range input ignores AXValue writes of either kind) is
+            // stepped there with its increment and decrement actions.
+            let mut stepped = false;
+            if let Some(target) = numeric_target {
+                if write_not_applied(verified, changed) && step_to_value(element, target) {
+                    stepped = true;
+                    (verified, changed) = read_back();
+                }
+            }
             // A control that reads empty after a value it did not take was
             // emptied by the write: put back what it held, and say so rather
             // than report a write that lost the field's value.
@@ -658,7 +668,12 @@ fn set_value_blocking(
             };
             Ok(SetValueOutcome {
                 detail: format!(
-                    "✅ Set AXValue on [{element_index}] {role}.{suffix}{}",
+                    "✅ Set AXValue on [{element_index}] {role}{}.{suffix}{}",
+                    if stepped {
+                        " via AXIncrement/AXDecrement stepping"
+                    } else {
+                        ""
+                    },
                     document.note()
                 ),
                 verified,
