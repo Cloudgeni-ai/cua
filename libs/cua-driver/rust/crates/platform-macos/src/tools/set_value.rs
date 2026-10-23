@@ -617,10 +617,17 @@ fn set_value_blocking(
                             Ok(n) if !web => unsafe { set_number_attr(element, "AXValue", n) },
                             _ => unsafe { set_string_attr(element, "AXValue", previous) },
                         };
-                        err == kAXErrorSuccess
-                            && classify_write(None, read_value(element).as_deref(), previous, true)
-                                .0
+                        // Chrome may show it a moment later.
+                        let back = || {
+                            classify_write(None, read_value(element).as_deref(), previous, true).0
                                 == Some(true)
+                        };
+                        err == kAXErrorSuccess
+                            && (back()
+                                || (0..NOT_APPLIED_REREADS).any(|_| {
+                                    crate::timing::sleep(std::time::Duration::from_millis(100));
+                                    back()
+                                }))
                     }
                     _ => false,
                 };
