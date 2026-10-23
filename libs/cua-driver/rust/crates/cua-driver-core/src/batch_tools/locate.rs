@@ -385,6 +385,10 @@ pub(crate) struct Read {
     pub window: Window,
     pub elements: Vec<Value>,
     pub markdown: String,
+    /// The read stopped before the whole tree (its node or time budget ran
+    /// out): an element of the role named may lie past the cut, so no other
+    /// role stands in for it.
+    pub truncated: bool,
 }
 
 /// An element found by description.
@@ -396,9 +400,11 @@ pub(crate) struct Found {
     /// role pressed alike, by that exact name, was used instead: says so,
     /// so the caller names it right next time.
     pub role_note: Option<String>,
-    /// The read's element count, for a stand-in: a poll takes a stand-in
-    /// only once the window has stopped changing (see [`Settle`]).
-    pub seen: usize,
+    /// For a stand-in: a digest of the read, so a poll takes it only once
+    /// the window has stopped changing (see [`Settle`]), and the miss the
+    /// lookup would have reported without it, for a window that never did.
+    pub digest: u64,
+    pub fallback: Option<Miss>,
 }
 
 impl Found {
@@ -429,11 +435,11 @@ pub(crate) struct Miss {
     pub code: &'static str,
     pub message: String,
     pub window: Option<Window>,
-    /// For a `not_found` whose name is shown only on an element of another
-    /// role, or an `ambiguous` whose name is on several elements of a role
-    /// pressed alike: the read's element count, so a poll can tell when the
-    /// window has stopped changing and stop waiting early.
-    pub other_role_only: Option<usize>,
+    /// For an `ambiguous` whose name is on several elements of a role pressed
+    /// alike and on none of the role named: a digest of the read, so a poll
+    /// fails it only once the window has stopped changing, as the role named
+    /// may yet appear.
+    pub settle_digest: Option<u64>,
 }
 
 impl Miss {
@@ -442,7 +448,7 @@ impl Miss {
             code,
             message: message.into(),
             window: None,
-            other_role_only: None,
+            settle_digest: None,
         }
     }
 
@@ -452,7 +458,7 @@ impl Miss {
     fn worth_waiting(&self) -> bool {
         // Several elements of a role pressed alike: the role named may yet
         // appear, until the window settles.
-        (self.code == "ambiguous" && self.other_role_only.is_some())
+        (self.code == "ambiguous" && self.settle_digest.is_some())
             || matches!(
                 self.code,
                 "not_found"
@@ -478,53 +484,40 @@ pub(crate) struct Checked {
     /// As [`Found::role_note`]: the check held on an element of a role
     /// pressed alike, not the role named.
     pub role_note: Option<String>,
-    /// As [`Found::seen`].
-    pub seen: usize,
+    /// As [`Found::digest`] and [`Found::fallback`].
+    pub digest: u64,
+    pub fallback: Option<Miss>,
 }
 
-/// How long a window must stay unchanged, showing the name asked for only on
-/// an element of another role, before a wait for it stops early, or uses the
-/// one element of a role pressed alike. A page that is still loading (or a
+/// How long a window must read the same, showing the name asked for only on
+/// elements of a role pressed alike, before a lookup uses the one such
+/// element (or fails naming several). A page that is still loading (or a
 /// dialog an earlier step opened) keeps changing, and may yet show the role
-/// named; one that has settled will not grow it in the remaining seconds of
-/// a long wait.
+/// named.
 const OTHER_ROLE_SETTLE: Duration = Duration::from_millis(1_500);
 
-/// Tracks consecutive polls that show the name only on another role, as a
-/// stand-in or not, in a window of the same size.
+/// Tracks consecutive polls that show the name only on a role pressed alike,
+/// in a window whose read stays the same.
 #[derive(Default)]
 struct Settle {
-    since: Option<(Instant, (bool, usize))>,
+    since: Option<(Instant, u64)>,
 }
 
 impl Settle {
-    /// `poll` is `(stand_in, element_count)`, or None for any other result.
-    fn settled(&mut self, poll: Option<(bool, usize)>) -> bool {
-        let Some(poll) = poll else {
+    /// `digest` is the read's, for a poll that showed the name only on a role
+    /// pressed alike, or None for any other result.
+    fn settled(&mut self, digest: Option<u64>) -> bool {
+        let Some(digest) = digest else {
             self.since = None;
             return false;
         };
         match self.since {
-            Some((at, seen)) if seen == poll => at.elapsed() >= OTHER_ROLE_SETTLE,
+            Some((at, seen)) if seen == digest => at.elapsed() >= OTHER_ROLE_SETTLE,
             _ => {
-                self.since = Some((Instant::now(), poll));
+                self.since = Some((Instant::now(), digest));
                 false
             }
         }
-    }
-
-    fn settled_miss(&mut self, miss: &Miss) -> bool {
-        self.settled(miss.other_role_only.map(|count| (false, count)))
-    }
-
-    fn stopped(&self, mut miss: Miss, started: Instant) -> Miss {
-        miss.message = format!(
-            "{} (stopped after {} ms: the window stopped changing and shows that name only \
-             on another kind of element)",
-            miss.message,
-            started.elapsed().as_millis()
-        );
-        miss
     }
 }
 
@@ -822,6 +815,7 @@ impl<'a> Locator<'a> {
             window: window.clone(),
             elements,
             markdown,
+            truncated: state.get("truncated").and_then(Value::as_bool) == Some(true),
         })
     }
 
@@ -837,7 +831,8 @@ impl<'a> Locator<'a> {
 
     /// As [`Locator::find`]. A stand-in of another role is used once the
     /// window has settled, or at once when `settled` (a check just held on
-    /// it after the window settled).
+    /// it after the window settled). A window that never settles fails as
+    /// it would without the stand-in.
     pub async fn find_settled(
         &self,
         window: &WindowSpec,
@@ -848,31 +843,32 @@ impl<'a> Locator<'a> {
         let started = Instant::now();
         let deadline = (started + timeout).min(self.deadline);
         let mut settle = Settle::default();
+        let waited = |mut miss: Miss| {
+            let waited = started.elapsed().as_millis();
+            if waited > 0 {
+                miss.message = format!("{} (waited {waited} ms)", miss.message);
+            }
+            miss
+        };
         loop {
             let attempt = self.find_once(window, element).await;
             match attempt {
                 Ok(found) if found.role_note.is_none() => return Ok(found),
                 Ok(found) => {
-                    if settled
-                        || settle.settled(Some((true, found.seen)))
-                        || Instant::now() + POLL_INTERVAL > deadline
-                    {
+                    if settled || settle.settled(Some(found.digest)) {
                         return Ok(found);
+                    }
+                    if Instant::now() + POLL_INTERVAL > deadline {
+                        return Err(waited(found.fallback.expect("a stand-in keeps its miss")));
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
                 Err(miss) if !miss.worth_waiting() => return Err(miss),
-                Err(miss) if settle.settled_miss(&miss) => {
-                    return Err(settle.stopped(miss, started))
-                }
                 Err(miss) => {
-                    if Instant::now() + POLL_INTERVAL > deadline {
-                        let waited = started.elapsed().as_millis();
-                        let mut miss = miss;
-                        if waited > 0 {
-                            miss.message = format!("{} (waited {waited} ms)", miss.message);
-                        }
-                        return Err(miss);
+                    if settle.settled(miss.settle_digest)
+                        || Instant::now() + POLL_INTERVAL > deadline
+                    {
+                        return Err(waited(miss));
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
@@ -899,7 +895,7 @@ impl<'a> Locator<'a> {
                 Err(miss) if miss.code == "ambiguous" || miss.code == "not_addressable" => {
                     // Several of a role pressed alike: the role named may be
                     // in another window.
-                    if miss.other_role_only.is_some() {
+                    if miss.settle_digest.is_some() {
                         let size = read.elements.len();
                         if best_miss.as_ref().is_none_or(|(best, _)| size > *best) {
                             best_miss = Some((size, miss.in_window(window)));
@@ -948,7 +944,8 @@ impl<'a> Locator<'a> {
                     observed: Some(format!("{} is closed", spec.describe())),
                     waited: started.elapsed(),
                     role_note: None,
-                    seen: 0,
+                    digest: 0,
+                    fallback: None,
                 })
             }
             Err(miss) => return Err(miss),
@@ -971,8 +968,11 @@ impl<'a> Locator<'a> {
                         window: Some(window.clone()),
                         observed,
                         waited: started.elapsed(),
+                        fallback: role_note
+                            .as_ref()
+                            .and_then(|_| evaluate_as_named(check, &read).err()),
                         role_note,
-                        seen: read.elements.len(),
+                        digest: digest(&read),
                     };
                     if checked.role_note.is_none() {
                         return Ok(checked);
@@ -998,7 +998,8 @@ impl<'a> Locator<'a> {
                 observed: None,
                 waited: started.elapsed(),
                 role_note: None,
-                seen: 0,
+                digest: 0,
+                fallback: None,
             }),
             Some((_, mut miss)) => {
                 if windows.len() > 1 {
@@ -1023,31 +1024,35 @@ impl<'a> Locator<'a> {
         let started = Instant::now();
         let deadline = (started + check.timeout).min(self.deadline);
         let mut settle = Settle::default();
+        let checked_for = |mut miss: Miss| {
+            miss.message = format!(
+                "{} (checked for {} ms)",
+                miss.message,
+                started.elapsed().as_millis()
+            );
+            miss
+        };
         loop {
             let outcome = self.check_once(check, &window_spec, started).await;
             match outcome {
                 Ok(checked) if checked.role_note.is_none() => return Ok(checked),
                 Ok(checked) => {
-                    if settle.settled(Some((true, checked.seen)))
-                        || Instant::now() + POLL_INTERVAL > deadline
-                    {
+                    if settle.settled(Some(checked.digest)) {
                         return Ok(checked);
+                    }
+                    if Instant::now() + POLL_INTERVAL > deadline {
+                        return Err(checked_for(
+                            checked.fallback.expect("a stand-in keeps its miss"),
+                        ));
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
                 Err(miss) if !miss.worth_waiting() => return Err(miss),
-                Err(miss) if settle.settled_miss(&miss) => {
-                    return Err(settle.stopped(miss, started))
-                }
                 Err(miss) => {
-                    if Instant::now() + POLL_INTERVAL > deadline {
-                        let mut miss = miss;
-                        miss.message = format!(
-                            "{} (checked for {} ms)",
-                            miss.message,
-                            started.elapsed().as_millis()
-                        );
-                        return Err(miss);
+                    if settle.settled(miss.settle_digest)
+                        || Instant::now() + POLL_INTERVAL > deadline
+                    {
+                        return Err(checked_for(miss));
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
@@ -1168,6 +1173,11 @@ fn narrow<'r>(found: Vec<&'r Value>, spec: &ElementSpec) -> Vec<&'r Value> {
 }
 
 fn pick(read: &Read, spec: &ElementSpec) -> Result<Found, Miss> {
+    pick_with(read, spec, true)
+}
+
+/// As [`pick`]; with `stand_in` false, no element of another role stands in.
+fn pick_with(read: &Read, spec: &ElementSpec, stand_in: bool) -> Result<Found, Miss> {
     let found = narrow(matches(read, spec), spec);
     let mut role_note = None;
     let chosen = match (found.len(), spec.nth) {
@@ -1191,16 +1201,16 @@ fn pick(read: &Read, spec: &ElementSpec) -> Result<Found, Miss> {
                     ),
                 ));
             }
-            match other_roles(read, spec) {
-                Some(OtherRole::PressedAlike(alike)) if alike.len() == 1 => {
+            match other_roles(read, spec).filter(|_| stand_in) {
+                Some(alike) if alike.len() == 1 => {
                     role_note = Some(role_note_for(spec, alike[0]));
                     alike[0]
                 }
-                Some(OtherRole::PressedAlike(alike)) => {
+                Some(alike) => {
                     return Err(several_alike(read, spec, &alike));
                 }
-                other => {
-                    let mut miss = Miss::new(
+                None => {
+                    return Err(Miss::new(
                         "not_found",
                         format!(
                             "no {} in {}{}",
@@ -1208,11 +1218,7 @@ fn pick(read: &Read, spec: &ElementSpec) -> Result<Found, Miss> {
                             read.window.describe(),
                             near_misses(read, spec)
                         ),
-                    );
-                    if let Some(OtherRole::Unlike) = other {
-                        miss.other_role_only = Some(read.elements.len());
-                    }
-                    return Err(miss);
+                    ));
                 }
             }
         }
@@ -1263,36 +1269,87 @@ fn pick(read: &Read, spec: &ElementSpec) -> Result<Found, Miss> {
     Ok(Found {
         window: read.window.clone(),
         element: chosen.clone(),
+        fallback: role_note
+            .as_ref()
+            .and_then(|_| pick_with(read, spec, false).err()),
         role_note,
-        seen: read.elements.len(),
+        digest: digest(read),
     })
+}
+
+/// A digest of what a read shows, without its per-read element tokens: two
+/// reads with the same digest show the same elements in the same places.
+fn digest(read: &Read) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for element in &read.elements {
+        let mut element = element.clone();
+        if let Some(fields) = element.as_object_mut() {
+            fields.remove("element_token");
+        }
+        element.to_string().hash(&mut hasher);
+    }
+    read.markdown.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Role families that are pressed alike. On a web page whether a control is
 /// a button or a link is rarely visible, and models confuse the two; pressing
-/// either does the same. Toggles, choices and menus keep their own roles.
+/// either does the same. Toggles, choices and menus keep their own roles, and
+/// so does a toggle button (see [`toggles`]).
 const PRESSED_ALIKE: &[&str] = &["button", "link"];
 
 fn pressed_alike(role: &str) -> bool {
     PRESSED_ALIKE.contains(&role_family(role).as_str())
 }
 
-/// Elements of another role than the one named that carry the name exactly.
-enum OtherRole<'r> {
-    /// Of a role pressed alike with the one named (never empty).
-    PressedAlike(Vec<&'r Value>),
-    /// Only of roles that are not pressed alike.
-    Unlike,
+/// A toggle button, or anything with a pressed or checked state: pressing it
+/// changes that state, so it never stands in for a button or link.
+fn toggles(role: &str, element: Option<&Value>) -> bool {
+    let normalized: String = role
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    if normalized.contains("toggle") {
+        return true;
+    }
+    let Some(element) = element else {
+        return false;
+    };
+    // Many web elements report AXSelected false, so only a set one counts.
+    ["checked", "pressed"]
+        .iter()
+        .any(|field| element.get(field).is_some_and(|value| !value.is_null()))
+        || element.get("selected").and_then(Value::as_bool) == Some(true)
+        || element
+            .get("value")
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "1" | "true" | "false" | "on" | "off" | "mixed"
+                )
+            })
 }
 
-/// When nothing of the named role matches: whether the exact name is on
-/// elements of another role. Only a role pressed alike can stand in, and only
-/// for a lookup that presses or checks it, never for one that types into it
-/// or a pick by position.
-fn other_roles<'r>(read: &'r Read, spec: &ElementSpec) -> Option<OtherRole<'r>> {
+/// When nothing of the named role matches: the elements of a role pressed
+/// alike that carry the exact name, if any. Only a button or link (never a
+/// toggle) stands in for the other, only for a lookup that presses or checks
+/// it, never for one that types into it or a pick by position, and never
+/// from a truncated read, where the role named may lie past the cut.
+fn other_roles<'r>(read: &'r Read, spec: &ElementSpec) -> Option<Vec<&'r Value>> {
     let (Some(role), Some(name)) = (&spec.role, &spec.name) else {
         return None;
     };
+    if read.truncated
+        || spec.nth.is_some()
+        || !pressed_alike(role)
+        || toggles(role, None)
+        || matches!(spec.action, Some("set_value" | "type_text" | "drag"))
+    {
+        return None;
+    }
     let needle = fold(name);
     let role_of = |element: &Value| {
         element
@@ -1301,36 +1358,23 @@ fn other_roles<'r>(read: &'r Read, spec: &ElementSpec) -> Option<OtherRole<'r>> 
             .unwrap_or_default()
             .to_owned()
     };
-    let named: Vec<&Value> = read
+    let alike: Vec<&Value> = read
         .elements
         .iter()
         .filter(|element| element.get("display_only").and_then(Value::as_bool) != Some(true))
         .filter(|element| label_of(element).is_some_and(|label| fold(label) == needle))
-        .filter(|element| !role_matches(role, &role_of(element)))
+        .filter(|element| {
+            let other = role_of(element);
+            !role_matches(role, &other) && pressed_alike(&other) && !toggles(&other, Some(element))
+        })
         .collect();
-    if named.is_empty() {
-        return None;
-    }
-    let substitutable = spec.nth.is_none()
-        && pressed_alike(role)
-        && !matches!(spec.action, Some("set_value" | "type_text" | "drag"));
-    if substitutable {
-        let alike: Vec<&Value> = named
-            .iter()
-            .copied()
-            .filter(|element| pressed_alike(&role_of(element)))
-            .collect();
-        let visible: Vec<&Value> = alike
-            .iter()
-            .copied()
-            .filter(|element| has_area(element))
-            .collect();
-        let alike = if visible.is_empty() { alike } else { visible };
-        if !alike.is_empty() {
-            return Some(OtherRole::PressedAlike(alike));
-        }
-    }
-    Some(OtherRole::Unlike)
+    let visible: Vec<&Value> = alike
+        .iter()
+        .copied()
+        .filter(|element| has_area(element))
+        .collect();
+    let alike = if visible.is_empty() { alike } else { visible };
+    (!alike.is_empty()).then_some(alike)
 }
 
 /// What a lookup that used another role says, so the caller learns the role.
@@ -1367,7 +1411,7 @@ fn several_alike(read: &Read, spec: &ElementSpec, alike: &[&Value]) -> Miss {
             listed.join("; ")
         ),
     );
-    miss.other_role_only = Some(read.elements.len());
+    miss.settle_digest = Some(digest(read));
     miss
 }
 
@@ -1375,6 +1419,19 @@ fn several_alike(read: &Read, spec: &ElementSpec, alike: &[&Value]) -> Miss {
 /// `role_note` is set when it held on an element of a role pressed alike
 /// with the one named, because nothing had that role.
 fn evaluate(check: &Check, read: &Read) -> Result<(Option<String>, Option<String>), Miss> {
+    evaluate_with(check, read, true)
+}
+
+/// As [`evaluate`], with no element of another role standing in.
+fn evaluate_as_named(check: &Check, read: &Read) -> Result<(Option<String>, Option<String>), Miss> {
+    evaluate_with(check, read, false)
+}
+
+fn evaluate_with(
+    check: &Check,
+    read: &Read,
+    stand_in: bool,
+) -> Result<(Option<String>, Option<String>), Miss> {
     let element_spec = ElementSpec {
         nth: None,
         ..check.element.clone()
@@ -1400,18 +1457,16 @@ fn evaluate(check: &Check, read: &Read) -> Result<(Option<String>, Option<String
     // Nothing has the role named: the exact name on an element of a role
     // pressed alike holds a presence check, as a lookup would press it.
     let mut substituted = false;
-    let mut other_role_only = None;
-    if !present && !check.gone && check.element.text.is_none() {
+    if stand_in && !present && !check.gone && check.element.text.is_none() {
         match other_roles(read, &check.element) {
-            Some(OtherRole::PressedAlike(alike)) if alike.len() == 1 => {
+            Some(alike) if alike.len() == 1 => {
                 structured = alike;
                 substituted = true;
                 present = true;
             }
-            Some(OtherRole::PressedAlike(alike)) => {
+            Some(alike) => {
                 return Err(several_alike(read, &check.element, &alike).in_window(&read.window));
             }
-            Some(OtherRole::Unlike) => other_role_only = Some(read.elements.len()),
             None => {}
         }
     }
@@ -1438,7 +1493,7 @@ fn evaluate(check: &Check, read: &Read) -> Result<(Option<String>, Option<String
         };
     }
     if !present {
-        let mut miss = Miss::new(
+        return Err(Miss::new(
             "not_found",
             format!(
                 "no {} in {}{}",
@@ -1447,9 +1502,7 @@ fn evaluate(check: &Check, read: &Read) -> Result<(Option<String>, Option<String
                 near_misses(read, &check.element)
             ),
         )
-        .in_window(window);
-        miss.other_role_only = other_role_only;
-        return Err(miss);
+        .in_window(window));
     }
     let needs_fields = check.value.is_some()
         || check.value_contains.is_some()
@@ -1880,6 +1933,7 @@ mod tests {
             },
             elements,
             markdown: markdown.to_owned(),
+            truncated: false,
         }
     }
 
@@ -2118,6 +2172,16 @@ mod tests {
         );
         let found = pick(&read, &button("Edit billing")).unwrap();
         assert_eq!(found.element["element_index"], 46);
+        // Without the stand-in, the lookup would have missed as before.
+        let fallback = found.fallback.clone().unwrap();
+        assert_eq!(fallback.code, "not_found");
+        assert!(
+            fallback
+                .message
+                .contains("nearest: [46] AXLink \"Edit billing\""),
+            "{}",
+            fallback.message
+        );
         let note = found.role_note.unwrap();
         assert!(
             note.contains("no button \"Edit billing\" (exact) here, so it used the link")
@@ -2161,6 +2225,10 @@ mod tests {
         let miss = pick(&twins, &button("Edit billing")).unwrap_err();
         assert_eq!(miss.code, "ambiguous");
         assert!(
+            miss.settle_digest.is_some(),
+            "waits for the window to settle"
+        );
+        assert!(
             miss.message
                 .contains("2 elements of other roles have that exact name")
                 && miss.message.contains("[1] AXLink")
@@ -2172,20 +2240,54 @@ mod tests {
         let longer = read_with(vec![element(1, "AXLink", "Edit billing details")]);
         let miss = pick(&longer, &button("Edit billing")).unwrap_err();
         assert_eq!(miss.code, "not_found");
-        assert!(miss.other_role_only.is_none());
         let loose = ElementSpec {
             exact: false,
             ..button("Edit billing")
         };
         assert_eq!(pick(&longer, &loose).unwrap_err().code, "not_found");
-        // A role not pressed alike never stands in, and says the window
-        // shows the name only on another role.
+        // A role not pressed alike, or a toggle, never stands in: the usual
+        // miss, which waits its whole time.
         for role in ["AXStaticText", "AXCheckBox", "AXMenuItem", "AXTextField"] {
             let other = read_with(vec![element(1, role, "Edit billing")]);
             let miss = pick(&other, &button("Edit billing")).unwrap_err();
             assert_eq!(miss.code, "not_found", "{role}");
-            assert_eq!(miss.other_role_only, Some(1), "{role}");
+            assert!(miss.worth_waiting(), "{role}");
         }
+        // A toggle button, or a button with a pressed or checked state, does
+        // not stand in for a link, and a toggle button asked for takes no link.
+        let link_bold = ElementSpec {
+            role: Some("link".into()),
+            ..button("Bold")
+        };
+        let toggle_button = read_with(vec![element(1, "toggle button", "Bold")]);
+        assert_eq!(
+            pick(&toggle_button, &link_bold).unwrap_err().code,
+            "not_found"
+        );
+        for (field, value) in [
+            ("checked", json!(false)),
+            ("pressed", json!(true)),
+            ("selected", json!(true)),
+            ("value", json!("0")),
+        ] {
+            let mut toggle = element(1, "push button", "Bold");
+            toggle[field] = value;
+            let link = ElementSpec {
+                role: Some("link".into()),
+                ..button("Bold")
+            };
+            assert_eq!(
+                pick(&read_with(vec![toggle]), &link).unwrap_err().code,
+                "not_found",
+                "{field}"
+            );
+        }
+        let toggle = ElementSpec {
+            role: Some("toggle button".into()),
+            ..button("Bold")
+        };
+        let bold = read_with(vec![element(1, "link", "Bold")]);
+        assert_eq!(pick(&bold, &toggle).unwrap_err().code, "not_found");
         // Typing, or a pick by position, keeps the role named.
         let link = read_with(vec![element(1, "AXLink", "Edit billing")]);
         for spec in [
@@ -2200,12 +2302,25 @@ mod tests {
         ] {
             assert_eq!(pick(&link, &spec).unwrap_err().code, "not_found");
         }
-        // A field named for typing is not a pressable role.
-        let field = ElementSpec {
-            role: Some("textfield".into()),
-            ..button("Edit billing")
-        };
-        assert!(pick(&link, &field).unwrap_err().other_role_only.is_some());
+    }
+
+    #[test]
+    fn a_truncated_read_takes_no_stand_in() {
+        // The read stopped at its budget: a button of that name may lie past
+        // the cut, so the link near the top is not taken, nor several links
+        // called ambiguous.
+        let mut cut = read_with(vec![element(1, "AXLink", "Edit billing")]);
+        cut.truncated = true;
+        let miss = pick(&cut, &button("Edit billing")).unwrap_err();
+        assert_eq!(miss.code, "not_found");
+        assert!(miss.settle_digest.is_none());
+        cut.elements.push(element(2, "AXLink", "Edit billing"));
+        assert_eq!(
+            pick(&cut, &button("Edit billing")).unwrap_err().code,
+            "not_found"
+        );
+        let check = Check::parse(&json!({"role": "button", "name": "Edit billing"}), 0).unwrap();
+        assert_eq!(evaluate(&check, &cut).unwrap_err().code, "not_found");
     }
 
     #[test]
@@ -2229,7 +2344,7 @@ mod tests {
             &read
         )
         .is_ok());
-        // Only static text by that name: not found, and settled-able.
+        // Only static text by that name: not found, waiting its whole time.
         let text = read_with(vec![element(1, "AXStaticText", "Edit billing")]);
         let miss = evaluate(
             &check(json!({"role": "button", "name": "Edit billing"})),
@@ -2237,34 +2352,42 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(miss.code, "not_found");
-        assert_eq!(miss.other_role_only, Some(1));
+        assert!(miss.settle_digest.is_none());
     }
 
     #[test]
-    fn a_wait_stops_once_a_window_with_only_another_role_settles() {
+    fn a_stand_in_waits_for_a_window_whose_content_stops_changing() {
         let mut settle = Settle::default();
-        let mut miss = Miss::new("not_found", "no button");
-        assert!(!settle.settled_miss(&miss), "no other role: keep waiting");
-        miss.other_role_only = Some(10);
-        assert!(!settle.settled_miss(&miss), "first sight starts the clock");
-        settle.since = settle
-            .since
-            .map(|(_, count)| (Instant::now() - OTHER_ROLE_SETTLE, count));
-        miss.other_role_only = Some(11);
+        let age = |settle: &mut Settle| {
+            settle.since = settle
+                .since
+                .map(|(_, digest)| (Instant::now() - OTHER_ROLE_SETTLE, digest));
+        };
+        let page = |label: &str| {
+            digest(&read_with(vec![
+                element(1, "AXLink", "Save"),
+                element(2, "AXStaticText", label),
+            ]))
+        };
         assert!(
-            !settle.settled_miss(&miss),
-            "the window changed: start over"
+            !settle.settled(Some(page("Loading"))),
+            "first sight starts the clock"
         );
-        settle.since = settle
-            .since
-            .map(|(_, count)| (Instant::now() - OTHER_ROLE_SETTLE, count));
-        assert!(settle.settled_miss(&miss), "unchanged for the settle time");
-        settle.since = settle
-            .since
-            .map(|(_, count)| (Instant::now() - OTHER_ROLE_SETTLE, count));
+        age(&mut settle);
+        // Same element count, other content: the window is still changing.
+        assert!(!settle.settled(Some(page("Loaded"))), "changed: start over");
+        age(&mut settle);
         assert!(
-            !settle.settled(Some((true, 11))),
-            "a stand-in after misses of the same size starts its own clock"
+            settle.settled(Some(page("Loaded"))),
+            "unchanged for the settle time"
+        );
+        assert!(!settle.settled(None), "any other result starts over");
+        // A read's tokens change every time; its content does not.
+        let mut again = element(1, "AXLink", "Save");
+        again["element_token"] = json!("s00000002:1");
+        assert_eq!(
+            digest(&read_with(vec![element(1, "AXLink", "Save")])),
+            digest(&read_with(vec![again]))
         );
     }
 

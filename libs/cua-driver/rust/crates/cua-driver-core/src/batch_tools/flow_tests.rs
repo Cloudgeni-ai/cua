@@ -25,6 +25,8 @@ struct Ui {
     /// Reads left before a dialog's "Save" button appears on screen 4,
     /// over a page that already shows a link "Save".
     save_delay_reads: u32,
+    /// Reads say they stopped at their node budget.
+    truncated: bool,
     snapshot: u32,
     /// Element labels of the latest read, by element index.
     last_labels: Vec<(String, String)>,
@@ -69,6 +71,12 @@ impl Ui {
             5 => vec![
                 ("AXLink", "Details".into(), None),
                 ("AXLink", "Details".into(), None),
+            ],
+            // A page that keeps changing (a progress line), with a link
+            // "Edit billing".
+            6 => vec![
+                ("AXLink", "Edit billing".into(), None),
+                ("AXStaticText", format!("Loading {}%", self.snapshot), None),
             ],
             _ => {
                 let mut rows = vec![("AXButton", "Back".into(), None)];
@@ -159,6 +167,7 @@ impl Tool for Fake {
                     "snapshot_id": format!("s{snapshot:08x}"),
                     "elements": elements,
                     "tree_markdown": markdown,
+                    "truncated": ui.truncated,
                 }))
             }
             "click" | "set_value" => {
@@ -616,13 +625,14 @@ async fn a_button_named_for_a_link_is_pressed_as_the_link_at_once() {
 }
 
 #[tokio::test]
-async fn a_wait_for_a_name_shown_only_as_text_stops_once_the_window_settles() {
+async fn a_wait_for_a_name_shown_only_as_text_waits_its_whole_time() {
+    // A slow page may yet render the button behind a heading of its name.
     let harness = Harness::new();
     harness.ui.lock().unwrap().screen = 2;
     let started = std::time::Instant::now();
     let result = harness
         .run(json!({"steps": [
-            {"wait_for": {"app": "Demo", "role": "button", "name": "Plan", "timeout_ms": 10000}},
+            {"wait_for": {"app": "Demo", "role": "button", "name": "Plan", "timeout_ms": 2500}},
             {"click": {"role": "button", "name": "Plan"}}
         ]}))
         .await;
@@ -634,14 +644,58 @@ async fn a_wait_for_a_name_shown_only_as_text_stops_once_the_window_settles() {
         message.contains("nearest: [3] AXStaticText \"Plan\""),
         "{message}"
     );
+    assert!(!message.contains("stopped"), "{message}");
+    assert!(elapsed >= Duration::from_millis(2_000), "{elapsed:?}");
+    assert!(harness.calls("click").is_empty(), "nothing pressed");
+}
+
+#[tokio::test]
+async fn a_window_that_never_settles_takes_no_stand_in() {
+    // The page keeps changing until the wait runs out: the link is not
+    // taken for the button, and the step fails as it would without it.
+    let harness = Harness::new();
+    harness.ui.lock().unwrap().screen = 6;
+    let result = harness
+        .run(json!({"steps": [
+            {"wait_for": {"app": "Demo", "role": "button", "name": "Edit billing",
+                          "exact": true, "timeout_ms": 2500}},
+            {"click": {"role": "button", "name": "Edit billing", "exact": true}}
+        ]}))
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    let message = text(&result);
     assert!(
-        message.contains(
-            "the window stopped changing and shows that name only on another kind of element"
-        ),
+        message.contains("no button \"Edit billing\" (exact)")
+            && message.contains("nearest: [1] AXLink \"Edit billing\"")
+            && message.contains("checked for"),
         "{message}"
     );
-    assert!(elapsed >= Duration::from_millis(1_400), "{elapsed:?}");
-    assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+    assert!(!message.contains("used the link"), "{message}");
+    assert!(harness.calls("click").is_empty(), "nothing pressed");
+}
+
+#[tokio::test]
+async fn a_truncated_read_takes_no_stand_in() {
+    // The read stopped at its node budget: the button may lie past the cut.
+    let harness = Harness::new();
+    {
+        let mut ui = harness.ui.lock().unwrap();
+        ui.screen = 2;
+        ui.truncated = true;
+    }
+    let result = harness
+        .run(json!({"steps": [
+            {"wait_for": {"app": "Demo", "role": "button", "name": "Edit billing",
+                          "exact": true, "timeout_ms": 2500}},
+            {"click": {"role": "button", "name": "Edit billing", "exact": true}}
+        ]}))
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert!(
+        !text(&result).contains("used the link"),
+        "{}",
+        text(&result)
+    );
     assert!(harness.calls("click").is_empty(), "nothing pressed");
 }
 
