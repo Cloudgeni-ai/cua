@@ -22,6 +22,9 @@ struct Ui {
     bubble_open: bool,
     /// Reads left before the "Finish" button appears on screen 2.
     finish_delay_reads: u32,
+    /// Reads left before a dialog's "Save" button appears on screen 4,
+    /// over a page that already shows a link "Save".
+    save_delay_reads: u32,
     snapshot: u32,
     /// Element labels of the latest read, by element index.
     last_labels: Vec<(String, String)>,
@@ -52,6 +55,16 @@ impl Ui {
                 ("AXLink", "Edit billing".into(), None),
                 ("AXStaticText", "Plan".into(), None),
             ],
+            // A page with a link "Save" under a dialog still rendering.
+            4 => {
+                let mut rows = vec![("AXLink", "Save".into(), None)];
+                if self.save_delay_reads == 0 {
+                    rows.push(("AXButton", "Save".into(), None));
+                } else {
+                    self.save_delay_reads -= 1;
+                }
+                rows
+            }
             _ => {
                 let mut rows = vec![("AXButton", "Back".into(), None)];
                 if self.finish_delay_reads == 0 {
@@ -566,11 +579,10 @@ async fn a_button_named_for_a_link_is_pressed_as_the_link_at_once() {
         ]}))
         .await;
     assert_ne!(result.is_error, Some(true), "{}", text(&result));
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "{:?}",
-        started.elapsed()
-    );
+    // The stand-in is used once the window has stayed the same for 1.5 s.
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(1_400), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
     let clicks = harness.calls("click");
     assert_eq!(clicks.len(), 1);
     assert!(clicks[0]["element_token"].as_str().unwrap().ends_with(":2"));
@@ -626,4 +638,36 @@ async fn a_wait_for_a_name_shown_only_as_text_stops_once_the_window_settles() {
     assert!(elapsed >= Duration::from_millis(1_400), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
     assert!(harness.calls("click").is_empty(), "nothing pressed");
+}
+
+#[tokio::test]
+async fn a_button_that_appears_after_a_link_of_its_name_is_the_one_pressed() {
+    // An earlier step opened a dialog with a "Save" button over a page that
+    // already shows a link "Save": the link must not be pressed while the
+    // dialog is still rendering.
+    let harness = Harness::new();
+    {
+        let mut ui = harness.ui.lock().unwrap();
+        ui.screen = 4;
+        ui.save_delay_reads = 3;
+    }
+    let result = harness
+        .run(json!({"steps": [
+            {"wait_for": {"app": "Demo", "role": "button", "name": "Save", "exact": true,
+                          "enabled": true, "timeout_ms": 10000}},
+            {"click": {"role": "button", "name": "Save", "exact": true}}
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let clicks = harness.calls("click");
+    assert_eq!(clicks.len(), 1);
+    assert!(
+        clicks[0]["element_token"].as_str().unwrap().ends_with(":2"),
+        "{}",
+        clicks[0]
+    );
+    let message = text(&result);
+    assert!(!message.contains("used the link"), "{message}");
+    let structured = result.structured_content.unwrap();
+    assert!(structured["steps"][1]["target"]["stand_in"].is_null());
 }

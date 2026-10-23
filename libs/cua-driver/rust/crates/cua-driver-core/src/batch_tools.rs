@@ -876,9 +876,15 @@ async fn run_step(
         };
     }
 
+    // The element a wait held on as a stand-in, after the window settled:
+    // the step's lookup of the same element then uses it at once.
+    let mut settled_stand_in: Option<ElementSpec> = None;
     if let Some(check) = &step.wait_for {
         match locator.check(check, context).await {
             Ok(checked) => {
+                if checked.role_note.is_some() {
+                    settled_stand_in = Some(check.element.clone());
+                }
                 if !check.window.is_empty() {
                     *context = check.window.clone();
                 }
@@ -936,7 +942,21 @@ async fn run_step(
                 action: Some(tool),
                 ..element
             };
-            match locator.find(&window_spec, &element, find_timeout).await {
+            let settled = settled_stand_in.as_ref().is_some_and(|held| {
+                ElementSpec {
+                    action: None,
+                    nth: None,
+                    ..held.clone()
+                } == ElementSpec {
+                    action: None,
+                    nth: None,
+                    ..element.clone()
+                }
+            });
+            match locator
+                .find_settled(&window_spec, &element, find_timeout, settled)
+                .await
+            {
                 Ok(found) => {
                     let object = args.as_object_mut().expect("object");
                     object.insert("pid".into(), json!(found.window.pid));

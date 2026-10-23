@@ -396,6 +396,9 @@ pub(crate) struct Found {
     /// role pressed alike, by that exact name, was used instead: says so,
     /// so the caller names it right next time.
     pub role_note: Option<String>,
+    /// The read's element count, for a stand-in: a poll takes a stand-in
+    /// only once the window has stopped changing (see [`Settle`]).
+    pub seen: usize,
 }
 
 impl Found {
@@ -471,34 +474,43 @@ pub(crate) struct Checked {
     /// As [`Found::role_note`]: the check held on an element of a role
     /// pressed alike, not the role named.
     pub role_note: Option<String>,
+    /// As [`Found::seen`].
+    pub seen: usize,
 }
 
 /// How long a window must stay unchanged, showing the name asked for only on
-/// an element of another role, before a wait for it stops early. A page that
-/// is still loading keeps changing; one that has settled will not grow the
-/// element in the remaining seconds of a long wait.
+/// an element of another role, before a wait for it stops early, or uses the
+/// one element of a role pressed alike. A page that is still loading (or a
+/// dialog an earlier step opened) keeps changing, and may yet show the role
+/// named; one that has settled will not grow it in the remaining seconds of
+/// a long wait.
 const OTHER_ROLE_SETTLE: Duration = Duration::from_millis(1_500);
 
-/// Tracks consecutive polls whose miss is an other-role-only window of the
-/// same size.
+/// Tracks consecutive polls that show the name only on another role, as a
+/// stand-in or not, in a window of the same size.
 #[derive(Default)]
 struct Settle {
-    since: Option<(Instant, usize)>,
+    since: Option<(Instant, (bool, usize))>,
 }
 
 impl Settle {
-    fn settled(&mut self, miss: &Miss) -> bool {
-        let Some(count) = miss.other_role_only else {
+    /// `poll` is `(stand_in, element_count)`, or None for any other result.
+    fn settled(&mut self, poll: Option<(bool, usize)>) -> bool {
+        let Some(poll) = poll else {
             self.since = None;
             return false;
         };
         match self.since {
-            Some((at, seen)) if seen == count => at.elapsed() >= OTHER_ROLE_SETTLE,
+            Some((at, seen)) if seen == poll => at.elapsed() >= OTHER_ROLE_SETTLE,
             _ => {
-                self.since = Some((Instant::now(), count));
+                self.since = Some((Instant::now(), poll));
                 false
             }
         }
+    }
+
+    fn settled_miss(&mut self, miss: &Miss) -> bool {
+        self.settled(miss.other_role_only.map(|count| (false, count)))
     }
 
     fn stopped(&self, mut miss: Miss, started: Instant) -> Miss {
@@ -816,15 +828,39 @@ impl<'a> Locator<'a> {
         element: &ElementSpec,
         timeout: Duration,
     ) -> Result<Found, Miss> {
+        self.find_settled(window, element, timeout, false).await
+    }
+
+    /// As [`Locator::find`]. A stand-in of another role is used once the
+    /// window has settled, or at once when `settled` (a check just held on
+    /// it after the window settled).
+    pub async fn find_settled(
+        &self,
+        window: &WindowSpec,
+        element: &ElementSpec,
+        timeout: Duration,
+        settled: bool,
+    ) -> Result<Found, Miss> {
         let started = Instant::now();
         let deadline = (started + timeout).min(self.deadline);
         let mut settle = Settle::default();
         loop {
             let attempt = self.find_once(window, element).await;
             match attempt {
-                Ok(found) => return Ok(found),
+                Ok(found) if found.role_note.is_none() => return Ok(found),
+                Ok(found) => {
+                    if settled
+                        || settle.settled(Some((true, found.seen)))
+                        || Instant::now() + POLL_INTERVAL > deadline
+                    {
+                        return Ok(found);
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
                 Err(miss) if !miss.worth_waiting() => return Err(miss),
-                Err(miss) if settle.settled(&miss) => return Err(settle.stopped(miss, started)),
+                Err(miss) if settle.settled_miss(&miss) => {
+                    return Err(settle.stopped(miss, started))
+                }
                 Err(miss) => {
                     if Instant::now() + POLL_INTERVAL > deadline {
                         let waited = started.elapsed().as_millis();
@@ -899,6 +935,7 @@ impl<'a> Locator<'a> {
                     observed: Some(format!("{} is closed", spec.describe())),
                     waited: started.elapsed(),
                     role_note: None,
+                    seen: 0,
                 })
             }
             Err(miss) => return Err(miss),
@@ -922,6 +959,7 @@ impl<'a> Locator<'a> {
                         observed,
                         waited: started.elapsed(),
                         role_note,
+                        seen: read.elements.len(),
                     };
                     if checked.role_note.is_none() {
                         return Ok(checked);
@@ -947,6 +985,7 @@ impl<'a> Locator<'a> {
                 observed: None,
                 waited: started.elapsed(),
                 role_note: None,
+                seen: 0,
             }),
             Some((_, mut miss)) => {
                 if windows.len() > 1 {
@@ -974,9 +1013,19 @@ impl<'a> Locator<'a> {
         loop {
             let outcome = self.check_once(check, &window_spec, started).await;
             match outcome {
-                Ok(checked) => return Ok(checked),
+                Ok(checked) if checked.role_note.is_none() => return Ok(checked),
+                Ok(checked) => {
+                    if settle.settled(Some((true, checked.seen)))
+                        || Instant::now() + POLL_INTERVAL > deadline
+                    {
+                        return Ok(checked);
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
                 Err(miss) if !miss.worth_waiting() => return Err(miss),
-                Err(miss) if settle.settled(&miss) => return Err(settle.stopped(miss, started)),
+                Err(miss) if settle.settled_miss(&miss) => {
+                    return Err(settle.stopped(miss, started))
+                }
                 Err(miss) => {
                     if Instant::now() + POLL_INTERVAL > deadline {
                         let mut miss = miss;
@@ -1217,6 +1266,7 @@ fn pick(read: &Read, spec: &ElementSpec) -> Result<Found, Miss> {
         window: read.window.clone(),
         element: chosen.clone(),
         role_note,
+        seen: read.elements.len(),
     })
 }
 
@@ -2169,18 +2219,28 @@ mod tests {
     fn a_wait_stops_once_a_window_with_only_another_role_settles() {
         let mut settle = Settle::default();
         let mut miss = Miss::new("not_found", "no button");
-        assert!(!settle.settled(&miss), "no other role: keep waiting");
+        assert!(!settle.settled_miss(&miss), "no other role: keep waiting");
         miss.other_role_only = Some(10);
-        assert!(!settle.settled(&miss), "first sight starts the clock");
+        assert!(!settle.settled_miss(&miss), "first sight starts the clock");
         settle.since = settle
             .since
             .map(|(_, count)| (Instant::now() - OTHER_ROLE_SETTLE, count));
         miss.other_role_only = Some(11);
-        assert!(!settle.settled(&miss), "the window changed: start over");
+        assert!(
+            !settle.settled_miss(&miss),
+            "the window changed: start over"
+        );
         settle.since = settle
             .since
             .map(|(_, count)| (Instant::now() - OTHER_ROLE_SETTLE, count));
-        assert!(settle.settled(&miss), "unchanged for the settle time");
+        assert!(settle.settled_miss(&miss), "unchanged for the settle time");
+        settle.since = settle
+            .since
+            .map(|(_, count)| (Instant::now() - OTHER_ROLE_SETTLE, count));
+        assert!(
+            !settle.settled(Some((true, 11))),
+            "a stand-in after misses of the same size starts its own clock"
+        );
     }
 
     #[test]
