@@ -22,12 +22,14 @@ use crate::{
 
 /// Keys a step may add to an action's arguments to name its target. They are
 /// removed before the action tool runs.
-pub(crate) const SELECTOR_KEYS: &[&str] = &["role", "name", "label", "nth", "app", "window"];
+pub(crate) const SELECTOR_KEYS: &[&str] =
+    &["role", "name", "label", "exact", "nth", "app", "window"];
 /// Keys a `wait_for` / `expect` check accepts.
 pub(crate) const CHECK_KEYS: &[&str] = &[
     "role",
     "name",
     "label",
+    "exact",
     "text",
     "nth",
     "app",
@@ -106,6 +108,9 @@ impl WindowSpec {
 pub(crate) struct ElementSpec {
     pub role: Option<String>,
     pub name: Option<String>,
+    /// The name must be the element's whole label (case-insensitive), not
+    /// the start of a word in it: "Delete" never matches "Delete all".
+    pub exact: bool,
     /// Any row of the tree containing this text, display-only rows included.
     pub text: Option<String>,
     pub nth: Option<usize>,
@@ -128,6 +133,9 @@ impl ElementSpec {
         }
         if let Some(name) = &self.name {
             out.push_str(&format!(" \"{name}\""));
+            if self.exact {
+                out.push_str(" (exact)");
+            }
         }
         if let Some(text) = &self.text {
             out.push_str(&format!(" with text \"{text}\""));
@@ -286,6 +294,7 @@ fn element_spec(object: &Map<String, Value>) -> Result<ElementSpec, String> {
     Ok(ElementSpec {
         role: opt_string(object, "role")?,
         name,
+        exact: opt_bool(object, "exact")?.unwrap_or(false),
         text: opt_string(object, "text")?,
         nth,
         action: None,
@@ -923,7 +932,7 @@ pub(crate) fn matches<'r>(read: &'r Read, spec: &ElementSpec) -> Vec<&'r Value> 
                 .copied()
                 .filter(|element| label_of(element).is_some_and(|label| fold(label) == needle))
                 .collect();
-            if exact.is_empty() {
+            if exact.is_empty() && !spec.exact {
                 by_role
                     .into_iter()
                     .filter(|element| {
@@ -1278,7 +1287,14 @@ pub(crate) fn display_rows(read: &Read, spec: &ElementSpec) -> Vec<Value> {
                 }
             }
             if let Some(name) = &spec.name {
-                if !has_word_start(&folded, &fold(name)) {
+                let matched = if spec.exact {
+                    label
+                        .as_deref()
+                        .is_some_and(|label| fold(label) == fold(name))
+                } else {
+                    has_word_start(&folded, &fold(name))
+                };
+                if !matched {
                     return None;
                 }
             }
@@ -1309,7 +1325,12 @@ fn row_matches(row: &str, spec: &ElementSpec) -> bool {
         }
     }
     if let Some(name) = &spec.name {
-        if !has_word_start(&folded, &fold(name)) {
+        let matched = if spec.exact {
+            row_label(row).is_some_and(|label| fold(label) == fold(name))
+        } else {
+            has_word_start(&folded, &fold(name))
+        };
+        if !matched {
             return false;
         }
     }
@@ -1325,6 +1346,18 @@ fn row_matches(row: &str, spec: &ElementSpec) -> bool {
         }
     }
     spec.text.is_some() || spec.name.is_some()
+}
+
+/// The quoted label of a tree row such as `- [3] AXButton "Delete" ...`.
+fn row_label(row: &str) -> Option<&str> {
+    let rest = row.trim_start_matches("- ");
+    let rest = match rest.strip_prefix('[') {
+        Some(indexed) => indexed.split_once("] ")?.1,
+        None => rest,
+    };
+    let after_role = rest.split_once(' ')?.1.trim_start();
+    let inner = after_role.strip_prefix('"')?;
+    inner.find('"').map(|end| &inner[..end])
 }
 
 fn near_misses(read: &Read, spec: &ElementSpec) -> String {
@@ -1791,6 +1824,49 @@ mod tests {
         assert!(evaluate(&check(json!({"text": "Error", "gone": true})), &read).is_ok());
         let still = evaluate(&check(json!({"text": "Saved", "gone": true})), &read).unwrap_err();
         assert_eq!(still.code, "still_present");
+    }
+
+    #[test]
+    fn an_exact_name_never_takes_a_longer_label() {
+        let read = read(
+            vec![element(4, "AXButton", "Delete all")],
+            "- [0] AXWindow \"Doc\"\n  - [4] AXButton \"Delete all\"\n  - AXStaticText \"Delete all rows\"",
+        );
+        let loose = ElementSpec {
+            role: Some("button".into()),
+            name: Some("delete".into()),
+            ..Default::default()
+        };
+        assert_eq!(pick(&read, &loose).unwrap().element["element_index"], 4);
+        let exact = ElementSpec {
+            exact: true,
+            ..loose
+        };
+        assert_eq!(pick(&read, &exact).unwrap_err().code, "not_found");
+        let whole = ElementSpec {
+            name: Some("DELETE ALL".into()),
+            ..exact.clone()
+        };
+        assert_eq!(pick(&read, &whole).unwrap().element["element_index"], 4);
+        let check = |raw: Value| Check::parse(&raw, 0).unwrap();
+        assert!(evaluate(&check(json!({"name": "Delete"})), &read).is_ok());
+        assert_eq!(
+            evaluate(&check(json!({"name": "Delete", "exact": true})), &read)
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
+        assert!(evaluate(
+            &check(json!({"role": "button", "name": "delete all", "exact": true, "enabled": true})),
+            &read
+        )
+        .is_ok());
+        assert_eq!(
+            row_label("- [4] AXButton \"Delete all\" (x)"),
+            Some("Delete all")
+        );
+        assert_eq!(row_label("- AXStaticText \"Saved\""), Some("Saved"));
+        assert_eq!(row_label("- AXGroup"), None);
     }
 
     #[test]
