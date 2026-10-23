@@ -508,7 +508,14 @@ fn set_value_blocking(
         // direct writes are rejected (SwiftUI AXSlider rejects every AXValue
         // write with -25200 yet exposes a readable AXValue + increment/decrement
         // actions).
-        let numeric_target = value.trim().parse::<f64>().ok();
+        // A text field takes text even when it reads as a number (a card's
+        // CVC "312"): Chrome accepts a CFNumber write to a web text field
+        // with success and ignores it, so the string write never ran.
+        let numeric_target = if takes_text(&role) {
+            None
+        } else {
+            value.trim().parse::<f64>().ok()
+        };
         // Read the value before writing so an unchanged field can be reported as
         // idempotent rather than silently indistinguishable from a fresh write.
         let before = unsafe { copy_string_attr(element, "AXValue") };
@@ -596,6 +603,14 @@ fn set_value_blocking(
             anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
         }
     }
+}
+
+/// Roles whose AXValue is text, written as a CFString whatever it reads like.
+fn takes_text(role: &str) -> bool {
+    matches!(
+        role,
+        "AXTextField" | "AXTextArea" | "AXComboBox" | "AXSearchField" | "AXSecureTextField"
+    )
 }
 
 /// Re-reads (100 ms apart) before an unchanged value counts as not applied.
@@ -1293,9 +1308,25 @@ fn hex_digit(n: u8) -> char {
 mod tests {
     use super::{
         apply_surface_trust, apply_verification_label, classify_write, file_name_needs_rename,
-        is_file_name_cell, is_get_info_name_field, not_applied_result, write_not_applied,
-        SetValueOutcome, GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
+        is_file_name_cell, is_get_info_name_field, not_applied_result, takes_text,
+        write_not_applied, SetValueOutcome, GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
     };
+
+    #[test]
+    fn text_fields_take_numeric_looking_values_as_text() {
+        for role in [
+            "AXTextField",
+            "AXTextArea",
+            "AXComboBox",
+            "AXSearchField",
+            "AXSecureTextField",
+        ] {
+            assert!(takes_text(role), "{role}");
+        }
+        for role in ["AXSlider", "AXIncrementor", "AXStepper", "AXValueIndicator"] {
+            assert!(!takes_text(role), "{role}");
+        }
+    }
 
     #[test]
     fn a_listed_file_name_is_a_file_name_cell() {
