@@ -216,7 +216,6 @@ impl Tool for SetValueTool {
         // child option which can trigger app activation in some setups.
         let prior_front = apps::frontmost_pid();
         let snapshot = WindowChangeDetector::snapshot(prior_front);
-        let requested = value.clone();
 
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
@@ -244,7 +243,7 @@ impl Tool for SetValueTool {
             Ok(Ok(SetValueOutcome {
                 refusal: Some(refusal),
                 ..
-            })) => refusal_result(element_index, &requested, refusal),
+            })) => refusal_result(element_index, refusal),
             Ok(Ok(outcome)) if outcome.not_applied && !ax_echo_surface => {
                 let vcl = crate::input::pointer_toolkit::detect(pid)
                     == Some(crate::input::pointer_toolkit::PointerReadingToolkit::Vcl);
@@ -771,7 +770,9 @@ fn refused(refusal: Refusal) -> SetValueOutcome {
 
 /// The result of a write that ran but is refused. `write_not_applied` always
 /// means the control holds what it held before: nothing changed.
-fn refusal_result(element_index: usize, value: &str, refusal: Refusal) -> ToolResult {
+/// The message never repeats the value: it may be a secret, such as a PIN in a
+/// number field.
+fn refusal_result(element_index: usize, refusal: Refusal) -> ToolResult {
     let (message, code, effect) = match refusal {
         Refusal::Rejected { restored: true } => (
             format!(
@@ -794,20 +795,19 @@ fn refusal_result(element_index: usize, value: &str, refusal: Refusal) -> ToolRe
         ),
         Refusal::OutOfRange { min, max } => (
             format!(
-                "set_value did not take: {} is outside the range of element [{element_index}] \
-                 ({min} to {max}), so nothing changed. Give it a value in that range.",
-                value.trim()
+                "set_value did not take: the value is outside the range of element \
+                 [{element_index}] ({min} to {max}), so nothing changed. Give it a value in \
+                 that range."
             ),
             "write_not_applied",
             "not_applied",
         ),
         Refusal::SteppedShort { now } => (
             format!(
-                "set_value did not reach {}: element [{element_index}] took no direct value \
-                 write, so it was stepped toward the value with its increment and decrement \
-                 actions, and it stopped short. It now reads {now}, not the value it had \
-                 before.",
-                value.trim()
+                "set_value did not reach the value: element [{element_index}] took no direct \
+                 value write, so it was stepped toward the value with its increment and \
+                 decrement actions, and it stopped short. It now reads {now}, not the value it \
+                 had before."
             ),
             "value_not_reached",
             "partial",
@@ -1588,7 +1588,7 @@ mod tests {
 
     #[test]
     fn a_refused_value_says_what_the_control_holds_now() {
-        let restored = refusal_result(9, "abc", Refusal::Rejected { restored: true });
+        let restored = refusal_result(9, Refusal::Rejected { restored: true });
         assert_eq!(restored.is_error, Some(true));
         let text = format!("{restored:?}");
         assert!(text.contains("previous value was put back"), "{text}");
@@ -1598,7 +1598,7 @@ mod tests {
         // with its own code.
         let cleared = format!(
             "{:?}",
-            refusal_result(9, "abc", Refusal::Rejected { restored: false })
+            refusal_result(9, Refusal::Rejected { restored: false })
         );
         assert!(cleared.contains("It is now empty"), "{cleared}");
         assert!(cleared.contains("\"write_cleared\""), "{cleared}");
@@ -1606,7 +1606,6 @@ mod tests {
             "{:?}",
             refusal_result(
                 4,
-                " 150 ",
                 Refusal::OutOfRange {
                     min: 0.0,
                     max: 100.0
@@ -1614,13 +1613,14 @@ mod tests {
             )
         );
         assert!(
-            range.contains("150 is outside the range of element [4] (0 to 100)"),
+            range.contains("the value is outside the range of element [4] (0 to 100)"),
             "{range}"
         );
+        assert!(!range.contains("150"), "{range}");
         assert!(range.contains("\"write_not_applied\""), "{range}");
         let short = format!(
             "{:?}",
-            refusal_result(4, "30", Refusal::SteppedShort { now: "17".into() })
+            refusal_result(4, Refusal::SteppedShort { now: "17".into() })
         );
         assert!(short.contains("It now reads 17"), "{short}");
         assert!(short.contains("\"value_not_reached\""), "{short}");
