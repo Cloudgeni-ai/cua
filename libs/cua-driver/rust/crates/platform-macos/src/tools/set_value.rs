@@ -22,7 +22,8 @@ use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_bool_attr, copy_children, copy_number_attr, copy_string_attr, copy_url_attr,
+    copy_bool_attr, copy_children, copy_number_attr, copy_string_attr, copy_stringish_attr,
+    copy_url_attr,
     kAXErrorSuccess, perform_action, set_number_attr, set_string_attr, AXUIElementRef,
 };
 use crate::focus_guard;
@@ -518,7 +519,7 @@ fn set_value_blocking(
         };
         // Read the value before writing so an unchanged field can be reported as
         // idempotent rather than silently indistinguishable from a fresh write.
-        let before = unsafe { copy_string_attr(element, "AXValue") };
+        let before = read_value(element);
         // Whether the value went in as a CFNumber, which some controls accept
         // with success and ignore (Chrome's web fields).
         let mut wrote_number = false;
@@ -540,7 +541,7 @@ fn set_value_blocking(
             // Some apps apply the write a moment later; give it a short
             // settle before calling it not applied.
             let read_back = || {
-                let mut after = unsafe { copy_string_attr(element, "AXValue") };
+                let mut after = read_value(element);
                 let mut outcome = classify_write(
                     before.as_deref(),
                     after.as_deref(),
@@ -552,7 +553,7 @@ fn set_value_blocking(
                         break;
                     }
                     crate::timing::sleep(std::time::Duration::from_millis(100));
-                    after = unsafe { copy_string_attr(element, "AXValue") };
+                    after = read_value(element);
                     outcome = classify_write(
                         before.as_deref(),
                         after.as_deref(),
@@ -601,7 +602,7 @@ fn set_value_blocking(
             // Both direct writes failed for a numeric target — fall back to
             // stepping the control via AXIncrement / AXDecrement actions.
             if step_to_value(element, target) {
-                let after = unsafe { copy_string_attr(element, "AXValue") };
+                let after = read_value(element);
                 let (verified, changed) =
                     classify_write(before.as_deref(), after.as_deref(), value, true);
                 Ok(SetValueOutcome {
@@ -620,6 +621,12 @@ fn set_value_blocking(
             anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
         }
     }
+}
+
+/// An element's AXValue as text: a CFString as-is, a CFNumber (a native
+/// slider's or stepper's value) as its number, so a numeric write reads back.
+fn read_value(element: AXUIElementRef) -> Option<String> {
+    unsafe { copy_stringish_attr(element, "AXValue") }.map(|value| value.state_value)
 }
 
 /// Roles whose AXValue is text, written as a CFString whatever it reads like.
