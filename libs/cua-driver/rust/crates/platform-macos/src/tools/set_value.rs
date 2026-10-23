@@ -519,10 +519,14 @@ fn set_value_blocking(
         // Read the value before writing so an unchanged field can be reported as
         // idempotent rather than silently indistinguishable from a fresh write.
         let before = unsafe { copy_string_attr(element, "AXValue") };
+        // Whether the value went in as a CFNumber, which some controls accept
+        // with success and ignore (Chrome's web fields).
+        let mut wrote_number = false;
         let err = match numeric_target {
             Some(n) => {
                 let e = unsafe { set_number_attr(element, "AXValue", n) };
                 if e == kAXErrorSuccess {
+                    wrote_number = true;
                     e
                 } else {
                     unsafe { set_string_attr(element, "AXValue", value) }
@@ -531,29 +535,42 @@ fn set_value_blocking(
             None => unsafe { set_string_attr(element, "AXValue", value) },
         };
         if err == kAXErrorSuccess {
-            let mut after = unsafe { copy_string_attr(element, "AXValue") };
-            let (mut verified, mut changed) = classify_write(
-                before.as_deref(),
-                after.as_deref(),
-                value,
-                numeric_target.is_some(),
-            );
-            // Some apps apply the write a moment later; give it a short
-            // settle before calling it not applied.
             let secure = unsafe { copy_string_attr(element, "AXSubrole") }.as_deref()
                 == Some("AXSecureTextField");
-            for _ in 0..NOT_APPLIED_REREADS {
-                if secure || !write_not_applied(verified, changed) {
-                    break;
-                }
-                crate::timing::sleep(std::time::Duration::from_millis(100));
-                after = unsafe { copy_string_attr(element, "AXValue") };
-                (verified, changed) = classify_write(
+            // Some apps apply the write a moment later; give it a short
+            // settle before calling it not applied.
+            let read_back = || {
+                let mut after = unsafe { copy_string_attr(element, "AXValue") };
+                let mut outcome = classify_write(
                     before.as_deref(),
                     after.as_deref(),
                     value,
                     numeric_target.is_some(),
                 );
+                for _ in 0..NOT_APPLIED_REREADS {
+                    if secure || !write_not_applied(outcome.0, outcome.1) {
+                        break;
+                    }
+                    crate::timing::sleep(std::time::Duration::from_millis(100));
+                    after = unsafe { copy_string_attr(element, "AXValue") };
+                    outcome = classify_write(
+                        before.as_deref(),
+                        after.as_deref(),
+                        value,
+                        numeric_target.is_some(),
+                    );
+                }
+                outcome
+            };
+            let (mut verified, mut changed) = read_back();
+            // A number the control took with success but did not show (a web
+            // number or range input in Chrome) is written again as text.
+            if wrote_number
+                && verified != Some(true)
+                && changed != Some(true)
+                && unsafe { set_string_attr(element, "AXValue", value) } == kAXErrorSuccess
+            {
+                (verified, changed) = read_back();
             }
             let suffix = match (verified, changed) {
                 (Some(true), Some(false)) => " Value already matched; write was idempotent.",
