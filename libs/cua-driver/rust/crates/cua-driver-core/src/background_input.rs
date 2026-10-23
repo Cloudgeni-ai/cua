@@ -40,10 +40,15 @@ pub enum ElementAncestry {
     /// The action does not address a retained element.
     NotAddressed,
     /// The live element ascends to an AX window whose CGWindowID is the
-    /// requested one.
+    /// requested one, or to a window the requested one adopts into its own
+    /// accessibility tree (an attached bubble or popover window).
     ProvenDescendant,
-    /// The live element ascends to a different window of the same process.
-    OutsideTargetWindow,
+    /// The live element ascends to a different window of the same process,
+    /// one the requested window does not adopt.
+    OutsideTargetWindow {
+        /// The CGWindowID the element does belong to.
+        owner_window_id: u32,
+    },
     /// Ancestry could not be resolved (dead element, SPI failure). An address
     /// the shell cannot re-prove is not an exact target.
     Unproven,
@@ -256,7 +261,19 @@ pub fn decide_background_input(
 
     match facts.element {
         ElementAncestry::NotAddressed | ElementAncestry::ProvenDescendant => {}
-        ElementAncestry::OutsideTargetWindow | ElementAncestry::Unproven => {
+        ElementAncestry::OutsideTargetWindow { owner_window_id } => {
+            return refuse(
+                refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
+                format!(
+                    "the addressed element belongs to window {owner_window_id}, a separate \
+                     window of this app, not to window {}; read window {owner_window_id} with \
+                     get_window_state and address the element there",
+                    target.window_id
+                ),
+                Some("get_window_state"),
+            );
+        }
+        ElementAncestry::Unproven => {
             return refuse(
                 refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
                 format!(
@@ -623,7 +640,9 @@ mod tests {
                 ..facts.clone()
             },
             BackgroundTargetFacts {
-                element: ElementAncestry::OutsideTargetWindow,
+                element: ElementAncestry::OutsideTargetWindow {
+                    owner_window_id: 91,
+                },
                 ..facts.clone()
             },
         ] {
@@ -655,7 +674,9 @@ mod tests {
     #[test]
     fn unproven_element_ancestry_refuses_all_routes() {
         for element in [
-            ElementAncestry::OutsideTargetWindow,
+            ElementAncestry::OutsideTargetWindow {
+                owner_window_id: 91,
+            },
             ElementAncestry::Unproven,
         ] {
             let facts = BackgroundTargetFacts {
@@ -682,6 +703,30 @@ mod tests {
         assert!(decide_background_input(TARGET, &facts, BackgroundAction::AxSemantic).is_execute());
     }
 
+    /// An element of another, unattached window is refused with that window
+    /// named, so the caller can address it there instead of re-reading the
+    /// same window and getting the same refusal.
+    #[test]
+    fn element_of_another_window_is_refused_naming_its_window() {
+        let facts = BackgroundTargetFacts {
+            element: ElementAncestry::OutsideTargetWindow {
+                owner_window_id: 91,
+            },
+            ..matched_facts()
+        };
+        match decide_background_input(TARGET, &facts, BackgroundAction::AxSemantic) {
+            BackgroundInputDecision::Refuse(refusal) => {
+                assert_eq!(refusal.code, refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW);
+                assert!(refusal.reason.contains("belongs to window 91"));
+                assert!(refusal
+                    .reason
+                    .contains("read window 91 with get_window_state"));
+                assert!(refusal.reason.contains("not to window 700"));
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     /// Refusal precedence: exactness failures are reported before state or
     /// cardinality failures so the caller fixes the most fundamental fact.
     #[test]
@@ -692,7 +737,9 @@ mod tests {
             target_minimized: Some(true),
             app_hidden: Some(true),
             competing_keyboard_destinations: 3,
-            element: ElementAncestry::OutsideTargetWindow,
+            element: ElementAncestry::OutsideTargetWindow {
+                owner_window_id: 91,
+            },
             screen_locked: false,
         };
         assert_eq!(

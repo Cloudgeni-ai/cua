@@ -13,7 +13,7 @@ use cua_driver_core::background_input::{
 };
 
 use super::bindings::{
-    ax_get_window_id, copy_ax_windows_including, copy_bool_attr, copy_element_attr,
+    ax_get_window_id, copy_ax_windows_including, copy_bool_attr, copy_children, copy_element_attr,
     copy_string_attr, focused_element_of_pid, AXUIElementCreateApplication, AXUIElementRef,
 };
 use super::snapshot::RetainedElement;
@@ -24,6 +24,13 @@ const MAX_ANCESTRY_DEPTH: usize = 40;
 
 /// Bounded sheet chain followed when mapping a sheet to its parent window.
 const MAX_SHEET_NESTING: usize = 8;
+
+/// Levels of the requested window's own tree searched for an adopted window.
+const MAX_ADOPTION_DEPTH: usize = 6;
+
+/// Elements of the requested window's own tree read while searching for an
+/// adopted window.
+const MAX_ADOPTION_NODES: usize = 400;
 
 /// Resolve the CGWindowID of the top-level AX window that owns `element`.
 ///
@@ -78,13 +85,167 @@ pub unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
 }
 
 /// Decide an addressed element's ancestry from what was read about it.
-fn element_ancestry(window: Option<u32>, in_app_menu_bar: bool, requested: u32) -> ElementAncestry {
+///
+/// `adopted` is whether the requested window adopts the element's own window
+/// into its tree (see [`element_in_window`]); it only matters when that
+/// window is another one.
+fn element_ancestry(
+    window: Option<u32>,
+    adopted: bool,
+    in_app_menu_bar: bool,
+    requested: u32,
+) -> ElementAncestry {
     match window {
         Some(id) if id == requested => ElementAncestry::ProvenDescendant,
-        Some(_) => ElementAncestry::OutsideTargetWindow,
+        Some(_) if adopted => ElementAncestry::ProvenDescendant,
+        Some(owner_window_id) => ElementAncestry::OutsideTargetWindow { owner_window_id },
         None if in_app_menu_bar => ElementAncestry::ProvenDescendant,
         None => ElementAncestry::Unproven,
     }
+}
+
+/// Whether `element` belongs to window `window_id` of `pid`: its own window
+/// is that window (see [`element_window_id`]), or its own window is one the
+/// requested window adopts into its accessibility tree.
+///
+/// Chrome draws a bubble (Save password?, translate, site permissions,
+/// downloads) as a separate window anchored to the browser window. It lists
+/// the bubble's content among the `AXChildren` of the browser window's own
+/// tree, while that content's `AXParent` and `AXWindow` name the bubble
+/// window. The adoption is why a snapshot of the browser window shows the
+/// bubble, and it is the proof used here: the element's window, or its
+/// content root, must be a child of an element in the requested window's own
+/// tree. An unrelated window of the same app is never adopted, so it stays
+/// outside.
+///
+/// # Safety
+///
+/// `element` must be a valid `AXUIElementRef` for the duration of the call.
+pub unsafe fn element_in_window(pid: i32, element: AXUIElementRef, window_id: u32) -> bool {
+    match element_window_id(element) {
+        Some(id) if id == window_id => true,
+        Some(_) => window_adopts_element(pid, element, window_id),
+        None => false,
+    }
+}
+
+/// Whether window `window_id` of `pid` adopts the window `element` lives in.
+/// See [`element_in_window`].
+///
+/// # Safety
+///
+/// `element` must be a valid `AXUIElementRef` for the duration of the call.
+unsafe fn window_adopts_element(pid: i32, element: AXUIElementRef, window_id: u32) -> bool {
+    let Some((content_root, own_window)) = content_root_and_window(element) else {
+        return false;
+    };
+    let app = AXUIElementCreateApplication(pid);
+    if app.is_null() {
+        return false;
+    }
+    let mut requested = None;
+    for window in copy_ax_windows_including(app, pid, window_id) {
+        if requested.is_none() && ax_get_window_id(window) == Some(window_id) {
+            requested = Some(adopt_retained(window));
+        } else {
+            CFRelease(window as CFTypeRef);
+        }
+    }
+    CFRelease(app as CFTypeRef);
+    let Some(requested) = requested else {
+        return false;
+    };
+    let same = |a: &RetainedElement, b: &RetainedElement| {
+        core_foundation::base::CFEqual(a.as_ptr() as CFTypeRef, b.as_ptr() as CFTypeRef) != 0
+    };
+    adopted_within(
+        requested,
+        MAX_ADOPTION_DEPTH,
+        MAX_ADOPTION_NODES,
+        |child| same(child, &content_root) || same(child, &own_window),
+        |node| {
+            let node = node.as_ptr() as AXUIElementRef;
+            // Web content never lists another window's root.
+            if copy_string_attr(node, "AXRole").as_deref() == Some("AXWebArea") {
+                return Vec::new();
+            }
+            copy_children(node)
+                .into_iter()
+                .map(|child| adopt_retained(child))
+                .collect()
+        },
+    )
+}
+
+/// Take over a +1 reference returned by a `copy_*` binding.
+///
+/// # Safety
+///
+/// `element` must be a live `AXUIElementRef` the caller owns one reference to.
+unsafe fn adopt_retained(element: AXUIElementRef) -> RetainedElement {
+    let retained = RetainedElement::retain(element as usize);
+    CFRelease(element as CFTypeRef);
+    retained
+}
+
+/// The top-level window `element` lives in (`AXWindow` or `AXSheet`) and the
+/// element directly under it on the element's `AXParent` chain: its content
+/// root. A window element is its own content root.
+///
+/// # Safety
+///
+/// `element` must be a valid `AXUIElementRef` for the duration of the call.
+unsafe fn content_root_and_window(
+    element: AXUIElementRef,
+) -> Option<(RetainedElement, RetainedElement)> {
+    let mut below = RetainedElement::retain(element as usize);
+    let mut current = RetainedElement::retain(element as usize);
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        match copy_string_attr(current.as_ptr() as AXUIElementRef, "AXRole").as_deref() {
+            Some("AXWindow") | Some("AXSheet") => return Some((below, current)),
+            Some("AXApplication") | None => return None,
+            _ => {}
+        }
+        let parent = copy_element_attr(current.as_ptr() as AXUIElementRef, "AXParent")?;
+        below = current;
+        current = adopt_retained(parent);
+    }
+    None
+}
+
+/// Pure breadth-first search behind [`window_adopts_element`]: whether a
+/// child within `max_depth` levels of `window` is `adopted`, reading at most
+/// `max_nodes` children. Running out of either bound means "not adopted",
+/// which keeps the element refused.
+fn adopted_within<E>(
+    window: E,
+    max_depth: usize,
+    max_nodes: usize,
+    adopted: impl Fn(&E) -> bool,
+    children: impl Fn(&E) -> Vec<E>,
+) -> bool {
+    let mut level = vec![window];
+    let mut read = 0;
+    for _ in 0..max_depth {
+        let mut next = Vec::new();
+        for node in &level {
+            for child in children(node) {
+                if adopted(&child) {
+                    return true;
+                }
+                read += 1;
+                if read >= max_nodes {
+                    return false;
+                }
+                next.push(child);
+            }
+        }
+        if next.is_empty() {
+            return false;
+        }
+        level = next;
+    }
+    false
 }
 
 /// Whether `element` sits under the application's own `AXMenuBar`: a bounded
@@ -199,7 +360,7 @@ fn resolve_owning_window<E>(
 /// Caller must `CFRelease` the returned element.
 pub unsafe fn focused_element_in_window(pid: i32, window_id: u32) -> Option<AXUIElementRef> {
     let element = focused_element_of_pid(pid)?;
-    if element_window_id(element) == Some(window_id) {
+    if element_in_window(pid, element, window_id) {
         Some(element)
     } else {
         CFRelease(element as CFTypeRef);
@@ -318,10 +479,12 @@ pub fn gather_background_facts(
             let element = element_ptr.map(|ptr| {
                 let element = ptr as AXUIElementRef;
                 let window = element_window_id(element);
+                let adopted = matches!(window, Some(id) if id != window_id)
+                    && window_adopts_element(pid, element, window_id);
                 // A menu-bar item has no window ancestor: the menu bar hangs
                 // off the application. It still belongs to this app.
                 let in_menu_bar = window.is_none() && element_in_app_menu_bar(app, element);
-                element_ancestry(window, in_menu_bar, window_id)
+                element_ancestry(window, adopted, in_menu_bar, window_id)
             });
             let focused_window_id = copy_element_attr(app, "AXFocusedWindow").and_then(|window| {
                 let window_id = ax_get_window_id(window);
@@ -383,10 +546,74 @@ mod tests {
     fn menu_bar_item_is_proven_only_through_the_app_menu_bar() {
         use super::element_ancestry;
         use cua_driver_core::background_input::ElementAncestry::*;
-        assert_eq!(element_ancestry(None, true, 7), ProvenDescendant);
-        assert_eq!(element_ancestry(None, false, 7), Unproven);
-        assert_eq!(element_ancestry(Some(7), false, 7), ProvenDescendant);
-        assert_eq!(element_ancestry(Some(8), true, 7), OutsideTargetWindow);
+        assert_eq!(element_ancestry(None, false, true, 7), ProvenDescendant);
+        assert_eq!(element_ancestry(None, false, false, 7), Unproven);
+        assert_eq!(element_ancestry(Some(7), false, false, 7), ProvenDescendant);
+        assert_eq!(
+            element_ancestry(Some(8), false, true, 7),
+            OutsideTargetWindow { owner_window_id: 8 }
+        );
+    }
+
+    #[test]
+    fn element_of_an_adopted_window_belongs_to_the_adopting_window() {
+        use super::element_ancestry;
+        use cua_driver_core::background_input::ElementAncestry::*;
+        // Chrome's Save password? bubble (window 2142) adopted by the
+        // browser window (2112) it is anchored to.
+        assert_eq!(
+            element_ancestry(Some(2142), true, false, 2112),
+            ProvenDescendant
+        );
+        assert_eq!(
+            element_ancestry(Some(2142), false, false, 2112),
+            OutsideTargetWindow {
+                owner_window_id: 2142
+            }
+        );
+        // Adoption never stands in for an unreadable window.
+        assert_eq!(element_ancestry(None, true, false, 2112), Unproven);
+    }
+
+    /// A fake tree for the adoption search: children by index.
+    fn adopted(tree: &[&[usize]], target: usize, max_depth: usize, max_nodes: usize) -> bool {
+        super::adopted_within(
+            0usize,
+            max_depth,
+            max_nodes,
+            |&node| node == target,
+            |&node| tree.get(node).map(|kids| kids.to_vec()).unwrap_or_default(),
+        )
+    }
+
+    #[test]
+    fn adoption_is_found_where_chrome_lists_a_bubble() {
+        // 0 browser window -> 1 root view -> {2 browser content, 3 bubble
+        // root}; 4..6 sit under the browser content.
+        let tree: &[&[usize]] = &[&[1], &[2, 3], &[4, 5], &[], &[6], &[], &[]];
+        assert!(adopted(tree, 3, 6, 400));
+    }
+
+    #[test]
+    fn a_window_that_is_not_listed_is_not_adopted() {
+        let tree: &[&[usize]] = &[&[1], &[2, 3], &[4, 5], &[], &[6], &[], &[]];
+        assert!(!adopted(tree, 9, 6, 400));
+    }
+
+    #[test]
+    fn adoption_search_is_bounded() {
+        // The adopted root sits four levels down: found with depth 4, not 3,
+        // and not when the node budget runs out first.
+        let tree: &[&[usize]] = &[&[1], &[2], &[3], &[4, 5], &[], &[]];
+        assert!(adopted(tree, 5, 4, 400));
+        assert!(!adopted(tree, 5, 3, 400));
+        assert!(!adopted(tree, 5, 4, 3));
+    }
+
+    #[test]
+    fn adoption_search_terminates_on_a_cycle() {
+        let tree: &[&[usize]] = &[&[1], &[0]];
+        assert!(!adopted(tree, 7, 6, 400));
     }
 
     #[test]

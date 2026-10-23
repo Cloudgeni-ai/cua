@@ -674,16 +674,13 @@ async fn focused_element_holds_point(
                 return false;
             };
             let rect = crate::ax::bindings::element_screen_rect(focused);
-            let focused_window = if require_window {
-                crate::ax::exact_target::element_window_id(focused)
-            } else {
-                Some(wid)
-            };
+            let in_window =
+                !require_window || crate::ax::exact_target::element_in_window(pid, focused, wid);
             core_foundation::base::CFRelease(focused as core_foundation::base::CFTypeRef);
             let Some(rect) = rect else {
                 return false;
             };
-            focused_window == Some(wid) && point_within_rect(rect, screen_x, screen_y)
+            in_window && point_within_rect(rect, screen_x, screen_y)
         }
     })
     .await
