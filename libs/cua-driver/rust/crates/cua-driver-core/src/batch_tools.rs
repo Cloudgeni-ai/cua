@@ -1015,8 +1015,20 @@ async fn run_step(
                                     report,
                                 );
                             }
-                            Some(state) if state == wanted => already_toggled = true,
-                            Some(_) => {
+                            Some(state)
+                                if state
+                                    == if wanted {
+                                        locate::Toggle::Checked
+                                    } else {
+                                        locate::Toggle::NotChecked
+                                    } =>
+                            {
+                                already_toggled = true
+                            }
+                            Some(state) => {
+                                if state == locate::Toggle::Mixed {
+                                    notes.push("it read mixed, so it was pressed".to_owned());
+                                }
                                 toggle_check = Some(Check {
                                     window: WindowSpec {
                                         pid: Some(found.window.pid),

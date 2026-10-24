@@ -1574,19 +1574,48 @@ fn fields_hold(check: &Check, element: &Value) -> bool {
         }
     }
     if let Some(expected) = check.selected {
-        if selected_state(element).unwrap_or(false) != expected {
+        // A mixed checkbox reads neither checked nor not checked.
+        if mixed_toggle(element) || selected_state(element).unwrap_or(false) != expected {
             return false;
         }
     }
     true
 }
 
+/// A toggle control's value that says it is mixed (indeterminate): "2" on
+/// macOS, "mixed" elsewhere.
+fn mixed_value(element: &Value) -> bool {
+    element
+        .get("value")
+        .and_then(Value::as_str)
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "2" | "mixed"))
+}
+
+fn toggle_role(element: &Value) -> bool {
+    element
+        .get("role")
+        .and_then(Value::as_str)
+        .is_some_and(|role| {
+            matches!(
+                role_family(role).as_str(),
+                "checkbox" | "radiobutton" | "switch"
+            ) || matches!(bare_role(role).as_str(), "togglebutton" | "checkmenuitem")
+        })
+}
+
+fn mixed_toggle(element: &Value) -> bool {
+    toggle_role(element) && mixed_value(element)
+}
+
 /// An element's on/off state. For a toggle control (checkbox, radio,
 /// switch) its checked value ("1"/"0", "true"/"false", "on"/"off") wins:
 /// Chromium reports web checkboxes as value "1" with AXSelected false,
-/// because AXSelected means list selection, not checked. Otherwise the
-/// platform's `selected` flag, else that value.
+/// because AXSelected means list selection, not checked. A mixed toggle
+/// has none. Otherwise the platform's `selected` flag, else that value.
 fn selected_state(element: &Value) -> Option<bool> {
+    if mixed_toggle(element) {
+        return None;
+    }
     let checked = element
         .get("value")
         .and_then(Value::as_str)
@@ -1606,14 +1635,35 @@ fn selected_state(element: &Value) -> Option<bool> {
     element.get("selected").and_then(Value::as_bool).or(checked)
 }
 
+/// A checkbox's or switch's state, as `toggle_state` reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Toggle {
+    Checked,
+    NotChecked,
+    /// Indeterminate: neither, so it is never "already" in a wanted state.
+    Mixed,
+}
+
 /// A checkbox's or switch's checked state, or None when the element is no
 /// such control or its state cannot be read.
-pub(crate) fn toggle_state(element: &Value) -> Option<bool> {
+pub(crate) fn toggle_state(element: &Value) -> Option<Toggle> {
     let role = element.get("role").and_then(Value::as_str)?;
     let bare = bare_role(role);
     let toggle = role_family(role) == "checkbox"
         || matches!(bare.as_str(), "switch" | "togglebutton" | "checkmenuitem");
-    toggle.then(|| selected_state(element)).flatten()
+    if !toggle {
+        return None;
+    }
+    if mixed_value(element) {
+        return Some(Toggle::Mixed);
+    }
+    selected_state(element).map(|on| {
+        if on {
+            Toggle::Checked
+        } else {
+            Toggle::NotChecked
+        }
+    })
 }
 
 /// Display-only rows (static text and other rows without an element index)

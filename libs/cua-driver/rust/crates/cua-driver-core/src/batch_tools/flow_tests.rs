@@ -20,6 +20,8 @@ struct Ui {
     dialog_open: bool,
     /// The "Reminders" checkbox; "Stuck" never changes when pressed.
     reminders: bool,
+    /// "Select all" reads mixed until pressed, then checked.
+    select_all_pressed: bool,
     /// A transient popup (no useful controls) stacked on top.
     bubble_open: bool,
     /// Reads left before the "Finish" button appears on screen 2.
@@ -58,6 +60,11 @@ impl Ui {
                     Some(if self.reminders { "1" } else { "0" }.into()),
                 ),
                 ("AXCheckBox", "Stuck".into(), Some("0".into())),
+                (
+                    "AXCheckBox",
+                    "Select all".into(),
+                    Some(if self.select_all_pressed { "1" } else { "2" }.into()),
+                ),
             ],
             // A web page: "Edit billing" is a link, "Plan" only text.
             2 => vec![
@@ -194,6 +201,7 @@ impl Tool for Fake {
                     }
                     ("click", "Next") => ui.screen = 1,
                     ("click", "Reminders") => ui.reminders = !ui.reminders,
+                    ("click", "Select all") => ui.select_all_pressed = true,
                     ("click", "Back") => ui.dialog_open = true,
                     ("click", "Keep") | ("click", "Discard") => ui.dialog_open = false,
                     _ => {}
@@ -809,6 +817,36 @@ async fn toggle_to_presses_a_checkbox_only_when_it_is_not_in_that_state() {
     assert_ne!(result.is_error, Some(true), "{}", text(&result));
     assert!(!harness.ui.lock().unwrap().reminders);
     assert_eq!(harness.calls("click").len(), 2);
+}
+
+#[tokio::test]
+async fn toggle_to_presses_a_mixed_checkbox_either_way_and_checks_where_it_lands() {
+    let select_all = json!({"app": "Demo", "role": "checkbox", "name": "Select all"});
+    // Mixed is neither state: asked off, it is pressed, lands checked, and
+    // the step says so instead of calling it "already not checked".
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [{"click": select_all.clone(), "toggle_to": false}]}))
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(harness.calls("click").len(), 1, "pressed");
+    assert!(
+        text(&result).contains("pressed but does not read not checked"),
+        "{}",
+        text(&result)
+    );
+    assert!(!text(&result).contains("already"), "{}", text(&result));
+
+    // Asked on: pressed, and it reads checked.
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [{"click": select_all, "toggle_to": true}]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(harness.calls("click").len(), 1);
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["steps"][0]["toggle"], "pressed");
+    assert!(text(&result).contains("it read mixed"), "{}", text(&result));
 }
 
 #[tokio::test]
