@@ -1023,7 +1023,8 @@ fn step_to_value(element: AXUIElementRef, target: f64) -> bool {
 const POPUP_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
 /// Consecutive unchanged polls that mean the menu has finished filling in.
 const POPUP_STABLE_POLLS: u32 = 3;
-/// How long a dismissed menu may take to close before Escape is sent.
+/// How long a dismissed menu may take to close, after `AXCancel` and again
+/// after Escape.
 const POPUP_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
 const POPUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 /// AX messaging timeout while opening the menu. The target app enters its
@@ -1151,16 +1152,37 @@ fn cancel_popup_menu(popup: AXUIElementRef) {
 }
 
 /// Close a menu this call opened, without choosing anything. `AXCancel` is
-/// enough for AppKit; Chromium's menu ignores it, so fall back to Escape sent
-/// to the app (the open menu is what receives it).
+/// enough for AppKit; Chromium's menu ignores it, so it gets Escape sent to
+/// the app (the open menu is what receives it). A popup that reports
+/// `AXExpanded` is a Chromium `<select>`: it gets Escape at once when it
+/// reads expanded, instead of after waiting out `AXCancel`, and nothing when
+/// it reads closed. Any other popup gets `AXCancel` (harmless when closed)
+/// and falls back to Escape when its menu is still open after that.
 fn dismiss_popup_menu(popup: AXUIElementRef, pid: i32) {
-    cancel_popup_menu(popup);
+    match unsafe { copy_bool_attr(popup, "AXExpanded") } {
+        Some(false) => return,
+        Some(true) => {}
+        None => {
+            cancel_popup_menu(popup);
+            if popup_menu_closes(popup) {
+                return;
+            }
+        }
+    }
+    let _ = crate::input::keyboard::press_key_no_auth(pid, "escape", &[]);
+    popup_menu_closes(popup);
+}
+
+/// Poll until the popup's menu reads closed, for at most
+/// `POPUP_CLOSE_TIMEOUT`. Returns whether it closed.
+fn popup_menu_closes(popup: AXUIElementRef) -> bool {
     let deadline = std::time::Instant::now() + POPUP_CLOSE_TIMEOUT;
-    while popup_menu_is_open(popup) {
+    loop {
+        if !popup_menu_is_open(popup) {
+            return true;
+        }
         if std::time::Instant::now() >= deadline {
-            let _ = crate::input::keyboard::press_key_no_auth(pid, "escape", &[]);
-            crate::timing::sleep(POPUP_CLOSE_TIMEOUT);
-            return;
+            return false;
         }
         crate::timing::sleep(POPUP_POLL_INTERVAL);
     }
