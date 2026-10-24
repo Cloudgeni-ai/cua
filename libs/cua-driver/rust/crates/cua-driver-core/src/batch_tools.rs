@@ -1029,13 +1029,30 @@ async fn run_step(
                                 if state == locate::Toggle::Mixed {
                                     notes.push("it read mixed, so it was pressed".to_owned());
                                 }
+                                // The check after the press reads the element
+                                // found, not another one the name also fits
+                                // ("Email reminders" for "Reminders").
+                                let label = found
+                                    .element
+                                    .get("label")
+                                    .and_then(Value::as_str)
+                                    .filter(|label| !label.trim().is_empty());
+                                let pinned = match label {
+                                    Some(label) => ElementSpec {
+                                        name: Some(label.to_owned()),
+                                        exact: true,
+                                        text: None,
+                                        ..element.clone()
+                                    },
+                                    None => element.clone(),
+                                };
                                 toggle_check = Some(Check {
                                     window: WindowSpec {
                                         pid: Some(found.window.pid),
                                         window_id: Some(found.window.window_id),
                                         ..Default::default()
                                     },
-                                    element: element.clone(),
+                                    element: pinned,
                                     gone: false,
                                     value: None,
                                     value_contains: None,

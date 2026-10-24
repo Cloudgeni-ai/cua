@@ -844,7 +844,7 @@ async fn toggle_to_presses_a_mixed_checkbox_either_way_and_checks_where_it_lands
         .await;
     assert_ne!(result.is_error, Some(true), "{}", text(&result));
     assert_eq!(harness.calls("click").len(), 1);
-    let structured = result.structured_content.unwrap();
+    let structured = result.structured_content.clone().unwrap();
     assert_eq!(structured["steps"][0]["toggle"], "pressed");
     assert!(text(&result).contains("it read mixed"), "{}", text(&result));
 }
