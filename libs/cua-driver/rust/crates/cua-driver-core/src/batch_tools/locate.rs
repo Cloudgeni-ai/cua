@@ -1108,11 +1108,9 @@ pub(crate) fn matches<'r>(read: &'r Read, spec: &ElementSpec) -> Vec<&'r Value> 
         .copied()
         .filter(|element| has_area(element))
         .collect();
-    if visible.is_empty() {
-        named
-    } else {
-        visible
-    }
+    // Copies are left out here, so `nth` and every candidate list count the
+    // same elements.
+    distinct(if visible.is_empty() { named } else { visible })
 }
 
 /// Lowercase role without the platform prefix: "AXTextField" -> "textfield".
@@ -1135,10 +1133,6 @@ fn bare_role(role: &str) -> String {
 /// than static text). Returns the input unchanged when no rule narrows it.
 fn narrow<'r>(found: Vec<&'r Value>, spec: &ElementSpec) -> Vec<&'r Value> {
     if found.len() < 2 || spec.nth.is_some() {
-        return found;
-    }
-    let found = distinct(found);
-    if found.len() < 2 {
         return found;
     }
     let role_of = |element: &Value| {
@@ -1398,7 +1392,11 @@ fn distinct(found: Vec<&Value>) -> Vec<&Value> {
     found
         .into_iter()
         .filter(|element| {
-            let Some(frame) = element.get("frame").filter(|frame| frame.is_object()) else {
+            // A zero-size frame says nothing about where an element is.
+            let Some(frame) = element
+                .get("frame")
+                .filter(|frame| frame.is_object() && has_area(element))
+            else {
                 return true;
             };
             let place = (
@@ -2350,6 +2348,23 @@ mod tests {
             "{}",
             miss.message
         );
+        // `nth` counts the elements as the message lists them.
+        assert!(miss.message.contains("nth 1: [6]"), "{}", miss.message);
+        let mut elsewhere = table.elements.clone();
+        elsewhere.push(element(6, "AXLink", "Juniper Dental"));
+        let second = ElementSpec {
+            nth: Some(1),
+            ..spec.clone()
+        };
+        let found = pick(&read_with(elsewhere), &second).unwrap();
+        assert_eq!(found.element["element_index"], 6);
+        // Zero-size elements are never taken for one another.
+        let mut hidden = element(7, "AXButton", "Remove");
+        hidden["frame"] = json!({"x": 0, "y": 0, "w": 0, "h": 0});
+        let mut other = element(8, "AXButton", "Remove");
+        other["frame"] = hidden["frame"].clone();
+        let miss = pick(&read_with(vec![hidden, other]), &button("Remove")).unwrap_err();
+        assert_eq!(miss.code, "ambiguous");
     }
 
     #[test]
