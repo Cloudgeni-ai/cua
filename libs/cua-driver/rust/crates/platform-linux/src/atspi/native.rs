@@ -1623,7 +1623,7 @@ async fn collect_visited_bounded_opts<'a>(
             .and_then(|state| state.as_ref().ok())
             .is_some_and(|state| state.contains(State::Expanded));
         let under_menubar = menubar_children.remove(&(oref.name.clone(), oref.path.clone()));
-        let selected = if checked.is_some() {
+        let selected = if is_toggle_role(&role_lower) {
             checked
         } else if role_lower.contains("radio")
             || role_lower.contains("list item")
@@ -2267,14 +2267,21 @@ fn listing_state(role_lower: &str, state: &StateSet) -> (bool, bool) {
 const OFFSCREEN_NOTE: &str =
     "off-screen: scroll it into view before a pixel action; element actions still reach it";
 
+/// Check boxes, check menu items, switches and toggle buttons.
+fn is_toggle_role(role_lower: &str) -> bool {
+    role_lower.contains("check") || role_lower == "switch" || role_lower == "toggle button"
+}
+
 /// Whether a checkbox, switch or toggle button is on, or `None` for any other
-/// role. A check box or check menu item reports `Checked`; a GTK4 switch
-/// reports `Checked` and a toggle button (GTK4, or a web `aria-pressed`
-/// button) reports `Pressed`, so all three read either.
+/// role and for one that is half on (`Indeterminate`: a "select all" box with
+/// some rows selected), which is neither. A check box or check menu item
+/// reports `Checked`; a GTK4 switch reports `Checked` and a toggle button
+/// (GTK4, or a web `aria-pressed` button) reports `Pressed`, so all read either.
 fn toggle_checked(role_lower: &str, state: &StateSet) -> Option<bool> {
-    let toggle =
-        role_lower.contains("check") || role_lower == "switch" || role_lower == "toggle button";
-    toggle.then(|| state.contains(State::Checked) || state.contains(State::Pressed))
+    if !is_toggle_role(role_lower) || state.contains(State::Indeterminate) {
+        return None;
+    }
+    Some(state.contains(State::Checked) || state.contains(State::Pressed))
 }
 
 /// How many leading children of a menubar menu the closed-menu peek reads
@@ -7145,6 +7152,13 @@ mod coord_tests {
                 toggle_checked(role, &StateSet::new(State::Enabled | State::Checked)),
                 None,
                 "{role} is no checkbox or switch"
+            );
+        }
+        for role in ["check box", "check menu item"] {
+            assert_eq!(
+                toggle_checked(role, &StateSet::new(State::Enabled | State::Indeterminate)),
+                None,
+                "a half-checked {role} is neither on nor off"
             );
         }
     }
