@@ -72,10 +72,14 @@ struct CfRange {
     length: isize,
 }
 
-/// Whether `element` sits in a document window: its window's `AXDocument`
-/// is a file. A browser window names its page's web address there; a web
-/// field takes an accessibility write through the page's own input events
-/// and has no document to save, so it gets no key edit.
+/// Whether `element` needs the net-zero key edit after an AX write: it sits
+/// in a document window (its window has an `AXDocument`), and either that
+/// document is a file or the element is a multi-line text area.
+///
+/// A browser window names its page's web address there. Chrome fires
+/// `input` and `change` itself when an AX write sets a single-line field,
+/// so those get no keys. A text area may be a contenteditable editor that
+/// only takes the write through key events, so it keeps the edit.
 ///
 /// # Safety
 /// `element` must be a live `AXUIElementRef`.
@@ -85,7 +89,14 @@ unsafe fn in_document_window(element: AXUIElementRef) -> bool {
     };
     let document = copy_string_attr(window, "AXDocument");
     core_foundation::base::CFRelease(window as _);
-    document.is_some_and(|url| names_a_file(&url))
+    let role = copy_string_attr(element, "AXRole");
+    document.is_some_and(|url| needs_key_edit(&url, role.as_deref()))
+}
+
+/// [`in_document_window`]'s rule for a window document `url` and element
+/// `role`.
+fn needs_key_edit(url: &str, role: Option<&str>) -> bool {
+    !url.trim().is_empty() && (names_a_file(url) || role == Some("AXTextArea"))
 }
 
 /// Whether an `AXDocument` value is a file URL.
@@ -241,7 +252,7 @@ unsafe fn caret_to_end_of(element: AXUIElementRef) {
 
 #[cfg(test)]
 mod tests {
-    use super::{names_a_file, DocumentEdited};
+    use super::{names_a_file, needs_key_edit, DocumentEdited};
 
     #[test]
     fn only_a_file_is_a_document_to_mark_edited() {
@@ -251,6 +262,17 @@ mod tests {
         assert!(!names_a_file("http://localhost:8080/"));
         assert!(!names_a_file(""));
         assert!(!names_a_file("fil"));
+    }
+
+    #[test]
+    fn a_web_page_keeps_the_key_edit_only_for_text_areas() {
+        let page = "https://mail.example.com/compose";
+        assert!(!needs_key_edit(page, Some("AXTextField")));
+        assert!(!needs_key_edit(page, Some("AXComboBox")));
+        assert!(needs_key_edit(page, Some("AXTextArea")));
+        assert!(needs_key_edit("file:///tmp/Notes.rtf", Some("AXTextArea")));
+        assert!(needs_key_edit("file:///tmp/Notes.rtf", Some("AXTextField")));
+        assert!(!needs_key_edit("", Some("AXTextArea")));
     }
 
     #[test]
