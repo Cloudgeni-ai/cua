@@ -435,11 +435,14 @@ pub(crate) struct Miss {
     pub code: &'static str,
     pub message: String,
     pub window: Option<Window>,
-    /// For an `ambiguous` whose name is on several elements of a role pressed
-    /// alike and on none of the role named: a digest of the read, so a poll
-    /// fails it only once the window has stopped changing, as the role named
-    /// may yet appear.
+    /// For an `ambiguous`: a digest of the read, so a poll fails it only once
+    /// the window has stopped changing. A list still filtering may narrow to
+    /// one, and the role named may yet appear.
     pub settle_digest: Option<u64>,
+    /// The name is on several elements of a role pressed alike and on none
+    /// of the role named, so the role named may be in another window. A tie
+    /// of the role named is that window's answer.
+    pub other_roles: bool,
 }
 
 impl Miss {
@@ -449,6 +452,7 @@ impl Miss {
             message: message.into(),
             window: None,
             settle_digest: None,
+            other_roles: false,
         }
     }
 
@@ -895,7 +899,7 @@ impl<'a> Locator<'a> {
                 Err(miss) if miss.code == "ambiguous" || miss.code == "not_addressable" => {
                     // Several of a role pressed alike: the role named may be
                     // in another window.
-                    if miss.settle_digest.is_some() {
+                    if miss.other_roles {
                         let size = read.elements.len();
                         if best_miss.as_ref().is_none_or(|(best, _)| size > *best) {
                             best_miss = Some((size, miss.in_window(window)));
@@ -1416,6 +1420,7 @@ fn several_alike(read: &Read, spec: &ElementSpec, alike: &[&Value]) -> Miss {
         ),
     );
     miss.settle_digest = Some(digest(read));
+    miss.other_roles = true;
     miss
 }
 

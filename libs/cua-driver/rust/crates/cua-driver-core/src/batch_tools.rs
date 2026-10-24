@@ -1143,6 +1143,25 @@ async fn run_step(
                             found.describe()
                         );
                         report["refound"] = json!(note);
+                        // The step reports, and checks after the press, the
+                        // element found again.
+                        report["target"] = json!({
+                            "window": found.window.to_json(),
+                            "element": found.describe(),
+                        });
+                        if let Some(role_note) = &found.role_note {
+                            report["target"]["role_note"] = json!(role_note);
+                        }
+                        if let Some(stand_in) = found.stand_in() {
+                            report["target"]["stand_in"] = stand_in;
+                        }
+                        if let Some(check) = toggle_check.as_mut() {
+                            check.window = WindowSpec {
+                                pid: Some(found.window.pid),
+                                window_id: Some(found.window.window_id),
+                                ..Default::default()
+                            };
+                        }
                         let already = step.toggle_to.is_some_and(|wanted| {
                             locate::toggle_state(&found.element)
                                 == Some(if wanted {

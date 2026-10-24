@@ -31,6 +31,9 @@ struct Ui {
     save_delay_reads: u32,
     /// Reads say they stopped at their node budget.
     truncated: bool,
+    /// The "Unsaved changes" window, searched first, shows two buttons "OK",
+    /// and the main window one.
+    dialog_ok: bool,
     snapshot: u32,
     /// Element labels of the latest read, by element index.
     last_labels: Vec<(String, String)>,
@@ -43,10 +46,19 @@ impl Ui {
             return vec![("AXButton", "Done".into(), None)];
         }
         if window_id == 8 {
+            if self.dialog_ok {
+                return vec![
+                    ("AXButton", "OK".into(), None),
+                    ("AXButton", "OK".into(), None),
+                ];
+            }
             return vec![
                 ("AXButton", "Discard".into(), None),
                 ("AXButton", "Keep".into(), None),
             ];
+        }
+        if self.dialog_ok {
+            return vec![("AXButton", "OK".into(), None)];
         }
         match self.screen {
             0 => vec![
@@ -358,6 +370,29 @@ async fn several_matches_fail_with_the_candidates_and_nth_picks_one() {
     assert!(message.contains("2 elements match"), "{message}");
     assert!(message.contains("nth 1: [4] AXButton \"OK\""), "{message}");
     assert!(harness.calls("click").is_empty(), "nothing clicked");
+
+    // Another window of the app with one "OK" is not the one meant: the tie
+    // in the window searched first is the answer.
+    {
+        let mut ui = harness.ui.lock().unwrap();
+        ui.dialog_open = true;
+        ui.dialog_ok = true;
+    }
+    let result = harness
+        .run(json!({"steps": [{"click": {"app": "Demo", "role": "button", "name": "OK"}}]}))
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert!(
+        text(&result).contains("2 elements match"),
+        "{}",
+        text(&result)
+    );
+    assert!(harness.calls("click").is_empty(), "nothing clicked");
+    {
+        let mut ui = harness.ui.lock().unwrap();
+        ui.dialog_open = false;
+        ui.dialog_ok = false;
+    }
 
     let result = harness
         .run(json!({"steps": [{"click": {"app": "Demo", "role": "button", "name": "OK", "nth": 1}}]}))
