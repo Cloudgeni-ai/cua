@@ -437,6 +437,12 @@ struct RerenderState {
     /// Labels of the current snapshot, by row.
     rows: Vec<(&'static str, &'static str)>,
     clicked: Vec<String>,
+    /// Clicks that re-render the window just before they land, so the
+    /// token they carry is from the snapshot before.
+    rerender_on_click: u32,
+    /// From this snapshot on, these rows replace `rows` (a list that a
+    /// search filters a moment after it was typed).
+    later_rows: Option<(u32, Vec<(&'static str, &'static str)>)>,
 }
 
 #[async_trait]
@@ -450,6 +456,11 @@ impl Tool for Rerender {
         match self.def.name.as_str() {
             "get_window_state" => {
                 state.snapshot += 1;
+                if let Some((from, rows)) = state.later_rows.clone() {
+                    if state.snapshot >= from {
+                        state.rows = rows;
+                    }
+                }
                 let snapshot = format!("s{:08x}", state.snapshot);
                 let elements: Vec<Value> = state
                     .rows
@@ -471,6 +482,10 @@ impl Tool for Rerender {
                 }))
             }
             "click" => {
+                if state.rerender_on_click > 0 {
+                    state.rerender_on_click -= 1;
+                    state.snapshot += 1;
+                }
                 let token = args["element_token"]
                     .as_str()
                     .unwrap_or_default()
@@ -610,5 +625,90 @@ async fn a_stale_token_is_not_retried_when_its_label_is_ambiguous_or_unknown() {
             text(&result)
         );
     }
+    assert!(state.lock().unwrap().clicked.is_empty());
+}
+
+#[tokio::test]
+async fn a_named_step_whose_page_rerendered_before_the_press_finds_it_again() {
+    // A page that loaded under the step: its lookup read the element, then
+    // the page re-rendered before the press landed. Refinding tokens is off,
+    // as browserd runs batches, but the step named its element by role and
+    // name, so that description finds it again.
+    let (registry, state) = rerender_registry(vec![
+        ("AXLink", "Accounts"),
+        ("AXTextField", "Search accounts"),
+    ]);
+    state.lock().unwrap().rerender_on_click = 1;
+    let result = registry
+        .invoke(
+            super::super::RUN_STEPS_TOOL,
+            json!({
+                "refind_stale": false,
+                "steps": [{"click": {"pid": 42, "window_id": 7, "role": "textfield", "name": "Search accounts", "exact": true}}]
+            }),
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(state.lock().unwrap().clicked, vec!["Search accounts"]);
+    assert!(
+        text(&result).contains("the page changed before the press, so"),
+        "{}",
+        text(&result)
+    );
+
+    // It looks again once: a page that keeps re-rendering stops the batch.
+    state.lock().unwrap().rerender_on_click = 2;
+    let result = registry
+        .invoke(
+            super::super::RUN_STEPS_TOOL,
+            json!({
+                "refind_stale": false,
+                "steps": [{"click": {"pid": 42, "window_id": 7, "role": "link", "name": "Accounts", "exact": true}}]
+            }),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert!(
+        text(&result).contains("element_outside_target_window"),
+        "{}",
+        text(&result)
+    );
+    assert_eq!(state.lock().unwrap().clicked, vec!["Search accounts"]);
+}
+
+#[tokio::test]
+async fn a_named_step_waits_for_a_filtering_list_to_narrow_to_one() {
+    // A search typed a moment ago: the list still shows both accounts of
+    // that name, then filters to the one searched for.
+    let (registry, state) = rerender_registry(vec![
+        ("AXLink", "Juniper Printing"),
+        ("AXLink", "Juniper Printing"),
+    ]);
+    state.lock().unwrap().later_rows = Some((43, vec![("AXLink", "Juniper Printing")]));
+    let result = registry
+        .invoke(
+            super::super::RUN_STEPS_TOOL,
+            json!({"steps": [{"click": {"pid": 42, "window_id": 7, "role": "link", "name": "Juniper Printing", "exact": true}}]}),
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(state.lock().unwrap().clicked, vec!["Juniper Printing"]);
+
+    // Two that stay: once the window has settled, the step says which match.
+    let (registry, state) = rerender_registry(vec![("AXButton", "OK"), ("AXButton", "OK")]);
+    let started = std::time::Instant::now();
+    let result = registry
+        .invoke(
+            super::super::RUN_STEPS_TOOL,
+            json!({"steps": [{"click": {"pid": 42, "window_id": 7, "role": "button", "name": "OK", "exact": true}}]}),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true), "{}", text(&result));
+    assert!(
+        text(&result).contains("2 elements match"),
+        "{}",
+        text(&result)
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
     assert!(state.lock().unwrap().clicked.is_empty());
 }

@@ -937,6 +937,9 @@ async fn run_step(
     // A toggle already in the state asked for is left as it is.
     let mut already_toggled = false;
     let mut toggle_check: Option<Check> = None;
+    // The window and element a step named by role and name, so a press
+    // refused because the page re-rendered under it finds them again.
+    let mut named: Option<(WindowSpec, ElementSpec)> = None;
     if let Some(action) = step.action {
         let Action {
             tool,
@@ -958,6 +961,7 @@ async fn run_step(
                 action: Some(tool),
                 ..element
             };
+            named = Some((window_spec.clone(), element.clone()));
             let settled = settled_stand_in.as_ref().is_some_and(|held| {
                 ElementSpec {
                     action: None,
@@ -1124,9 +1128,58 @@ async fn run_step(
         } else {
             let mut result = registry.invoke(tool, args.clone()).await;
             let mut refound_note = None;
+            // A step that named its element by role and name looked it up just
+            // now; when the page re-rendered before the press landed, the same
+            // description finds the element meant, once. This holds whatever
+            // `refind_stale` says, which is about tokens from an older snapshot.
+            if result.is_error == Some(true) && stale_element(&result) {
+                if let Some((named_window, named_element)) = &named {
+                    if let Ok(found) = locator
+                        .find_settled(named_window, named_element, find_timeout, false)
+                        .await
+                    {
+                        let note = format!(
+                            "the page changed before the press, so {} was found again",
+                            found.describe()
+                        );
+                        report["refound"] = json!(note);
+                        let already = step.toggle_to.is_some_and(|wanted| {
+                            locate::toggle_state(&found.element)
+                                == Some(if wanted {
+                                    locate::Toggle::Checked
+                                } else {
+                                    locate::Toggle::NotChecked
+                                })
+                        });
+                        *last_window = Some(found.window.clone());
+                        if already {
+                            report["toggle"] = json!("already");
+                            toggle_check = None;
+                            result = ToolResult::text(
+                                "it already reads as asked, so it was not pressed",
+                            );
+                        } else {
+                            let mut retry = args.clone();
+                            let object = retry.as_object_mut().expect("object");
+                            object.insert("pid".into(), json!(found.window.pid));
+                            object.insert("window_id".into(), json!(found.window.window_id));
+                            object.insert(
+                                "element_token".into(),
+                                json!(found.token().unwrap_or_default()),
+                            );
+                            result = registry.invoke(tool, retry).await;
+                        }
+                        refound_note = Some(note);
+                    }
+                }
+            }
             // Both fallbacks act on what an older snapshot said the token was;
             // `refind_stale:false` keeps the step to the exact element it named.
-            if result.is_error == Some(true) && tool == "click" && refind_stale {
+            if result.is_error == Some(true)
+                && refound_note.is_none()
+                && tool == "click"
+                && refind_stale
+            {
                 if let Some((menu_args, note)) = menu_bar_route(&args, &result) {
                     report["refound"] = json!(note);
                     result = registry.invoke("invoke_menu", menu_args).await;

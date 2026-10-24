@@ -1241,7 +1241,9 @@ fn pick_with(read: &Read, spec: &ElementSpec, stand_in: bool) -> Result<Found, M
                 .enumerate()
                 .map(|(nth, element)| format!("nth {nth}: {}", describe_element(element)))
                 .collect();
-            return Err(Miss::new(
+            // A list still filling or filtering (a search typed a moment ago)
+            // may narrow to one: a poll waits for the window to settle first.
+            let mut miss = Miss::new(
                 "ambiguous",
                 format!(
                     "{count} elements match {} in {}; add `nth` or a more exact name: {}",
@@ -1249,7 +1251,9 @@ fn pick_with(read: &Read, spec: &ElementSpec, stand_in: bool) -> Result<Found, M
                     read.window.describe(),
                     listed.join("; ")
                 ),
-            ));
+            );
+            miss.settle_digest = Some(digest(read));
+            return Err(miss);
         }
     };
     if chosen
