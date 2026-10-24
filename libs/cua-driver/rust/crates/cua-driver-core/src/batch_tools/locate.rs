@@ -1137,6 +1137,10 @@ fn narrow<'r>(found: Vec<&'r Value>, spec: &ElementSpec) -> Vec<&'r Value> {
     if found.len() < 2 || spec.nth.is_some() {
         return found;
     }
+    let found = distinct(found);
+    if found.len() < 2 {
+        return found;
+    }
     let role_of = |element: &Value| {
         element
             .get("role")
@@ -1382,7 +1386,36 @@ fn other_roles<'r>(read: &'r Read, spec: &ElementSpec) -> Option<Vec<&'r Value>>
         .filter(|element| has_area(element))
         .collect();
     let alike = if visible.is_empty() { alike } else { visible };
+    let alike = distinct(alike);
     (!alike.is_empty()).then_some(alike)
+}
+
+/// The elements with each listed once. macOS lists a table's cells again
+/// under each AXColumn, as new elements with the same role, label and frame;
+/// the first of them stands for the element.
+fn distinct(found: Vec<&Value>) -> Vec<&Value> {
+    let mut places: Vec<(&str, Option<&str>, &Value)> = Vec::new();
+    found
+        .into_iter()
+        .filter(|element| {
+            let Some(frame) = element.get("frame").filter(|frame| frame.is_object()) else {
+                return true;
+            };
+            let place = (
+                element
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                label_of(element),
+                frame,
+            );
+            if places.contains(&place) {
+                return false;
+            }
+            places.push(place);
+            true
+        })
+        .collect()
 }
 
 /// What a lookup that used another role says, so the caller learns the role.
@@ -2012,7 +2045,7 @@ mod tests {
             "element_token": format!("s00000001:{index}"),
             "role": role,
             "label": label,
-            "frame": {"x": 0, "y": 0, "w": 10, "h": 10},
+            "frame": {"x": 0, "y": index * 20, "w": 10, "h": 10},
         })
     }
 
@@ -2282,6 +2315,41 @@ mod tests {
 
     fn read_with(elements: Vec<Value>) -> Read {
         read(elements, "")
+    }
+
+    #[test]
+    fn a_table_cell_repeated_under_its_column_is_one_element() {
+        // macOS lists each cell again under AXColumn: same role, label and
+        // frame, another index.
+        let mut copy = element(5, "AXLink", "Juniper Dental");
+        copy["frame"] = element(2, "AXLink", "Juniper Dental")["frame"].clone();
+        let table = read_with(vec![
+            element(1, "AXRow", ""),
+            element(2, "AXLink", "Juniper Dental"),
+            element(3, "AXLink", "Juniper Electric"),
+            element(4, "AXColumn", ""),
+            copy,
+        ]);
+        let spec = ElementSpec {
+            role: Some("link".into()),
+            name: Some("Juniper Dental".into()),
+            ..Default::default()
+        };
+        assert_eq!(pick(&table, &spec).unwrap().element["element_index"], 2);
+        // Named as a button, the link stands in once, not as two links.
+        let stand_in = pick(&table, &button("Juniper Dental")).unwrap();
+        assert_eq!(stand_in.element["element_index"], 2);
+        assert!(stand_in.role_note.is_some());
+        // A same-named link elsewhere is still a second element.
+        let mut elsewhere = table.elements.clone();
+        elsewhere.push(element(6, "AXLink", "Juniper Dental"));
+        let miss = pick(&read_with(elsewhere), &spec).unwrap_err();
+        assert_eq!(miss.code, "ambiguous");
+        assert!(
+            miss.message.contains("2 elements match"),
+            "{}",
+            miss.message
+        );
     }
 
     #[test]

@@ -176,7 +176,7 @@ impl Tool for Fake {
                         "role": role,
                         "depth": 1,
                         "label": label,
-                        "frame": {"x": 0, "y": 0, "w": 10, "h": 10},
+                        "frame": {"x": 0, "y": index * 20, "w": 10, "h": 10},
                     });
                     if let Some(value) = value.as_ref().filter(|value| !value.is_empty()) {
                         element["value"] = json!(value);
