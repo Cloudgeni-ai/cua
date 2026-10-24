@@ -1042,6 +1042,15 @@ async fn run_step(
                                         name: Some(label.to_owned()),
                                         exact: true,
                                         text: None,
+                                        // An nth counts among what the step named: kept only when that
+                                        // was this exact label already.
+                                        nth: if element.exact
+                                            && element.name.as_deref() == Some(label)
+                                        {
+                                            element.nth
+                                        } else {
+                                            None
+                                        },
                                         ..element.clone()
                                     },
                                     None => element.clone(),
