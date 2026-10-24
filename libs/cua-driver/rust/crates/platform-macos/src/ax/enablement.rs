@@ -247,7 +247,7 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
         Attempt::Skip => return,
         Attempt::Run { prior_timeouts } => prior_timeouts,
     };
-    let opt_in = enable_chromium_accessibility(app_element);
+    let opt_in = enable_chromium_accessibility(app_element, || chromium_app(pid));
     let outcome = wait_outcome(opt_in, prior_timeouts, attempted_at, || {
         await_web_content(
             || probe_web_content(app_element),
@@ -256,7 +256,7 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
                 // `AXEnhancedUserInterface` write, so writing it again
                 // while waiting would only push the tree back.
                 if opt_in == AccessibilityOptIn::ManualAccessibility {
-                    enable_chromium_accessibility(app_element);
+                    enable_chromium_accessibility(app_element, || false);
                 }
             },
             pump_for,
@@ -267,6 +267,13 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
             state.insert(pid, ProcessEnablement { stamp, wait });
         }
     }
+}
+
+/// Whether `pid` is a Chromium-family browser or an Electron app.
+fn chromium_app(pid: i32) -> bool {
+    crate::apps::bundle_id_for_pid(pid)
+        .is_some_and(|bundle_id| crate::tools::is_chromium_identity(&bundle_id))
+        || crate::browser::electron_js::ElectronJs::is_electron(pid)
 }
 
 #[cfg(test)]
