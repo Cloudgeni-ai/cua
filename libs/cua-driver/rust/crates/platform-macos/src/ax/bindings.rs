@@ -772,10 +772,9 @@ pub enum AccessibilityOptIn {
 /// write with `kAXErrorNotImplemented` although it takes it: the attribute
 /// reads back true and the web tree follows about 2 s later. So a write that
 /// does not report success still counts when the attribute reads back true
-/// and either it was not true before the write or `chromium_app` says the app
-/// is a Chromium-family browser or an Electron app. An assistive app such as
-/// VoiceOver can leave the attribute true on a native app, which must not
-/// then wait for a web tree it never builds.
+/// and `chromium_app` says the app is a Chromium-family browser or an
+/// Electron app. Native AppKit apps answer the same way (refused, then true),
+/// and must not wait for a web tree they never build.
 ///
 /// # Safety
 ///
@@ -794,10 +793,8 @@ pub unsafe fn enable_chromium_accessibility(
         // fallback, and don't claim enablement happened.
         return AccessibilityOptIn::NotAccepted;
     }
-    let was_true = copy_bool_attr(app_element, "AXEnhancedUserInterface") == Some(true);
     if set_bool_attr_true(app_element, "AXEnhancedUserInterface") == kAXErrorSuccess
-        || (copy_bool_attr(app_element, "AXEnhancedUserInterface") == Some(true)
-            && (!was_true || chromium_app()))
+        || (copy_bool_attr(app_element, "AXEnhancedUserInterface") == Some(true) && chromium_app())
     {
         AccessibilityOptIn::EnhancedUserInterface
     } else {
