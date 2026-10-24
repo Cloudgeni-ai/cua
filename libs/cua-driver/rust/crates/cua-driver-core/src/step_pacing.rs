@@ -28,14 +28,17 @@ use std::time::Duration;
 /// other value, or none, applies the batch pacing.
 pub const BATCH_PACING_ENV: &str = "CUA_DRIVER_BATCH_PACING";
 
-/// Longest a batched step waits for the agent cursor to arrive. The glide
-/// itself still plays to the end.
-pub const BATCH_GLIDE_WAIT: Duration = Duration::from_millis(120);
+/// Longest a batched step waits for the agent cursor to arrive: not at all.
+/// The glide itself still plays to the end; the action does not need the
+/// overlay cursor at its target, and a 120 ms wait was about a tenth of a
+/// nine-step batch.
+pub const BATCH_GLIDE_WAIT: Duration = Duration::ZERO;
 
 /// How long a batched step waits for a window change to show before it returns.
 /// The watch continues detached for the rest of its deadline, and a late change
-/// is reported on the next action's result.
-pub const BATCH_REPORT_WINDOW: Duration = Duration::from_millis(100);
+/// is reported on the next action's result. One poll of the default 25 ms
+/// watch: the next step's lookup reads the window anyway.
+pub const BATCH_REPORT_WINDOW: Duration = Duration::from_millis(25);
 
 /// The role of the action being dispatched within the current tool call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -127,8 +130,8 @@ mod tests {
     #[tokio::test]
     async fn the_caps_never_lengthen_a_shorter_wait() {
         scope(StepPacing::Batched, async {
-            let short = Duration::from_millis(40);
-            assert_eq!(glide_wait_limit(short), short);
+            let short = Duration::from_millis(10);
+            assert!(glide_wait_limit(short) <= short);
             assert_eq!(report_window(short), short);
         })
         .await;

@@ -892,6 +892,8 @@ async fn run_step(
     // The element a wait held on as a stand-in, after the window settled:
     // the step's lookup of the same element then uses it at once.
     let mut settled_stand_in: Option<ElementSpec> = None;
+    // The check a wait held on, whose read the step's own lookup may reuse.
+    let mut held: Option<locate::Checked> = None;
     if let Some(check) = &step.wait_for {
         match locator.check(check, context).await {
             Ok(checked) => {
@@ -917,6 +919,9 @@ async fn run_step(
                     checked.waited.as_millis(),
                     check.describe()
                 ));
+                if !check.gone {
+                    held = Some(checked);
+                }
             }
             Err(miss) => {
                 if let Some(window) = &miss.window {
@@ -973,10 +978,20 @@ async fn run_step(
                     ..element.clone()
                 }
             });
-            match locator
-                .find_settled(&window_spec, &element, find_timeout, settled)
-                .await
-            {
+            // The wait just read the window and saw this element: pick it
+            // from that read rather than reading the window again.
+            let reused = held
+                .take()
+                .and_then(|checked| locate::pick_from_check(&checked, &window_spec, &element));
+            let found = match reused {
+                Some(found) => Ok(found),
+                None => {
+                    locator
+                        .find_settled(&window_spec, &element, find_timeout, settled)
+                        .await
+                }
+            };
+            match found {
                 Ok(found) => {
                     let object = args.as_object_mut().expect("object");
                     object.insert("pid".into(), json!(found.window.pid));

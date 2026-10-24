@@ -52,7 +52,10 @@ pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: u64 = 5_000;
 pub(crate) const DEFAULT_EXPECT_TIMEOUT_MS: u64 = 2_000;
 /// Longest wait any single check may ask for.
 pub(crate) const MAX_CHECK_TIMEOUT_MS: u64 = 10_000;
-const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Pause between two reads of a wait or lookup. A lookup read of an ordinary
+/// window takes tens of milliseconds, so a page that is ready is seen within
+/// about a tenth of a second.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CANDIDATES_SHOWN: usize = 5;
 /// Most windows of one app a lookup reads per poll.
 const MAX_WINDOWS_SEARCHED: usize = 4;
@@ -381,6 +384,7 @@ impl Window {
 }
 
 /// One accessibility read of a window.
+#[derive(Clone, Debug)]
 pub(crate) struct Read {
     pub window: Window,
     pub elements: Vec<Value>,
@@ -389,6 +393,9 @@ pub(crate) struct Read {
     /// out): an element of the role named may lie past the cut, so no other
     /// role stands in for it.
     pub truncated: bool,
+    /// The read walked the items inside the menu bar's menus, not only its
+    /// top-level titles (see [`reads_menu_bar`]).
+    pub menus: bool,
 }
 
 /// An element found by description.
@@ -491,6 +498,9 @@ pub(crate) struct Checked {
     /// As [`Found::digest`] and [`Found::fallback`].
     pub digest: u64,
     pub fallback: Option<Miss>,
+    /// The read a presence check held on, so the step's lookup of the same
+    /// element can pick it from that read instead of reading again.
+    pub read: Option<Read>,
 }
 
 /// How long a window must read the same, showing the name asked for only on
@@ -771,7 +781,11 @@ impl<'a> Locator<'a> {
 
     /// One fresh accessibility read. It refreshes the window's element
     /// tokens, so the tokens it returns are the ones to act with.
-    pub async fn read(&self, window: &Window) -> Result<Read, Miss> {
+    ///
+    /// With `menus` false the menu bar shows only its top-level titles: on
+    /// macOS walking every menu of an app's menu bar is most of a read's
+    /// time, and a lookup of anything but a menu item never needs them.
+    pub async fn read(&self, window: &Window, menus: bool) -> Result<Read, Miss> {
         if let Some(max_elements) = self.baseline_max_elements {
             let first = self
                 .baselined
@@ -793,18 +807,21 @@ impl<'a> Locator<'a> {
                     .await;
             }
         }
-        let state = self
-            .call(
-                "get_window_state",
-                json!({
-                    "pid": window.pid,
-                    "window_id": window.window_id,
-                    "full_output": true,
-                    "include_screenshot": false,
-                }),
-            )
-            .await
-            .map_err(|error| Miss::new("read_failed", error).in_window(window))?;
+        let call = self.call(
+            "get_window_state",
+            json!({
+                "pid": window.pid,
+                "window_id": window.window_id,
+                "full_output": true,
+                "include_screenshot": false,
+            }),
+        );
+        let state = if menus {
+            call.await
+        } else {
+            crate::window_state_view::with_menu_bar_collapsed(call).await
+        }
+        .map_err(|error| Miss::new("read_failed", error).in_window(window))?;
         let elements = state
             .get("elements")
             .and_then(Value::as_array)
@@ -820,6 +837,7 @@ impl<'a> Locator<'a> {
             elements,
             markdown,
             truncated: state.get("truncated").and_then(Value::as_bool) == Some(true),
+            menus,
         })
     }
 
@@ -890,7 +908,7 @@ impl<'a> Locator<'a> {
         // the role named.
         let mut stand_in: Option<Found> = None;
         for window in &windows {
-            let read = self.read(window).await?;
+            let read = self.read(window, reads_menu_bar(element)).await?;
             match pick(&read, element) {
                 Ok(found) if found.role_note.is_none() => return Ok(found),
                 Ok(found) => {
@@ -950,6 +968,7 @@ impl<'a> Locator<'a> {
                     role_note: None,
                     digest: 0,
                     fallback: None,
+                    read: None,
                 })
             }
             Err(miss) => return Err(miss),
@@ -959,7 +978,7 @@ impl<'a> Locator<'a> {
         // shows the role named.
         let mut stand_in: Option<Checked> = None;
         for window in &windows {
-            let read = match self.read(window).await {
+            let read = match self.read(window, reads_menu_bar(&check.element)).await {
                 Ok(read) => read,
                 // A window that closed between the lookup and the read has
                 // no elements left.
@@ -977,9 +996,13 @@ impl<'a> Locator<'a> {
                             .and_then(|_| evaluate_as_named(check, &read).err()),
                         role_note,
                         digest: digest(&read),
+                        read: None,
                     };
                     if checked.role_note.is_none() {
-                        return Ok(checked);
+                        return Ok(Checked {
+                            read: Some(read),
+                            ..checked
+                        });
                     }
                     stand_in.get_or_insert(checked);
                 }
@@ -1004,6 +1027,7 @@ impl<'a> Locator<'a> {
                 role_note: None,
                 digest: 0,
                 fallback: None,
+                read: None,
             }),
             Some((_, mut miss)) => {
                 if windows.len() > 1 {
@@ -1176,6 +1200,43 @@ fn narrow<'r>(found: Vec<&'r Value>, spec: &ElementSpec) -> Vec<&'r Value> {
 
 fn pick(read: &Read, spec: &ElementSpec) -> Result<Found, Miss> {
     pick_with(read, spec, true)
+}
+
+/// Whether a lookup of `spec` needs the items inside the menu bar's menus.
+/// Only a menu item can be one; an element named without a role might be.
+pub(crate) fn reads_menu_bar(spec: &ElementSpec) -> bool {
+    match &spec.role {
+        None => true,
+        Some(role) => matches!(
+            role_family(role).as_str(),
+            "menuitem" | "menubaritem" | "menu" | "menubar"
+        ),
+    }
+}
+
+/// The element a step names, picked from the read its `wait_for` just held
+/// on, when both address the same exact window and that read walked the
+/// menus the lookup would. None means the step looks it up as usual.
+///
+/// The read is current: the check returned the moment it held, and the
+/// tokens it carries are the window's latest.
+pub(crate) fn pick_from_check(
+    checked: &Checked,
+    window: &WindowSpec,
+    element: &ElementSpec,
+) -> Option<Found> {
+    if checked.role_note.is_some() {
+        return None;
+    }
+    let read = checked.read.as_ref()?;
+    if window.exact()? != (read.window.pid, read.window.window_id)
+        || read.menus != reads_menu_bar(element)
+    {
+        return None;
+    }
+    pick(read, element)
+        .ok()
+        .filter(|found| found.role_note.is_none())
 }
 
 /// As [`pick`]; with `stand_in` false, no element of another role stands in.
@@ -2034,6 +2095,7 @@ mod tests {
             elements,
             markdown: markdown.to_owned(),
             truncated: false,
+            menus: true,
         }
     }
 

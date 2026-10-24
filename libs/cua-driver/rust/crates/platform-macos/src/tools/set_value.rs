@@ -585,25 +585,20 @@ fn set_value_blocking(
             // Some apps apply the write a moment later; give it a short
             // settle before calling it not applied.
             let read_back = || {
-                let mut after = read_value(element);
-                let mut outcome = classify_write(
-                    before.as_deref(),
-                    after.as_deref(),
-                    value,
-                    numeric_target.is_some(),
-                );
-                for _ in 0..NOT_APPLIED_REREADS {
-                    if secure || !write_not_applied(outcome.0, outcome.1) {
-                        break;
-                    }
-                    crate::timing::sleep(std::time::Duration::from_millis(100));
-                    after = read_value(element);
-                    outcome = classify_write(
+                let classify = || {
+                    classify_write(
                         before.as_deref(),
-                        after.as_deref(),
+                        read_value(element).as_deref(),
                         value,
                         numeric_target.is_some(),
-                    );
+                    )
+                };
+                let mut outcome = classify();
+                if !secure && write_not_applied(outcome.0, outcome.1) {
+                    holds_soon(|| {
+                        outcome = classify();
+                        !write_not_applied(outcome.0, outcome.1)
+                    });
                 }
                 outcome
             };
@@ -652,12 +647,7 @@ fn set_value_blocking(
                             classify_write(None, read_value(element).as_deref(), previous, true).0
                                 == Some(true)
                         };
-                        err == kAXErrorSuccess
-                            && (back()
-                                || (0..NOT_APPLIED_REREADS).any(|_| {
-                                    crate::timing::sleep(std::time::Duration::from_millis(100));
-                                    back()
-                                }))
+                        err == kAXErrorSuccess && (back() || holds_soon(back))
                     }
                     _ => false,
                 };
@@ -861,8 +851,24 @@ fn moved(before: Option<&str>, now: &str) -> bool {
     before.is_some_and(|before| classify_write(None, Some(now), before, true).0 != Some(true))
 }
 
-/// Re-reads (100 ms apart) before an unchanged value counts as not applied.
-const NOT_APPLIED_REREADS: usize = 3;
+/// How long an unchanged value is re-read before it counts as not applied,
+/// and how often. Chrome shows a write a few milliseconds later; polling
+/// returns as soon as it does instead of sleeping a fixed 100 ms.
+const NOT_APPLIED_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+const NOT_APPLIED_POLL: std::time::Duration = std::time::Duration::from_millis(15);
+
+/// Re-check `holds` every [`NOT_APPLIED_POLL`] until it does or
+/// [`NOT_APPLIED_SETTLE`] passes. The first check comes after one poll.
+fn holds_soon(mut holds: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + NOT_APPLIED_SETTLE;
+    while std::time::Instant::now() < deadline {
+        crate::timing::sleep(NOT_APPLIED_POLL);
+        if holds() {
+            return true;
+        }
+    }
+    false
+}
 
 /// The read-back did not match and the value did not move: the app accepted
 /// the accessibility write (LibreOffice Calc cells do) but did not apply it.
@@ -1085,6 +1091,13 @@ fn option_pairs(options: &[PopupOption]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Whether a popup whose value reads `current` already shows `value`, by the
+/// same rule an option is matched with.
+fn already_selected(current: &str, value: &str) -> bool {
+    !value.trim().is_empty()
+        && matching_option(&[(current.to_owned(), String::new())], value).is_some()
+}
+
 fn describe_available(options: &[PopupOption]) -> String {
     options
         .iter()
@@ -1230,12 +1243,6 @@ fn select_chromium_popup_by_typeahead(
     }
     let selected = || unsafe { copy_string_attr(popup, "AXValue") }.unwrap_or_default();
     let matches = |current: &str| current.trim().to_lowercase() == wanted.to_lowercase();
-    if matches(&selected()) {
-        return Some(format!(
-            "✅ '{wanted}' is already selected in AXPopUpButton [{element_index}] \
-             \"{element_title}\"; nothing was changed."
-        ));
-    }
     // Focus moves inside the page only: no activation, no window order change.
     unsafe { crate::ax::bindings::set_bool_attr_true(popup, "AXFocused") };
     crate::timing::sleep(POPUP_POLL_INTERVAL);
@@ -1277,6 +1284,19 @@ fn select_popup_option(
     value: &str,
     element_title: &str,
 ) -> anyhow::Result<String> {
+    // A closed Chromium popup lists only its selected option. Pressing that
+    // item while the menu is closed empties the <select>, so a value it
+    // already shows is left as it is, on every route.
+    if !popup_menu_is_open(element) {
+        let current = unsafe { copy_string_attr(element, "AXValue") }.unwrap_or_default();
+        if already_selected(&current, value) {
+            return Ok(format!(
+                "✅ '{}' is already selected in AXPopUpButton [{element_index}] \
+                 \"{element_title}\"; nothing was changed.",
+                current.trim()
+            ));
+        }
+    }
     if let Some(detail) = select_chromium_popup_by_typeahead(
         element,
         element_index,
@@ -1424,7 +1444,7 @@ fn select_popup_option(
 
 #[cfg(test)]
 mod popup_option_tests {
-    use super::matching_option;
+    use super::{already_selected, matching_option};
 
     fn pairs(titles: &[&str]) -> Vec<(String, String)> {
         titles
@@ -1445,6 +1465,15 @@ mod popup_option_tests {
     fn matches_value_when_title_differs() {
         let options = vec![("Duplicate of".to_owned(), "dup".to_owned())];
         assert_eq!(matching_option(&options, "DUP"), Some(0));
+    }
+
+    #[test]
+    fn a_popup_already_showing_the_value_is_left_alone() {
+        assert!(already_selected("Business", "business"));
+        assert!(already_selected(" Team ", "Team"));
+        assert!(!already_selected("Team", "Business"));
+        assert!(!already_selected("", "Business"));
+        assert!(!already_selected("", " "));
     }
 }
 

@@ -281,10 +281,11 @@ impl Tool for GetWindowStateTool {
         let timeout_ms = cua_driver_core::tool_schema::resolve_timeout_ms(args.get("timeout_ms"));
 
         // A model-facing read lists the menu bar's top-level titles only; a
-        // query or full_output walks every menu as before.
+        // query or full_output walks every menu as before, except a batch
+        // lookup that is not after a menu item.
         let collapse_menus = query.as_deref().is_none_or(|q| q.trim().is_empty())
-            && !view.full_output
-            && !observation_only;
+            && ((!view.full_output && !observation_only)
+                || cua_driver_core::window_state_view::menu_bar_collapsed());
         // Start the screenshot grab before the tree walk so the two overlap:
         // ScreenCaptureKit and the accessibility walk use independent system
         // services, and the read otherwise pays for them one after the other.

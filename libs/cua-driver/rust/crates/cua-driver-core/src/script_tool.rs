@@ -606,7 +606,7 @@ impl<'a> Api<'a> {
         for resolved in &windows {
             let read = self
                 .locator
-                .read(resolved)
+                .read(resolved, locate::reads_menu_bar(&spec))
                 .await
                 .map_err(|miss| HostError::new(miss.message, miss.code))?;
             let window_json = json!({"window_id": resolved.window_id, "title": resolved.title});

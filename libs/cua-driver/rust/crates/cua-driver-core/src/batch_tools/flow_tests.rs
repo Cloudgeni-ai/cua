@@ -37,6 +37,8 @@ struct Ui {
     snapshot: u32,
     /// Element labels of the latest read, by element index.
     last_labels: Vec<(String, String)>,
+    /// Whether each window read listed only the menu bar's titles.
+    menu_bar_collapsed: Vec<bool>,
     calls: Vec<(String, Value)>,
 }
 
@@ -161,6 +163,8 @@ impl Tool for Fake {
             })),
             "get_window_state" => {
                 let window_id = args["window_id"].as_u64().unwrap_or(7);
+                ui.menu_bar_collapsed
+                    .push(crate::window_state_view::menu_bar_collapsed());
                 ui.snapshot += 1;
                 let snapshot = ui.snapshot;
                 let rows = ui.elements(window_id);
@@ -923,4 +927,83 @@ async fn toggle_to_fails_clearly_on_a_press_that_does_not_take_or_a_non_toggle()
         "{}",
         text(&result)
     );
+}
+
+#[tokio::test]
+async fn a_step_whose_wait_saw_its_element_acts_on_that_read() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"pid": 42, "window_id": 7, "role": "button", "name": "Next", "exact": true},
+             "wait_for": {"pid": 42, "window_id": 7, "role": "button", "name": "Next", "exact": true}}
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(harness.ui.lock().unwrap().screen, 1, "Next was pressed");
+    // The wait's read found the button; the lookup did not read again.
+    assert_eq!(harness.calls("get_window_state").len(), 1);
+
+    // Another element of that same read is picked from it too.
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"pid": 42, "window_id": 7, "role": "button", "name": "Next", "exact": true},
+             "wait_for": {"pid": 42, "window_id": 7, "role": "textfield", "name": "Email"}}
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(harness.calls("get_window_state").len(), 1);
+
+    // A lookup that may be after a menu item reads the menus the wait's
+    // read left out.
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"pid": 42, "window_id": 7, "name": "Next", "exact": true},
+             "wait_for": {"pid": 42, "window_id": 7, "role": "button", "name": "Next"}}
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(harness.calls("get_window_state").len(), 2);
+    assert_eq!(
+        harness.ui.lock().unwrap().menu_bar_collapsed,
+        vec![true, false]
+    );
+}
+
+#[tokio::test]
+async fn lookups_read_the_menu_bar_menus_only_when_after_a_menu_item() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"app": "Demo", "role": "button", "name": "Next"}}
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(harness.ui.lock().unwrap().menu_bar_collapsed, vec![true]);
+
+    // Named without a role, the element might be a menu item.
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"app": "Demo", "name": "Next"}}
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(harness.ui.lock().unwrap().menu_bar_collapsed, vec![false]);
+
+    // A menu item, by any platform's role name.
+    for role in ["menuitem", "AXMenuItem", "menu item", "MenuBarItem"] {
+        let harness = Harness::new();
+        let _ = harness
+            .run(json!({"steps": [
+                {"click": {"app": "Demo", "role": role, "name": "Next", "timeout_ms": 50}}
+            ]}))
+            .await;
+        let reads = harness.ui.lock().unwrap().menu_bar_collapsed.clone();
+        assert!(
+            !reads.is_empty() && reads.iter().all(|c| !c),
+            "{role}: {reads:?}"
+        );
+    }
 }

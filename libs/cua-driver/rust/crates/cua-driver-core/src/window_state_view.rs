@@ -29,6 +29,27 @@ use std::time::{Duration, Instant};
 /// renders 40-100K characters for an ordinary window.
 pub const DEFAULT_MAX_ELEMENTS: usize = 250;
 
+tokio::task_local! {
+    static MENU_BAR_COLLAPSED: ();
+}
+
+/// Run `future` with every window read it makes listing only the menu bar's
+/// top-level titles, as a model-facing read does, even a `full_output` read.
+///
+/// The batch lookups use it: they read with `full_output` (all metadata and
+/// both representations, and never a `since` baseline), and on macOS walking
+/// every menu of an app's menu bar is most of such a read's time. A lookup
+/// that may be after a menu item reads the menus as before. It is a
+/// task-local the batch executor sets, never a caller argument.
+pub async fn with_menu_bar_collapsed<F: std::future::Future>(future: F) -> F::Output {
+    MENU_BAR_COLLAPSED.scope((), future).await
+}
+
+/// Whether the read being made is inside [`with_menu_bar_collapsed`].
+pub fn menu_bar_collapsed() -> bool {
+    MENU_BAR_COLLAPSED.try_with(|_| ()).is_ok()
+}
+
 /// Snapshots remembered per (pid, window) for `since`.
 const STORE_PER_WINDOW: usize = 8;
 /// Snapshots remembered across all windows.

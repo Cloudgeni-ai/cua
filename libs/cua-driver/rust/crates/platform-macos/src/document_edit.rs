@@ -72,8 +72,10 @@ struct CfRange {
     length: isize,
 }
 
-/// Whether `element` sits in a document window (its window has an
-/// `AXDocument` URL).
+/// Whether `element` sits in a document window: its window's `AXDocument`
+/// is a file. A browser window names its page's web address there; a web
+/// field takes an accessibility write through the page's own input events
+/// and has no document to save, so it gets no key edit.
 ///
 /// # Safety
 /// `element` must be a live `AXUIElementRef`.
@@ -83,7 +85,14 @@ unsafe fn in_document_window(element: AXUIElementRef) -> bool {
     };
     let document = copy_string_attr(window, "AXDocument");
     core_foundation::base::CFRelease(window as _);
-    document.is_some_and(|url| !url.is_empty())
+    document.is_some_and(|url| names_a_file(&url))
+}
+
+/// Whether an `AXDocument` value is a file URL.
+fn names_a_file(url: &str) -> bool {
+    url.trim()
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
 }
 
 /// Whether the app's key window (its `AXFocusedWindow`) is the element's
@@ -232,7 +241,17 @@ unsafe fn caret_to_end_of(element: AXUIElementRef) {
 
 #[cfg(test)]
 mod tests {
-    use super::DocumentEdited;
+    use super::{names_a_file, DocumentEdited};
+
+    #[test]
+    fn only_a_file_is_a_document_to_mark_edited() {
+        assert!(names_a_file("file:///Users/me/Notes.rtf"));
+        assert!(names_a_file("FILE:///tmp/a.txt"));
+        assert!(!names_a_file("https://example.com/billing"));
+        assert!(!names_a_file("http://localhost:8080/"));
+        assert!(!names_a_file(""));
+        assert!(!names_a_file("fil"));
+    }
 
     #[test]
     fn only_a_document_left_unedited_gets_a_warning() {

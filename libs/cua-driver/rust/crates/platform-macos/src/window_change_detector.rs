@@ -969,7 +969,7 @@ mod tests {
             observation_bounds_from(Some("3000"), Some("10")),
             BATCH_REPORT_WINDOW,
             move || {
-                if started.elapsed() > Duration::from_millis(40) {
+                if started.elapsed() > Duration::from_millis(5) {
                     (
                         vec![win(1, 7, "App", "Main"), win(2, 7, "App", "Menu")],
                         Some(7),

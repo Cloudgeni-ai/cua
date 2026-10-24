@@ -268,8 +268,8 @@ Two waits make up most of a macOS action's latency: the agent cursor's glide to
 the target (600 ms or more with the default `steady` timing) and the first 300 ms
 of the window watch above. A call that is one step of a `run_steps` batch or a
 `run_script` program is followed at once by another step, so the driver shortens
-both for it: the step waits at most 120 ms for the cursor to arrive and 100 ms
-for a window change. The cursor keeps gliding and the watch keeps running
+both for it: the step does not wait for the cursor to arrive, and looks once,
+after 25 ms, for a window change. The cursor keeps gliding and the watch keeps running
 detached, as above, so a window that opens late is still reported on the next
 action's result. The last step of a `run_steps` batch, and every direct call,
 keep the full waits, so the batch's final result still reports what it left
