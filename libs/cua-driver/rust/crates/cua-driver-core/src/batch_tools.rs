@@ -134,7 +134,14 @@ pub const MAX_EXPECTS: usize = 4;
 /// client call timeouts.
 pub const MAX_BATCH_MS: u64 = 60_000;
 /// Fields a step object may carry besides one action.
-const STEP_KEYS: &[&str] = &["tool", "args", "wait_for", "expect", "timeout_ms"];
+const STEP_KEYS: &[&str] = &[
+    "tool",
+    "args",
+    "wait_for",
+    "expect",
+    "timeout_ms",
+    "toggle_to",
+];
 const OBSERVE_TOOL: &str = "get_window_state";
 /// Batch-level fields that name the window every step inherits.
 const BATCH_WINDOW_KEYS: &[&str] = &["pid", "window_id", "app", "window"];
@@ -236,7 +243,8 @@ impl Tool for RunStepsTool {
                                 "args": { "type": "object", "description": "Arguments for that tool, as in a direct call, optionally with role/name/nth/app/window to name the target instead of pid/window_id/element_token." },
                                 "wait_for": { "type": "object", "description": "Check that must hold before the action: {role?, name?, text?, gone?, app?, window?, timeout_ms?}. Default timeout 5000 ms." },
                                 "expect": { "type": "array", "maxItems": 4, "items": {"type": "object"}, "description": "Up to 4 checks that must hold after the action: {role?, name?, text?, gone?, value?, value_contains?, enabled?, selected?, app?, window?, timeout_ms?}. Default timeout 2000 ms." },
-                                "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 10000, "description": "How long a named target may take to appear. Default 3000." }
+                                "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 10000, "description": "How long a named target may take to appear. Default 3000." },
+                                "toggle_to": { "type": "boolean", "description": "On a click that names a checkbox or switch by role/name: the checked state wanted. The click runs only when the element is not in that state already, and the state is checked after it." }
                             },
                             "additionalProperties": true
                         }
@@ -324,6 +332,10 @@ struct Step {
     action: Option<Action>,
     wait_for: Option<Check>,
     expect: Vec<Check>,
+    /// The checked state a click on a named checkbox or switch is for: the
+    /// click runs only when the element is not in it already, and the state
+    /// is checked after it.
+    toggle_to: Option<bool>,
     /// A read-only tool placed between actions. It cannot change what later
     /// steps do, so it is skipped (with a note) instead of failing the batch.
     skipped_read: Option<&'static str>,
@@ -546,6 +558,7 @@ impl Plan {
                     action: None,
                     wait_for: None,
                     expect: Vec::new(),
+                    toggle_to: None,
                     skipped_read: Some(tool),
                 });
                 continue;
@@ -921,6 +934,9 @@ async fn run_step(
         }
     }
 
+    // A toggle already in the state asked for is left as it is.
+    let mut already_toggled = false;
+    let mut toggle_check: Option<Check> = None;
     if let Some(action) = step.action {
         let Action {
             tool,
@@ -981,6 +997,45 @@ async fn run_step(
                         found.describe(),
                         found.window.describe()
                     ));
+                    if let Some(wanted) = step.toggle_to {
+                        match locate::toggle_state(&found.element) {
+                            None => {
+                                let message = format!(
+                                    "toggle_to needs a checkbox or switch whose checked state \
+                                     can be read; {} has none",
+                                    found.describe()
+                                );
+                                *last_window = Some(found.window);
+                                return failure(
+                                    index,
+                                    label,
+                                    Phase::Find,
+                                    "not_a_toggle",
+                                    message,
+                                    report,
+                                );
+                            }
+                            Some(state) if state == wanted => already_toggled = true,
+                            Some(_) => {
+                                toggle_check = Some(Check {
+                                    window: WindowSpec {
+                                        pid: Some(found.window.pid),
+                                        window_id: Some(found.window.window_id),
+                                        ..Default::default()
+                                    },
+                                    element: element.clone(),
+                                    gone: false,
+                                    value: None,
+                                    value_contains: None,
+                                    enabled: None,
+                                    selected: Some(wanted),
+                                    timeout: Duration::from_millis(
+                                        locate::DEFAULT_EXPECT_TIMEOUT_MS,
+                                    ),
+                                });
+                            }
+                        }
+                    }
                     *last_window = Some(found.window);
                 }
                 Err(miss) => {
@@ -1020,91 +1075,103 @@ async fn run_step(
             });
         }
 
-        let mut result = registry.invoke(tool, args.clone()).await;
-        let mut refound_note = None;
-        // Both fallbacks act on what an older snapshot said the token was;
-        // `refind_stale:false` keeps the step to the exact element it named.
-        if result.is_error == Some(true) && tool == "click" && refind_stale {
-            if let Some((menu_args, note)) = menu_bar_route(&args, &result) {
-                report["refound"] = json!(note);
-                result = registry.invoke("invoke_menu", menu_args).await;
-                refound_note = Some(note);
+        if already_toggled {
+            let state = if step.toggle_to == Some(true) {
+                "checked"
+            } else {
+                "not checked"
+            };
+            report["toggle"] = json!("already");
+            notes.insert(0, format!("already {state}, so it was not pressed"));
+        } else {
+            let mut result = registry.invoke(tool, args.clone()).await;
+            let mut refound_note = None;
+            // Both fallbacks act on what an older snapshot said the token was;
+            // `refind_stale:false` keeps the step to the exact element it named.
+            if result.is_error == Some(true) && tool == "click" && refind_stale {
+                if let Some((menu_args, note)) = menu_bar_route(&args, &result) {
+                    report["refound"] = json!(note);
+                    result = registry.invoke("invoke_menu", menu_args).await;
+                    refound_note = Some(note);
+                }
             }
-        }
-        if result.is_error == Some(true) && refound_note.is_none() && refind_stale {
-            if let Some((retry, note)) = refind_stale_target(locator, &args, &result).await {
-                report["refound"] = json!(note);
+            if result.is_error == Some(true) && refound_note.is_none() && refind_stale {
+                if let Some((retry, note)) = refind_stale_target(locator, &args, &result).await {
+                    report["refound"] = json!(note);
+                    result = registry.invoke(tool, retry).await;
+                    refound_note = Some(note);
+                }
+            }
+            let wants_foreground = result.is_error == Some(true)
+                && wants_foreground(&result)
+                && args.get("delivery_mode").is_none()
+                && accepts(registry, tool, "delivery_mode");
+            let mut foreground_hint = None;
+            if wants_foreground && foreground_fallback {
+                let mut retry = args.clone();
+                retry["delivery_mode"] = json!("foreground");
                 result = registry.invoke(tool, retry).await;
-                refound_note = Some(note);
-            }
-        }
-        let wants_foreground = result.is_error == Some(true)
-            && wants_foreground(&result)
-            && args.get("delivery_mode").is_none()
-            && accepts(registry, tool, "delivery_mode");
-        let mut foreground_hint = None;
-        if wants_foreground && foreground_fallback {
-            let mut retry = args.clone();
-            retry["delivery_mode"] = json!("foreground");
-            result = registry.invoke(tool, retry).await;
-            notes.push("background delivery was refused, so it ran in the foreground".to_owned());
-            report["delivery_fallback"] = json!("foreground");
-        } else if wants_foreground {
-            foreground_hint = Some(format!(
+                notes.push(
+                    "background delivery was refused, so it ran in the foreground".to_owned(),
+                );
+                report["delivery_fallback"] = json!("foreground");
+            } else if wants_foreground {
+                foreground_hint = Some(format!(
                 " To run it, send the batch again from step {} with \"delivery_mode\":\"foreground\" \
                  on this step, or set \"foreground_fallback\":true on run_steps (the window is \
                  activated and the pointer may move).",
                 index + 1
             ));
-        }
-        let ok = result.is_error != Some(true);
-        let mut message = bounded_message(&result);
-        if let (false, Some(hint)) = (ok, &foreground_hint) {
-            message.push_str(hint);
-        }
-        if let (false, Some(note)) = (ok, &refound_note) {
-            message = format!("{note}, but: {message}");
-        }
-        if let (true, Some(note)) = (ok, refound_note) {
-            notes.push(note);
-        }
-        report["ok"] = json!(ok);
-        report["message"] = json!(message);
-        // The step's message keeps only the first line of the tool's text.
-        // The windows the action opened are reported further down; keep that
-        // report, so a caller can tell which window a step left in front.
-        let changes = window_changes(&result);
-        if ok && !changes.is_empty() {
-            report["window_changes"] = json!(changes);
-        }
-        if !ok {
-            if let Some(code) = result
-                .structured_content
-                .as_ref()
-                .and_then(|value| value.get("code"))
-                .and_then(Value::as_str)
-            {
-                report["code"] = Value::String(code.to_owned());
             }
-            // The step's own recovery hint and next call, so a failed batch
-            // says what to do next without a second tool call.
-            for key in ["hint", "next_call"] {
-                if let Some(value) = result
+            let ok = result.is_error != Some(true);
+            let mut message = bounded_message(&result);
+            if let (false, Some(hint)) = (ok, &foreground_hint) {
+                message.push_str(hint);
+            }
+            if let (false, Some(note)) = (ok, &refound_note) {
+                message = format!("{note}, but: {message}");
+            }
+            if let (true, Some(note)) = (ok, refound_note) {
+                notes.push(note);
+            }
+            report["ok"] = json!(ok);
+            report["message"] = json!(message);
+            // The step's message keeps only the first line of the tool's text.
+            // The windows the action opened are reported further down; keep that
+            // report, so a caller can tell which window a step left in front.
+            let changes = window_changes(&result);
+            if ok && !changes.is_empty() {
+                report["window_changes"] = json!(changes);
+            }
+            if !ok {
+                if let Some(code) = result
                     .structured_content
                     .as_ref()
-                    .and_then(|value| value.get(key))
+                    .and_then(|value| value.get("code"))
+                    .and_then(Value::as_str)
                 {
-                    report[key] = value.clone();
+                    report["code"] = Value::String(code.to_owned());
                 }
+                // The step's own recovery hint and next call, so a failed batch
+                // says what to do next without a second tool call.
+                for key in ["hint", "next_call"] {
+                    if let Some(value) = result
+                        .structured_content
+                        .as_ref()
+                        .and_then(|value| value.get(key))
+                    {
+                        report[key] = value.clone();
+                    }
+                }
+                return StepOutcome {
+                    line: format!("{}. {label} ERROR (action): {message}", index + 1),
+                    report: with_phase(report, Phase::Action),
+                    ok: false,
+                };
             }
-            return StepOutcome {
-                line: format!("{}. {label} ERROR (action): {message}", index + 1),
-                report: with_phase(report, Phase::Action),
-                ok: false,
-            };
-        }
-        if !message.is_empty() {
-            notes.insert(0, message);
+            if !message.is_empty() {
+                notes.insert(0, message);
+            }
         }
     }
 
@@ -1117,6 +1184,31 @@ async fn run_step(
         })
         .filter(|_| context.is_empty())
         .unwrap_or_else(|| context.clone());
+    if let Some(check) = &toggle_check {
+        match locator.check(check, &fallback).await {
+            Ok(_) => {
+                report["toggle"] = json!("pressed");
+            }
+            Err(miss) => {
+                if let Some(window) = &miss.window {
+                    *last_window = Some(window.clone());
+                }
+                let state = if step.toggle_to == Some(true) {
+                    "checked"
+                } else {
+                    "not checked"
+                };
+                return failure(
+                    index,
+                    label,
+                    Phase::Expect,
+                    miss.code,
+                    format!("it was pressed but does not read {state}: {}", miss.message),
+                    report,
+                );
+            }
+        }
+    }
     let mut checked = Vec::new();
     for (nth, check) in step.expect.iter().enumerate() {
         match locator.check(check, &fallback).await {
@@ -1709,10 +1801,31 @@ fn parse_step(
             inherits_window,
         )?),
     };
+    let toggle_to = match object.get("toggle_to") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(state)) => Some(*state),
+        Some(_) => {
+            return Err(PlanError::step(
+                index,
+                "`toggle_to` must be true (checked) or false (not checked)",
+            ))
+        }
+    };
+    if toggle_to.is_some()
+        && !action
+            .as_ref()
+            .is_some_and(|action| action.tool == "click" && !action.element.is_empty())
+    {
+        return Err(PlanError::step(
+            index,
+            "`toggle_to` goes on a click that names its checkbox or switch by role and name",
+        ));
+    }
     Ok(Step {
         action,
         wait_for,
         expect,
+        toggle_to,
         skipped_read: None,
     })
 }

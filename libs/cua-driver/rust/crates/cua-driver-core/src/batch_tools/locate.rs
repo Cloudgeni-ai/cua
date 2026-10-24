@@ -1606,6 +1606,16 @@ fn selected_state(element: &Value) -> Option<bool> {
     element.get("selected").and_then(Value::as_bool).or(checked)
 }
 
+/// A checkbox's or switch's checked state, or None when the element is no
+/// such control or its state cannot be read.
+pub(crate) fn toggle_state(element: &Value) -> Option<bool> {
+    let role = element.get("role").and_then(Value::as_str)?;
+    let bare = bare_role(role);
+    let toggle = role_family(role) == "checkbox"
+        || matches!(bare.as_str(), "switch" | "togglebutton" | "checkmenuitem");
+    toggle.then(|| selected_state(element)).flatten()
+}
+
 /// Display-only rows (static text and other rows without an element index)
 /// that match `spec`, parsed into {role, label, value, text}. Scripts read
 /// values such as "Ticket: 4F2K" from these; they cannot be acted on.

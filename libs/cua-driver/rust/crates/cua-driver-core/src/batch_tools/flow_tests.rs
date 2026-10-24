@@ -18,6 +18,8 @@ struct Ui {
     screen: u8,
     email: String,
     dialog_open: bool,
+    /// The "Reminders" checkbox; "Stuck" never changes when pressed.
+    reminders: bool,
     /// A transient popup (no useful controls) stacked on top.
     bubble_open: bool,
     /// Reads left before the "Finish" button appears on screen 2.
@@ -50,6 +52,12 @@ impl Ui {
                 ("AXButton", "Next".into(), None),
                 ("AXButton", "OK".into(), None),
                 ("AXButton", "OK".into(), None),
+                (
+                    "AXCheckBox",
+                    "Reminders".into(),
+                    Some(if self.reminders { "1" } else { "0" }.into()),
+                ),
+                ("AXCheckBox", "Stuck".into(), Some("0".into())),
             ],
             // A web page: "Edit billing" is a link, "Plan" only text.
             2 => vec![
@@ -185,6 +193,7 @@ impl Tool for Fake {
                         ui.email = args["value"].as_str().unwrap_or_default().to_owned()
                     }
                     ("click", "Next") => ui.screen = 1,
+                    ("click", "Reminders") => ui.reminders = !ui.reminders,
                     ("click", "Back") => ui.dialog_open = true,
                     ("click", "Keep") | ("click", "Discard") => ui.dialog_open = false,
                     _ => {}
@@ -764,4 +773,81 @@ async fn two_links_of_the_name_fail_a_button_step_once_the_window_settles() {
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["steps"][0]["code"], "ambiguous", "{structured}");
     }
+}
+
+#[tokio::test]
+async fn toggle_to_presses_a_checkbox_only_when_it_is_not_in_that_state() {
+    let harness = Harness::new();
+    let checkbox = json!({"app": "Demo", "role": "checkbox", "name": "Reminders", "exact": true});
+    // Off, asked on: pressed, and the state is read after.
+    let result = harness
+        .run(json!({"steps": [{"click": checkbox.clone(), "toggle_to": true}]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert!(harness.ui.lock().unwrap().reminders);
+    assert_eq!(harness.calls("click").len(), 1);
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["steps"][0]["toggle"], "pressed");
+
+    // On, asked on again: left as it is.
+    let result = harness
+        .run(json!({"steps": [{"click": checkbox.clone(), "toggle_to": true}]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(harness.calls("click").len(), 1, "not pressed again");
+    assert!(harness.ui.lock().unwrap().reminders);
+    assert!(
+        text(&result).contains("already checked"),
+        "{}",
+        text(&result)
+    );
+
+    // On, asked off: pressed.
+    let result = harness
+        .run(json!({"steps": [{"click": checkbox, "toggle_to": false}]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert!(!harness.ui.lock().unwrap().reminders);
+    assert_eq!(harness.calls("click").len(), 2);
+}
+
+#[tokio::test]
+async fn toggle_to_fails_clearly_on_a_press_that_does_not_take_or_a_non_toggle() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"app": "Demo", "role": "checkbox", "name": "Stuck"}, "toggle_to": true}
+        ]}))
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.clone().unwrap();
+    assert_eq!(structured["steps"][0]["phase"], "expect");
+    assert!(
+        text(&result).contains("pressed but does not read checked"),
+        "{}",
+        text(&result)
+    );
+
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"app": "Demo", "role": "button", "name": "Next"}, "toggle_to": true}
+        ]}))
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.clone().unwrap();
+    assert_eq!(structured["steps"][0]["code"], "not_a_toggle");
+    assert_eq!(harness.ui.lock().unwrap().screen, 0, "Next was not pressed");
+
+    // Only on a click that names its element.
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"pid": 42, "window_id": 7, "element_token": "s00000001:5"}, "toggle_to": true}
+        ]}))
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        text(&result).contains("rejected before running anything"),
+        "{}",
+        text(&result)
+    );
 }
