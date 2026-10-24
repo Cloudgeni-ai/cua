@@ -1113,10 +1113,17 @@ fn describe_available(options: &[PopupOption]) -> String {
         .join(", ")
 }
 
-/// Whether the popup's menu is open right now: an `AXMenu` child that already
-/// lists items. A closed AppKit popup has an empty `AXMenu` (or none), and a
-/// closed Chromium popup lists only its selected item directly.
+/// Whether the popup's menu is open right now.
+///
+/// A popup that reports `AXExpanded` says so itself. A Chromium `<select>`
+/// does, and has to be asked: once its menu has been opened, it keeps
+/// listing the items under an `AXMenu` after the menu closes. Otherwise an
+/// `AXMenu` child that already lists items is an open menu: a closed AppKit
+/// popup has an empty `AXMenu` (or none).
 fn popup_menu_is_open(popup: AXUIElementRef) -> bool {
+    if let Some(expanded) = unsafe { copy_bool_attr(popup, "AXExpanded") } {
+        return expanded;
+    }
     let mut open = false;
     for child in unsafe { copy_children(popup) } {
         if unsafe { copy_string_attr(child, "AXRole") }.as_deref() == Some("AXMenu") {
@@ -1291,15 +1298,13 @@ fn select_popup_option(
     element_title: &str,
 ) -> anyhow::Result<String> {
     // Pressing the item of the option a Chromium <select> already shows
-    // empties it, so a value it already shows is left as it is, on every
-    // route. Whether its menu is open cannot be told from its children:
-    // once opened, Chromium keeps listing the items under an AXMenu after
-    // the menu closes. A menu that is open is asked to close (AppKit takes
-    // AXCancel; nothing is typed into the page).
+    // empties it, even in its open menu, so a value it already shows is left
+    // as it is, on every route. A menu an earlier click left open is closed
+    // without choosing anything.
     let current = unsafe { copy_string_attr(element, "AXValue") }.unwrap_or_default();
     if already_selected(&current, value) {
         if popup_menu_is_open(element) {
-            cancel_popup_menu(element);
+            dismiss_popup_menu(element, pid);
         }
         return Ok(format!(
             "✅ '{}' is already selected in AXPopUpButton [{element_index}] \
