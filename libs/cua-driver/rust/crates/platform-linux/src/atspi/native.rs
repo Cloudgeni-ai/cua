@@ -1602,14 +1602,10 @@ async fn collect_visited_bounded_opts<'a>(
         };
         let focused = matches!(state_r.as_ref(), Some(Ok(s)) if s.contains(State::Focused));
         let role_lower = role.to_ascii_lowercase();
-        let checked = if role_lower.contains("check") {
-            state_r
-                .as_ref()
-                .and_then(|state| state.as_ref().ok())
-                .map(|state| state.contains(State::Checked))
-        } else {
-            None
-        };
+        let checked = state_r
+            .as_ref()
+            .and_then(|state| state.as_ref().ok())
+            .and_then(|state| toggle_checked(&role_lower, state));
         let enabled = state_r
             .as_ref()
             .and_then(|state| state.as_ref().ok())
@@ -1627,7 +1623,7 @@ async fn collect_visited_bounded_opts<'a>(
             .and_then(|state| state.as_ref().ok())
             .is_some_and(|state| state.contains(State::Expanded));
         let under_menubar = menubar_children.remove(&(oref.name.clone(), oref.path.clone()));
-        let selected = if role_lower.contains("check") {
+        let selected = if checked.is_some() {
             checked
         } else if role_lower.contains("radio")
             || role_lower.contains("list item")
@@ -2270,6 +2266,16 @@ fn listing_state(role_lower: &str, state: &StateSet) -> (bool, bool) {
 /// Description note for an indexed element that is not on screen.
 const OFFSCREEN_NOTE: &str =
     "off-screen: scroll it into view before a pixel action; element actions still reach it";
+
+/// Whether a checkbox, switch or toggle button is on, or `None` for any other
+/// role. A check box or check menu item reports `Checked`; a GTK4 switch
+/// reports `Checked` and a toggle button (GTK4, or a web `aria-pressed`
+/// button) reports `Pressed`, so all three read either.
+fn toggle_checked(role_lower: &str, state: &StateSet) -> Option<bool> {
+    let toggle =
+        role_lower.contains("check") || role_lower == "switch" || role_lower == "toggle button";
+    toggle.then(|| state.contains(State::Checked) || state.contains(State::Pressed))
+}
 
 /// How many leading children of a menubar menu the closed-menu peek reads
 /// (gail puts a state-less tearoff item first).
@@ -6863,7 +6869,7 @@ mod coord_tests {
         is_showing_state, is_web_process_bus, listing_state, passive_marker,
         prefer_authoritative_wayland_origin, project_screen_extents, rebase_renderer_window_offset,
         scoped_component_nodes, screen_extent_rebase, select_click_target, select_web_document,
-        ApplicationSelection,
+        toggle_checked, ApplicationSelection,
     };
     use atspi::{State, StateSet};
     use std::time::Duration;
@@ -7109,6 +7115,38 @@ mod coord_tests {
         );
         assert_eq!(passive_marker("push button", true, true, Some(true)), "");
         assert_eq!(passive_marker("label", false, true, Some(false)), "");
+    }
+
+    #[test]
+    fn checkboxes_switches_and_toggle_buttons_report_whether_they_are_on() {
+        let on_states = [
+            ("check box", State::Checked),
+            ("check menu item", State::Checked),
+            ("switch", State::Checked),
+            ("toggle button", State::Pressed),
+            ("toggle button", State::Checked),
+        ];
+        for (role, on) in on_states {
+            assert_eq!(
+                toggle_checked(role, &StateSet::new(State::Enabled | on)),
+                Some(true),
+                "{role} with {on:?}"
+            );
+        }
+        for role in ["check box", "switch", "toggle button"] {
+            assert_eq!(
+                toggle_checked(role, &StateSet::new(State::Enabled)),
+                Some(false),
+                "{role} without a checked or pressed state is off"
+            );
+        }
+        for role in ["push button", "radio button", "menu item"] {
+            assert_eq!(
+                toggle_checked(role, &StateSet::new(State::Enabled | State::Checked)),
+                None,
+                "{role} is no checkbox or switch"
+            );
+        }
     }
 
     #[test]
