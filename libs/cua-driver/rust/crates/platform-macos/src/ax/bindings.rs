@@ -768,7 +768,10 @@ pub enum AccessibilityOptIn {
 /// `AXManualAccessibility` is the modern opt-in with no screen-reader side
 /// effects; `AXEnhancedUserInterface` is the legacy fallback some Electron
 /// builds expose instead (the modern attribute returns
-/// `kAXErrorAttributeUnsupported` on those builds).
+/// `kAXErrorAttributeUnsupported` on those builds). Chrome answers the legacy
+/// write with `kAXErrorNotImplemented` although it takes it: the attribute
+/// reads back true and the web tree follows about 2 s later. So a write that
+/// does not report success still counts when the attribute reads back true.
 ///
 /// # Safety
 ///
@@ -784,7 +787,9 @@ pub unsafe fn enable_chromium_accessibility(app_element: AXUIElementRef) -> Acce
         // fallback, and don't claim enablement happened.
         return AccessibilityOptIn::NotAccepted;
     }
-    if set_bool_attr_true(app_element, "AXEnhancedUserInterface") == kAXErrorSuccess {
+    if set_bool_attr_true(app_element, "AXEnhancedUserInterface") == kAXErrorSuccess
+        || copy_bool_attr(app_element, "AXEnhancedUserInterface") == Some(true)
+    {
         AccessibilityOptIn::EnhancedUserInterface
     } else {
         AccessibilityOptIn::NotAccepted

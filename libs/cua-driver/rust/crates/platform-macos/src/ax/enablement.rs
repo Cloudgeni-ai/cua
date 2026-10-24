@@ -31,7 +31,9 @@ const MATERIALIZE_RETRY_BACKOFF_SECONDS: f64 = 30.0;
 const RUN_LOOP_PUMPS_PER_POLL: u32 = 4;
 const WEB_AREA_ROLE: &str = "AXWebArea";
 const MENU_BAR_ROLE: &str = "AXMenuBar";
-const WEB_AREA_MAX_DEPTH: u32 = 10;
+/// Chrome's page web area sits about nine levels below the app; the node
+/// budget, not the depth, bounds the probe.
+const WEB_AREA_MAX_DEPTH: u32 = 16;
 const WEB_AREA_PROBE_NODES: u32 = 400;
 
 type ProcessStartStamp = (u64, u64);
@@ -245,20 +247,21 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
         Attempt::Skip => return,
         Attempt::Run { prior_timeouts } => prior_timeouts,
     };
-    let outcome = wait_outcome(
-        enable_chromium_accessibility(app_element),
-        prior_timeouts,
-        attempted_at,
-        || {
-            await_web_content(
-                || probe_web_content(app_element),
-                || {
+    let opt_in = enable_chromium_accessibility(app_element);
+    let outcome = wait_outcome(opt_in, prior_timeouts, attempted_at, || {
+        await_web_content(
+            || probe_web_content(app_element),
+            || {
+                // Chrome switches its tree on 2 s after the last
+                // `AXEnhancedUserInterface` write, so writing it again
+                // while waiting would only push the tree back.
+                if opt_in == AccessibilityOptIn::ManualAccessibility {
                     enable_chromium_accessibility(app_element);
-                },
-                pump_for,
-            )
-        },
-    );
+                }
+            },
+            pump_for,
+        )
+    });
     if let (Some(stamp), Some(wait)) = (stamp, outcome) {
         if let Ok(mut state) = ENABLEMENT_STATE.lock() {
             state.insert(pid, ProcessEnablement { stamp, wait });
