@@ -269,17 +269,73 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
     }
 }
 
-/// Whether `pid` is a Chromium-family browser or an Electron app.
+/// Whether `pid` is a Chromium-family browser or an Electron or CEF app: a
+/// known browser identity, or an app bundle that ships Chromium's engine.
 fn chromium_app(pid: i32) -> bool {
     crate::apps::bundle_id_for_pid(pid)
         .is_some_and(|bundle_id| crate::tools::is_chromium_identity(&bundle_id))
-        || crate::browser::electron_js::ElectronJs::is_electron(pid)
+        || crate::apps::path_of_pid(pid)
+            .is_some_and(|exe| ships_chromium(std::path::Path::new(&exe)))
+}
+
+/// Chromium's resource pack, which every build of the engine ships inside its
+/// framework (Chrome, Edge, Arc, Electron under any framework name, CEF).
+const CHROMIUM_RESOURCE_PACK: &str = "Resources/chrome_100_percent.pak";
+
+/// Whether an app bundle holding `exe` ships a framework with Chromium's
+/// resource pack.
+fn ships_chromium(exe: &std::path::Path) -> bool {
+    exe.ancestors()
+        .filter(|dir| dir.extension().is_some_and(|ext| ext == "app"))
+        .any(|bundle| {
+            let Ok(entries) = std::fs::read_dir(bundle.join("Contents/Frameworks")) else {
+                return false;
+            };
+            entries.flatten().any(|entry| {
+                let framework = entry.path();
+                framework.extension().is_some_and(|ext| ext == "framework")
+                    && (framework.join(CHROMIUM_RESOURCE_PACK).exists()
+                        || framework
+                            .join("Versions/Current")
+                            .join(CHROMIUM_RESOURCE_PACK)
+                            .exists())
+            })
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn a_bundle_with_chromium_s_resource_pack_ships_chromium() {
+        let root = std::env::temp_dir().join(format!("chromium-detect-{}", std::process::id()));
+        let browser = root.join("Browser.app/Contents");
+        std::fs::create_dir_all(browser.join("MacOS")).unwrap();
+        let resources = browser.join("Frameworks/Browser Framework.framework/Versions/1/Resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(resources.join("chrome_100_percent.pak"), b"").unwrap();
+        std::os::unix::fs::symlink(
+            "1",
+            browser.join("Frameworks/Browser Framework.framework/Versions/Current"),
+        )
+        .unwrap();
+        let flat = root.join("Player.app/Contents/Frameworks/Embedded.framework/Resources");
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(flat.join("chrome_100_percent.pak"), b"").unwrap();
+        let native = root.join("Notes.app/Contents");
+        std::fs::create_dir_all(native.join("MacOS")).unwrap();
+        std::fs::create_dir_all(native.join("Frameworks/Sparkle.framework/Resources")).unwrap();
+
+        assert!(ships_chromium(&browser.join("MacOS/Browser")));
+        assert!(ships_chromium(
+            &root.join("Player.app/Contents/MacOS/Player")
+        ));
+        assert!(!ships_chromium(&native.join("MacOS/Notes")));
+        assert!(!ships_chromium(std::path::Path::new("/usr/bin/true")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn drive(script: Vec<WebContent>) -> (bool, Vec<String>) {
         let log = RefCell::new(Vec::new());
