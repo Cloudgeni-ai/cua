@@ -2018,7 +2018,12 @@ fn has_word_start(haystack: &str, needle: &str) -> bool {
 }
 
 fn fold(text: &str) -> String {
-    text.trim().to_lowercase()
+    // Names compare the way readings show them: trimmed, any run of
+    // whitespace (including a newline) as one space, and in any case.
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -2134,6 +2139,23 @@ mod tests {
         assert_eq!(pick(&read, &field).unwrap().element["element_index"], 3);
         assert_eq!(role_family("Push Button"), "button");
         assert_eq!(role_family("Hyperlink"), "link");
+    }
+
+    #[test]
+    fn an_exact_name_ignores_runs_of_whitespace() {
+        let read = read(
+            vec![
+                element(1, "AXButton", "  Save\n  changes "),
+                element(2, "AXButton", "Save changes as"),
+            ],
+            "",
+        );
+        let spec = ElementSpec {
+            role: Some("button".into()),
+            name: Some("Save Changes".into()),
+            ..Default::default()
+        };
+        assert_eq!(pick(&read, &spec).unwrap().element["element_index"], 1);
     }
 
     #[test]
