@@ -1131,10 +1131,9 @@ fn popup_menu_is_open(popup: AXUIElementRef) -> bool {
     open
 }
 
-/// Close a menu this call opened, without choosing anything. `AXCancel` is
-/// enough for AppKit; Chromium's menu ignores it, so fall back to Escape sent
-/// to the app (the open menu is what receives it).
-fn dismiss_popup_menu(popup: AXUIElementRef, pid: i32) {
+/// Send `AXCancel` to the popup's menu: closes an open AppKit menu, and does
+/// nothing to one that is closed.
+fn cancel_popup_menu(popup: AXUIElementRef) {
     for child in unsafe { copy_children(popup) } {
         let role = unsafe { copy_string_attr(child, "AXRole") }.unwrap_or_default();
         if role == "AXMenu" {
@@ -1142,6 +1141,13 @@ fn dismiss_popup_menu(popup: AXUIElementRef, pid: i32) {
         }
         unsafe { CFRelease(child as _) };
     }
+}
+
+/// Close a menu this call opened, without choosing anything. `AXCancel` is
+/// enough for AppKit; Chromium's menu ignores it, so fall back to Escape sent
+/// to the app (the open menu is what receives it).
+fn dismiss_popup_menu(popup: AXUIElementRef, pid: i32) {
+    cancel_popup_menu(popup);
     let deadline = std::time::Instant::now() + POPUP_CLOSE_TIMEOUT;
     while popup_menu_is_open(popup) {
         if std::time::Instant::now() >= deadline {
@@ -1284,18 +1290,22 @@ fn select_popup_option(
     value: &str,
     element_title: &str,
 ) -> anyhow::Result<String> {
-    // A closed Chromium popup lists only its selected option. Pressing that
-    // item while the menu is closed empties the <select>, so a value it
-    // already shows is left as it is, on every route.
-    if !popup_menu_is_open(element) {
-        let current = unsafe { copy_string_attr(element, "AXValue") }.unwrap_or_default();
-        if already_selected(&current, value) {
-            return Ok(format!(
-                "✅ '{}' is already selected in AXPopUpButton [{element_index}] \
-                 \"{element_title}\"; nothing was changed.",
-                current.trim()
-            ));
+    // Pressing the item of the option a Chromium <select> already shows
+    // empties it, so a value it already shows is left as it is, on every
+    // route. Whether its menu is open cannot be told from its children:
+    // once opened, Chromium keeps listing the items under an AXMenu after
+    // the menu closes. A menu that is open is asked to close (AppKit takes
+    // AXCancel; nothing is typed into the page).
+    let current = unsafe { copy_string_attr(element, "AXValue") }.unwrap_or_default();
+    if already_selected(&current, value) {
+        if popup_menu_is_open(element) {
+            cancel_popup_menu(element);
         }
+        return Ok(format!(
+            "✅ '{}' is already selected in AXPopUpButton [{element_index}] \
+             \"{element_title}\"; nothing was changed.",
+            current.trim()
+        ));
     }
     if let Some(detail) = select_chromium_popup_by_typeahead(
         element,

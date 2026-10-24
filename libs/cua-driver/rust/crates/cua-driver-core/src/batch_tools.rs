@@ -703,10 +703,13 @@ impl Plan {
             } else {
                 // Every step but the last is followed by another, so it does
                 // not hold up the batch for the cursor glide or the full
-                // window-change report. The last step keeps them: it reports
-                // what the batch left open.
+                // window-change report. The last step keeps the full report:
+                // it says what the batch left open. A batch of one step is
+                // paced as a direct call.
                 let pacing = if index + 1 < total {
                     crate::step_pacing::StepPacing::Batched
+                } else if total > 1 {
+                    crate::step_pacing::StepPacing::Last
                 } else {
                     crate::step_pacing::StepPacing::Single
                 };

@@ -271,8 +271,9 @@ of the window watch above. A call that is one step of a `run_steps` batch or a
 both for it: the step does not wait for the cursor to arrive, and looks once,
 after 25 ms, for a window change. The cursor keeps gliding and the watch keeps running
 detached, as above, so a window that opens late is still reported on the next
-action's result. The last step of a `run_steps` batch, and every direct call,
-keep the full waits, so the batch's final result still reports what it left
+action's result. The last step of a `run_steps` batch keeps the full window
+watch but not the cursor wait, and every direct call (or a batch of one step)
+keeps both, so the batch's final result still reports what it left
 open. A script has no last step the driver can know in advance; read the window
 with `getState()` or `waitFor()` after the action that opens something.
 

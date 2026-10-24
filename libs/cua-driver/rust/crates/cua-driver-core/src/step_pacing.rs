@@ -13,8 +13,8 @@
 //! both waits (see [`BATCH_GLIDE_WAIT`] and [`BATCH_REPORT_WINDOW`]). The
 //! cursor keeps gliding and the window watch keeps running detached, so only
 //! the time the step is held up changes. A direct call keeps the full waits,
-//! and so does the last step of a `run_steps` batch, which reports what the
-//! batch left open.
+//! and the last step of a `run_steps` batch ([`StepPacing::Last`]) keeps the
+//! full window watch, which reports what the batch left open.
 //!
 //! The marker is a task-local set by the batch executors. Callers cannot set it
 //! through arguments, and a daemon operator can turn the shortening off with
@@ -43,11 +43,14 @@ pub const BATCH_REPORT_WINDOW: Duration = Duration::from_millis(25);
 /// The role of the action being dispatched within the current tool call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StepPacing {
-    /// A direct call, or the last step of a batch: full waits.
+    /// A direct call, or a batch of one step: full waits.
     #[default]
     Single,
     /// A step that another step follows: shortened waits.
     Batched,
+    /// The last step of a batch of several: the full window watch, so the
+    /// batch's result reports what it left open, and no wait for the glide.
+    Last,
 }
 
 tokio::task_local! {
@@ -86,7 +89,7 @@ fn resolve(pacing: StepPacing, env: Option<&str>) -> StepPacing {
 pub fn glide_wait_limit(direct: Duration) -> Duration {
     match current() {
         StepPacing::Single => direct,
-        StepPacing::Batched => direct.min(BATCH_GLIDE_WAIT),
+        StepPacing::Batched | StepPacing::Last => direct.min(BATCH_GLIDE_WAIT),
     }
 }
 
@@ -94,7 +97,7 @@ pub fn glide_wait_limit(direct: Duration) -> Duration {
 /// window of a direct call.
 pub fn report_window(direct: Duration) -> Duration {
     match current() {
-        StepPacing::Single => direct,
+        StepPacing::Single | StepPacing::Last => direct,
         StepPacing::Batched => direct.min(BATCH_REPORT_WINDOW),
     }
 }
@@ -129,6 +132,15 @@ mod tests {
 
     #[tokio::test]
     async fn the_caps_never_lengthen_a_shorter_wait() {
+        scope(StepPacing::Last, async {
+            // The last step of a batch keeps the full watch, not the glide.
+            assert_eq!(glide_wait_limit(Duration::from_secs(8)), BATCH_GLIDE_WAIT);
+            assert_eq!(
+                report_window(Duration::from_millis(300)),
+                Duration::from_millis(300)
+            );
+        })
+        .await;
         scope(StepPacing::Batched, async {
             let short = Duration::from_millis(10);
             assert!(glide_wait_limit(short) <= short);

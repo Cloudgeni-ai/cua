@@ -178,7 +178,7 @@ fn text(result: &ToolResult) -> String {
 
 #[tokio::test]
 async fn every_step_but_the_last_is_paced_as_a_batched_step() {
-    use crate::step_pacing::StepPacing::{Batched, Single};
+    use crate::step_pacing::StepPacing::{Batched, Last};
     let harness = Harness::new();
     let result = harness
         .run(json!({"steps": [
@@ -200,7 +200,7 @@ async fn every_step_but_the_last_is_paced_as_a_batched_step() {
         vec![
             ("click".to_owned(), Batched),
             ("type_text".to_owned(), Batched),
-            ("press_key".to_owned(), Single),
+            ("press_key".to_owned(), Last),
         ]
     );
 }
