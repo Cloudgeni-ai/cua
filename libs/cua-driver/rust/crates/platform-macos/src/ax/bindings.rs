@@ -29,6 +29,7 @@ pub type AXError = c_int;
 pub const kAXErrorSuccess: AXError = 0;
 pub const kAXErrorFailure: AXError = -25200;
 pub const kAXErrorInvalidUIElement: AXError = -25202;
+pub const kAXErrorCannotComplete: AXError = -25204;
 pub const kAXErrorAttributeUnsupported: AXError = -25205;
 pub const kAXErrorActionUnsupported: AXError = -25206;
 pub const kAXErrorNoValue: AXError = -25212;
@@ -45,6 +46,9 @@ pub const kAXValueCGPointType: AXValueType = 1;
 pub const kAXValueCGSizeType: AXValueType = 2;
 pub const kAXValueCGRectType: AXValueType = 3;
 pub const kAXValueCFRangeType: AXValueType = 4;
+/// An `AXUIElementCopyMultipleAttributeValues` entry for an attribute the
+/// element could not answer.
+pub const kAXValueAXErrorType: AXValueType = 5;
 pub const kAXValueIllegalType: AXValueType = 1_000;
 
 // ── Link to AXUIElement functions ────────────────────────────────────────────
@@ -55,6 +59,15 @@ extern "C" {
         element: AXUIElementRef,
         attribute: CFStringRef,
         value: *mut CFTypeRef,
+    ) -> AXError;
+    /// Several attributes of one element in one request to the application.
+    /// With `options` 0 an attribute the element cannot answer is an AXValue
+    /// of type [`kAXValueAXErrorType`] in its place.
+    pub fn AXUIElementCopyMultipleAttributeValues(
+        element: AXUIElementRef,
+        attributes: CFArrayRef,
+        options: u32,
+        values: *mut CFArrayRef,
     ) -> AXError;
     pub fn AXUIElementCopyAttributeNames(
         element: AXUIElementRef,
@@ -126,6 +139,7 @@ pub unsafe fn element_at_screen_position(pid: i32, x: f64, y: f64) -> Option<AXU
 extern "C" {
     pub fn AXValueCreate(the_type: AXValueType, value_ptr: *const c_void) -> AXValueRef;
     pub fn AXValueGetType(value: AXValueRef) -> AXValueType;
+    pub fn AXValueGetTypeID() -> CFTypeID;
     pub fn AXValueGetValue(
         value: AXValueRef,
         the_type: AXValueType,
@@ -306,7 +320,7 @@ pub struct StringishAttrValue {
 }
 
 /// Convert a borrowed CF value without taking ownership of it.
-unsafe fn coerce_stringish_value(value: CFTypeRef) -> Option<StringishAttrValue> {
+pub(crate) unsafe fn coerce_stringish_value(value: CFTypeRef) -> Option<StringishAttrValue> {
     use core_foundation::boolean::CFBoolean;
     use core_foundation::number::CFNumber;
     let type_id = core_foundation::base::CFGetTypeID(value);

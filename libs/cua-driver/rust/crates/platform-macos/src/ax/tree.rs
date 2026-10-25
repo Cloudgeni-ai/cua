@@ -11,6 +11,7 @@
 //! - AXStaticText with no title/value is omitted.
 //! - Tree is walked depth-first; element_index is assigned in DFS order.
 
+use super::attributes::{NodeAttributes, ReadFailure};
 use super::bindings::*;
 use super::launch::{is_still_launching, LaunchStep, LaunchWait};
 use super::window_scope::{decide_window_scope, ScopeDecision, TopLevelCandidate, WindowScope};
@@ -45,6 +46,34 @@ const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 2.0;
 
 unsafe fn set_messaging_timeout(element: AXUIElementRef) {
     let _ = AXUIElementSetMessagingTimeout(element, AX_MESSAGING_TIMEOUT_SECONDS);
+}
+
+/// The shortest messaging timeout a budgeted read is given: below it, an app
+/// that answers at all is cut off mid-answer.
+const AX_MIN_BUDGETED_TIMEOUT_SECONDS: f32 = 0.1;
+
+/// [`set_messaging_timeout`], shortened to what is left of a timed walk.
+unsafe fn set_messaging_timeout_within(element: AXUIElementRef, budget: &WalkBudget) {
+    let seconds = budget
+        .remaining()
+        .map_or(AX_MESSAGING_TIMEOUT_SECONDS, |left| {
+            left.as_secs_f32().clamp(
+                AX_MIN_BUDGETED_TIMEOUT_SECONDS,
+                AX_MESSAGING_TIMEOUT_SECONDS,
+            )
+        });
+    let _ = AXUIElementSetMessagingTimeout(element, seconds);
+}
+
+/// Gives an element the ordinary [`set_messaging_timeout`] back when dropped,
+/// whichever way the walk leaves it.
+struct RestoreMessagingTimeout(AXUIElementRef);
+
+impl Drop for RestoreMessagingTimeout {
+    fn drop(&mut self) {
+        // SAFETY: the walk holds the element for as long as this guard lives.
+        unsafe { set_messaging_timeout(self.0) }
+    }
 }
 
 /// A single node in the AX tree.
@@ -452,9 +481,35 @@ unsafe fn walk_element(
 
     // Messaging timeouts are per AX object, not inherited from the application
     // element, so every descendant must be bounded before any attribute read.
-    set_messaging_timeout(element);
+    // Every request this walk makes of the element is bounded by what is left
+    // of the walk's time budget, so a slow app cannot hold the walk past its
+    // deadline; once the walk is done with it the element gets the ordinary
+    // timeout back for the actions taken on it later.
+    let _restore = RestoreMessagingTimeout(element);
+    set_messaging_timeout_within(element, budget);
+    // Every attribute below comes from this one request (see `attributes`).
+    let read = NodeAttributes::read(element);
+    let mut attributes = match read {
+        Ok(attributes) => attributes,
+        // The budget ran out while the app was answering: the element was
+        // not read, so it counts among the unread, not as an empty row.
+        Err(ReadFailure::TimedOut) if budget.expired() => {
+            budget.unread_for_timeout();
+            return;
+        }
+        // A dead or unanswering element reads as nothing, as it always did.
+        Err(_) => NodeAttributes::default(),
+    };
+    // Children the app did not answer in time are missing from the tree, so
+    // the read says it was cut off rather than showing a childless element.
+    if attributes.children_timed_out {
+        budget.children_unread_for_timeout();
+    }
 
-    let role = copy_string_attr(element, "AXRole").unwrap_or_else(|| "AXUnknown".into());
+    let role = attributes
+        .role
+        .clone()
+        .unwrap_or_else(|| "AXUnknown".into());
 
     let in_web_content = in_web_content || is_web_content_role(&role);
     if in_web_content && !include_web_content {
@@ -466,7 +521,7 @@ unsafe fn walk_element(
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
-        let children = copy_children(element);
+        let children = attributes.take_children();
         for child in children {
             walk_element(
                 child,
@@ -490,20 +545,21 @@ unsafe fn walk_element(
     // This is critical for Calculator where AXTitle="" but AXDescription="2"
     // (digit buttons). Merging them would produce "2" (quoted) instead of (2)
     // (parens), breaking _find_calc_button which searches for "(2)".
-    let title = copy_string_attr(element, "AXTitle");
-    // Read AXValue once with enough type information to preserve the existing
+    let title = attributes.title.clone();
+    // AXValue keeps enough type information to preserve the existing
     // string-only markdown while also exposing numeric/boolean control state.
-    let copied_value = copy_stringish_attr(element, "AXValue");
+    let copied_value = attributes.value.take();
     let value = copied_value
         .as_ref()
         .and_then(|copied| copied.string_value.clone());
     // AXPlaceholderValue as fallback for empty text fields.
     let value = value
         .filter(|v| !v.trim().is_empty())
-        .or_else(|| copy_string_attr(element, "AXPlaceholderValue"));
-    let description = copy_string_attr(element, "AXDescription");
-    let identifier = copy_string_attr(element, "AXIdentifier");
-    let help = copy_string_attr(element, "AXHelp").filter(|h| !h.trim().is_empty());
+        .or_else(|| attributes.placeholder.clone());
+    let description = attributes.description.clone();
+    let identifier = attributes.identifier.clone();
+    let help = attributes.help.clone().filter(|h| !h.trim().is_empty());
+    set_messaging_timeout_within(element, budget);
     let actions = copy_action_names(element);
 
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
@@ -518,22 +574,23 @@ unsafe fn walk_element(
     // field but unable to call set_value on it. Probe writability only for the
     // small family of value controls so arbitrary display nodes do not pay an
     // extra AX round trip.
-    let value_settable = actions.is_empty()
-        && role_supports_value_addressing(&role)
-        && is_attribute_settable(element, "AXValue");
+    let value_settable = actions.is_empty() && role_supports_value_addressing(&role) && {
+        set_messaging_timeout_within(element, budget);
+        is_attribute_settable(element, "AXValue")
+    };
     // A closed submenu can keep its descendants in AXChildren while reporting
     // those controls disabled. Never assign such a row a live element index:
     // the same native state also causes dispatch to refuse it, and exposing an
     // index for it invites agents to retain an unusable menu target.
     let enabled = if !actions.is_empty() || value_settable {
-        copy_bool_attr(element, "AXEnabled")
+        attributes.enabled
     } else {
         None
     };
     let is_actionable = is_addressable(!actions.is_empty(), value_settable, enabled);
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
-        let children = copy_children(element);
+        let children = attributes.take_children();
         for child in children {
             walk_element(
                 child,
@@ -553,7 +610,7 @@ unsafe fn walk_element(
     }
 
     let element_ptr = element as usize;
-    let frame = element_screen_rect(element);
+    let frame = attributes.frame;
     // Structured `elements` only contains actionable nodes. Keep all new AX
     // round-trips behind that same gate so display-only rows pay no cost.
     let control_state = read_control_state_if_actionable(is_actionable, || ControlState {
@@ -563,13 +620,15 @@ unsafe fn walk_element(
             .or_else(|| value.clone())
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty()),
-        value_description: copy_string_attr(element, "AXValueDescription")
+        value_description: attributes
+            .value_description
+            .clone()
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty()),
-        min_value: copy_number_attr(element, "AXMinValue"),
-        max_value: copy_number_attr(element, "AXMaxValue"),
+        min_value: attributes.min_value,
+        max_value: attributes.max_value,
         enabled,
-        selected: copy_bool_attr(element, "AXSelected"),
+        selected: attributes.selected,
     });
     let node = if is_actionable {
         let idx = *counter;
@@ -657,7 +716,7 @@ unsafe fn walk_element(
     // and ate the node budget before the window content.
     let collapse_here = role == "AXMenuBarItem"
         && MENUS_COLLAPSED.with(std::cell::Cell::get)
-        && copy_bool_attr(element, "AXSelected") != Some(true);
+        && attributes.selected != Some(true);
     let line = if role == "AXMenuBar" && MENUS_COLLAPSED.with(std::cell::Cell::get) {
         format!("{} {COLLAPSED_MENU_NOTE}", format_node_line(&node))
     } else {
@@ -669,7 +728,7 @@ unsafe fn walk_element(
         return;
     }
 
-    let children = copy_children(element);
+    let children = attributes.take_children();
     for child in children {
         walk_element(
             child,

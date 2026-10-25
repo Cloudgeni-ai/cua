@@ -113,9 +113,38 @@ impl WalkBudget {
             .is_some_and(|started| started.elapsed() >= self.timeout)
     }
 
+    /// Wall-clock time left, or `None` for a node-only budget. Backends bound
+    /// each accessibility request by it so one slow answer cannot carry the
+    /// walk far past its deadline.
+    pub fn remaining(&self) -> Option<Duration> {
+        self.time_bounded.then(|| {
+            self.started.map_or(self.timeout, |started| {
+                self.timeout.saturating_sub(started.elapsed())
+            })
+        })
+    }
+
+    /// The node admitted last could not be read before the time ran out: it
+    /// counts as discovered but not visited, and the walk stops.
+    pub fn unread_for_timeout(&mut self) {
+        if self.visited > 0 {
+            self.visited -= 1;
+            self.pending += 1;
+        }
+        self.stop.get_or_insert(WalkStop::Timeout);
+    }
+
     /// Record that the walk ran out of time outside [`WalkBudget::admit`]
     /// (a bulk fetch that returned after the deadline).
     pub fn stop_for_timeout(&mut self) {
+        self.stop.get_or_insert(WalkStop::Timeout);
+    }
+
+    /// The node visited last was read, but its children did not come back
+    /// in time: they count as discovered but not visited (as one, since
+    /// their number is unknown), and the walk stops.
+    pub fn children_unread_for_timeout(&mut self) {
+        self.pending += 1;
         self.stop.get_or_insert(WalkStop::Timeout);
     }
 
@@ -288,6 +317,46 @@ mod tests {
         let mut budget = WalkBudget::new(50, 100);
         std::thread::sleep(Duration::from_millis(80));
         assert!(budget.admit(), "setup time must not exhaust the budget");
+    }
+
+    #[test]
+    fn remaining_time_bounds_each_read_of_a_timed_walk_only() {
+        assert_eq!(WalkBudget::nodes_only(10).remaining(), None);
+        let mut budget = WalkBudget::new(1_000, 10);
+        assert_eq!(budget.remaining(), Some(Duration::from_millis(1_000)));
+        assert!(budget.admit());
+        let left = budget.remaining().unwrap();
+        assert!(left <= Duration::from_millis(1_000) && left > Duration::from_millis(500));
+        let expired = WalkBudget::new(0, 10);
+        assert_eq!(expired.remaining(), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn a_node_cut_off_by_the_deadline_counts_as_unread() {
+        let mut budget = WalkBudget::new(60_000, 10);
+        assert!(budget.admit());
+        assert!(budget.admit());
+        budget.unread_for_timeout();
+        assert!(
+            !budget.admit(),
+            "the walk stops once a read ran out of time"
+        );
+        let outcome = budget.outcome();
+        assert_eq!(outcome.reason(), Some("timeout"));
+        assert_eq!((outcome.nodes_visited, outcome.nodes_pending), (1, 2));
+    }
+
+    #[test]
+    fn children_that_did_not_come_back_in_time_count_as_unread() {
+        let mut budget = WalkBudget::new(60_000, 10);
+        assert!(budget.admit());
+        budget.children_unread_for_timeout();
+        assert!(!budget.admit(), "the walk stops");
+        let outcome = budget.outcome();
+        assert!(outcome.truncated());
+        assert_eq!(outcome.reason(), Some("timeout"));
+        // The node itself was read; its children and the refused node were not.
+        assert_eq!((outcome.nodes_visited, outcome.nodes_pending), (1, 2));
     }
 
     #[test]
