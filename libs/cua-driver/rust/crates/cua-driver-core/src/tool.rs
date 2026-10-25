@@ -2310,11 +2310,19 @@ impl ToolRegistry {
         // back to the uncapped capture before any platform interprets them.
         crate::desktop_capture_scale::map_desktop_args(&mut args);
         crate::tool_activity::note_tool_activity();
+        // An action on a process: the platform may make that process's next
+        // read wait for what the action set off. It is reported finished when
+        // the guard drops, also if this call is cancelled or panics.
+        let action_activity = crate::action_record::is_action_tool(resolved_name)
+            .then(|| args.get("pid").and_then(Value::as_i64))
+            .flatten()
+            .map(crate::tool_activity::ActionActivity::start);
         let mut result = crate::recording::scope_dispatch_click_capture(
             pending_turn.as_ref(),
             tool.invoke(args.clone()),
         )
         .await;
+        drop(action_activity);
         match resolved_name {
             "get_desktop_state" if result.is_error != Some(true) => {
                 crate::desktop_capture_scale::record_desktop_state(
@@ -3672,6 +3680,43 @@ mod runtime_isolation_tests {
         def: super::ToolDef,
     }
 
+    /// A `click` that never returns, or that panics.
+    struct StuckClick {
+        panics: bool,
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for StuckClick {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> crate::protocol::ToolResult {
+            if self.panics {
+                panic!("the click panicked");
+            }
+            std::future::pending().await
+        }
+    }
+
+    fn stuck_click_registry(panics: bool) -> Arc<super::ToolRegistry> {
+        let mut registry = super::ToolRegistry::new_with_protected_consent_provider(None);
+        registry.register(Box::new(StuckClick {
+            panics,
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "test input".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        Arc::new(registry)
+    }
+
     struct AttestedProbe {
         hits: Arc<AtomicUsize>,
         scope: serde_json::Value,
@@ -4593,6 +4638,84 @@ resources:
             provider.requests.load(Ordering::SeqCst),
             0,
             "routine standard recording is promptless"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_action_on_a_process_is_reported_before_and_after_it_runs() {
+        use crate::tool_activity::ActionPhase;
+        static SEEN: Mutex<Vec<(i64, ActionPhase)>> = Mutex::new(Vec::new());
+        crate::tool_activity::set_action_activity_fn(|pid, phase| {
+            SEEN.lock().unwrap().push((pid, phase));
+        });
+        let pid = 4_242_424;
+        let seen_for = |pid: i64| {
+            SEEN.lock()
+                .unwrap()
+                .iter()
+                .filter(|(seen_pid, _)| *seen_pid == pid)
+                .map(|(_, phase)| *phase)
+                .collect::<Vec<_>>()
+        };
+        let seen = || seen_for(pid);
+        let hits = Arc::new(AtomicUsize::new(0));
+        observation_registry(None, hits.clone())
+            .invoke_with_context(
+                "get_window_state",
+                serde_json::json!({"pid": pid, "window_id": 7}),
+                standard_context(),
+            )
+            .await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(seen().is_empty(), "a read is not an action");
+        let result = input_registry(None, hits.clone())
+            .invoke_with_context(
+                "click",
+                serde_json::json!({"pid": pid, "window_id": 7, "session": "control", "x": 10, "y": 20}),
+                standard_context(),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(seen(), vec![ActionPhase::Started, ActionPhase::Finished]);
+
+        // A cancelled action (its call dropped mid-way) is reported finished.
+        let cancelled = 4_242_425;
+        let call = async move {
+            stuck_click_registry(false)
+                .invoke_with_context(
+                    "click",
+                    serde_json::json!({"pid": cancelled, "window_id": 7, "session": "control", "x": 10, "y": 20}),
+                    standard_context(),
+                )
+                .await
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), call)
+                .await
+                .is_err(),
+            "the click never returns"
+        );
+        assert_eq!(
+            seen_for(cancelled),
+            vec![ActionPhase::Started, ActionPhase::Finished]
+        );
+
+        // So is one that panics.
+        let panicked = 4_242_426;
+        let call = tokio::spawn(async move {
+            stuck_click_registry(true)
+                .invoke_with_context(
+                    "click",
+                    serde_json::json!({"pid": panicked, "window_id": 7, "session": "control", "x": 10, "y": 20}),
+                    standard_context(),
+                )
+                .await
+        });
+        assert!(call.await.unwrap_err().is_panic());
+        assert_eq!(
+            seen_for(panicked),
+            vec![ActionPhase::Started, ActionPhase::Finished]
         );
     }
 

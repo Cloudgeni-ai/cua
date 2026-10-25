@@ -286,50 +286,73 @@ impl Tool for GetWindowStateTool {
         let collapse_menus = query.as_deref().is_none_or(|q| q.trim().is_empty())
             && ((!view.full_output && !observation_only)
                 || cua_driver_core::window_state_view::menu_bar_collapsed());
-        // Start the screenshot grab before the tree walk so the two overlap:
-        // ScreenCaptureKit and the accessibility walk use independent system
-        // services, and the read otherwise pays for them one after the other.
-        let prefetched_capture = prefetch_capture(should_capture, want_tree, move || {
-            crate::capture::screenshot_window_bytes(window_id)
-        });
-        let (tree_result, prepared_snapshot) = if want_tree {
-            let q = query.clone();
-            // `timeout_ms` bounds the walk itself: it returns the partial tree
-            // when the budget runs out. The outer deadline is only a backstop
-            // for an AX call that ignores the per-element messaging timeout
-            // (dropping a spawn_blocking JoinHandle cannot cancel it).
-            let walk_future = tokio::task::spawn_blocking(move || {
-                let tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
-                    crate::ax::tree::walk_tree_budgeted(
-                        pid,
-                        Some(window_id),
-                        q.as_deref(),
-                        max_depth,
-                        cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements),
-                    )
-                });
-                let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
-                (tree, payload)
+        // The first read of a process after an action on it waits until the
+        // changes the action set off are over, so it shows the action's
+        // result rather than the screen before it (see `ax::activity`).
+        // Steps of a batch have their own waits; trusted observation-only
+        // reads (previews, verification) never wait.
+        let mut settle = if observation_only || cua_driver_core::step_pacing::in_batch() {
+            None
+        } else {
+            crate::ax::activity::settle_before_read(pid, window_id).await
+        };
+        let (prefetched_capture, tree_result, prepared_snapshot) = loop {
+            let walk_started = std::time::Instant::now();
+            // Start the screenshot grab before the tree walk so the two
+            // overlap: ScreenCaptureKit and the accessibility walk use
+            // independent system services, and the read otherwise pays for
+            // them one after the other.
+            let prefetched_capture = prefetch_capture(should_capture, want_tree, move || {
+                crate::capture::screenshot_window_bytes(window_id)
             });
-            // A launching app is waited on for up to `timeout_ms` before the
-            // walk's own `timeout_ms` starts (see `ax::launch`).
-            let backstop =
-                std::time::Duration::from_millis(timeout_ms) * 2 + AX_WALK_BACKSTOP_GRACE;
-            match tokio::time::timeout(backstop, walk_future).await {
-                Ok(Ok((tree, payload))) => (Some(tree), Some(payload)),
-                Ok(Err(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
-                Err(_elapsed) => {
-                    return ToolResult::error(format!(
-                        "AX tree walk for pid={pid} did not return within {} s: an \
-                         accessibility call stopped answering past the {timeout_ms} ms \
-                         timeout_ms budget. Retry, or act by pixel (x,y) off a \
-                         screenshot-only get_window_state (include_accessibility_tree:false).",
-                        backstop.as_secs()
-                    ));
+            let (tree_result, prepared_snapshot) = if want_tree {
+                let q = query.clone();
+                // `timeout_ms` bounds the walk itself: it returns the partial
+                // tree when the budget runs out. The outer deadline is only a
+                // backstop for an AX call that ignores the per-element
+                // messaging timeout (dropping a spawn_blocking JoinHandle
+                // cannot cancel it).
+                let walk_future = tokio::task::spawn_blocking(move || {
+                    let tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
+                        crate::ax::tree::walk_tree_budgeted(
+                            pid,
+                            Some(window_id),
+                            q.as_deref(),
+                            max_depth,
+                            cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements),
+                        )
+                    });
+                    let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
+                    (tree, payload)
+                });
+                // A launching app is waited on for up to `timeout_ms` before
+                // the walk's own `timeout_ms` starts (see `ax::launch`).
+                let backstop =
+                    std::time::Duration::from_millis(timeout_ms) * 2 + AX_WALK_BACKSTOP_GRACE;
+                match tokio::time::timeout(backstop, walk_future).await {
+                    Ok(Ok((tree, payload))) => (Some(tree), Some(payload)),
+                    Ok(Err(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
+                    Err(_elapsed) => {
+                        return ToolResult::error(format!(
+                            "AX tree walk for pid={pid} did not return within {} s: an \
+                             accessibility call stopped answering past the {timeout_ms} ms \
+                             timeout_ms budget. Retry, or act by pixel (x,y) off a \
+                             screenshot-only get_window_state (include_accessibility_tree:false).",
+                            backstop.as_secs()
+                        ));
+                    }
+                }
+            } else {
+                (None, None)
+            };
+            // A window that changed while it was read may show the change
+            // half way: read it again once the change is over.
+            if let Some(read) = settle.as_mut() {
+                if read.read_again(walk_started).await {
+                    continue;
                 }
             }
-        } else {
-            (None, None)
+            break (prefetched_capture, tree_result, prepared_snapshot);
         };
 
         // The window can close, or its CGWindow can be re-parented onto another
@@ -641,6 +664,14 @@ impl Tool for GetWindowStateTool {
                 Issue #22865: use `max_elements` / `max_depth` to bound the \
                 AX walk on apps with very large trees."
         });
+        if let Some(report) = settle.as_ref().map(|read| read.report()) {
+            structured["settle"] = serde_json::json!({
+                "state": report.settle.as_str(),
+                "waited_ms": report.waited.as_millis() as u64,
+                "changes": report.changes,
+                "reads": report.reads,
+            });
+        }
         if query.is_some() {
             structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
         }

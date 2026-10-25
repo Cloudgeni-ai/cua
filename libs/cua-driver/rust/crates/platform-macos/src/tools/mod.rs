@@ -998,6 +998,9 @@ pub fn register_all(
     host_owns_permission_ux: bool,
     host_bundle_id: Option<String>,
 ) {
+    // Make the first read after an action wait for what the action set off
+    // (see `ax::activity`).
+    crate::ax::activity::install();
     let state = Arc::new(ToolState::new_with_capture_service(
         registry.capture_service(),
         cursor_overlay_available,
