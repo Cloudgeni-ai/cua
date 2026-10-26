@@ -161,6 +161,53 @@ fn toggle_press_shows(role: &str, before: &str, now: &str) -> bool {
     now != before && (role != "AXRadioButton" || now == "1")
 }
 
+/// Whether a background pixel click's AXPress on the hit-tested element shows
+/// that it acted. A checkbox or an unselected radio button shows a press in
+/// its own value; Chromium's tab strip accepts AXPress on a background tab
+/// (an `AXRadioButton`) and leaves it unselected, which used to be reported
+/// as a pressed click. When the value does not show the press, the caller
+/// delivers the routed pixel click instead. Elements whose value cannot show
+/// a press (buttons, a selected radio button) count as acted, as before.
+fn pixel_press_shown(
+    role: &str,
+    before: Option<&str>,
+    read: impl FnMut() -> Option<String>,
+) -> bool {
+    let Some(before) = before.filter(|before| match role {
+        "AXCheckBox" => true,
+        "AXRadioButton" => *before != "1",
+        _ => false,
+    }) else {
+        return true;
+    };
+    settled_value(
+        |now| toggle_press_shows(role, before, now),
+        read,
+        SELECTION_READBACK_TIMEOUT,
+        SELECTION_READBACK_POLL,
+        SELECTION_READBACK_STABILITY,
+    )
+    .is_some()
+}
+
+/// Chromium performs AXPress on any node of a page as a click (a `div` with
+/// a click handler shows as `AXStaticText`), but lists AXPress only in some
+/// accessibility modes: with the manual opt-in CUA uses, a page's buttons list
+/// only AXShowMenu and AXScrollToVisible. A press on Chromium web content is
+/// therefore not a likely no-op, and is not redirected to a container's
+/// selection.
+fn chromium_web_content_takes_press(
+    ax_action: &str,
+    advertised: &[String],
+    chromium: impl FnOnce() -> bool,
+    ancestor_roles: impl FnOnce() -> Vec<String>,
+) -> bool {
+    ax_action == "AXPress"
+        && !advertised.iter().any(|action| action == "AXPress")
+        && chromium()
+        && ancestor_roles().iter().any(|role| role == "AXWebArea")
+}
+
 /// The value `read` returns when, before `timeout`, it satisfies `shows` and
 /// a second read `stability` later agrees on it. Some apps (Finder's toolbar
 /// view switcher) apply a press and still return an AX error.
@@ -949,8 +996,7 @@ impl Tool for ClickTool {
                             .unwrap_or_default();
                             is_text_entry_role(&role)
                                 && crate::input::ax_actions::element_has_keyboard_focus(
-                                    pid,
-                                    element,
+                                    pid, element,
                                 )
                         })
                         .await
@@ -1253,9 +1299,16 @@ impl Tool for ClickTool {
                     let delivered = if focus_only {
                         crate::input::ax_actions::focus_element(element as usize).is_ok()
                     } else {
+                        let role = copy_string_attr(element, "AXRole").unwrap_or_default();
+                        let read_value = || {
+                            crate::ax::bindings::copy_stringish_attr(element, "AXValue")
+                                .map(|value| value.state_value)
+                        };
+                        let before = read_value();
                         let press = core_foundation::string::CFString::new("AXPress");
                         AXUIElementPerformAction(element, press.as_concrete_TypeRef())
                             == kAXErrorSuccess
+                            && pixel_press_shown(&role, before.as_deref(), read_value)
                     };
                     CFRelease(element as _);
                     Ok(delivered)
@@ -1720,7 +1773,15 @@ fn perform_ax_click(
 
     // Capture advertised actions BEFORE dispatching so we can detect silent no-ops
     // (AX returns success even when the element doesn't advertise the action).
-    let advertised = unsafe { copy_action_names(element) };
+    let mut advertised = unsafe { copy_action_names(element) };
+    if chromium_web_content_takes_press(
+        ax_action,
+        &advertised,
+        || crate::ax::enablement::chromium_app(pid),
+        || unsafe { ancestor_roles(element) },
+    ) {
+        advertised.push("AXPress".to_owned());
+    }
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
     let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
@@ -2205,6 +2266,72 @@ mod tests {
         assert_eq!(settled(vec![Some("1"), None]), None, "second read failed");
         assert_eq!(settled(vec![Some("0")]), None, "never moved");
         assert_eq!(settled(vec![None]), None, "unreadable");
+    }
+
+    #[test]
+    fn a_pixel_press_a_toggle_does_not_show_falls_through_to_the_pixel_click() {
+        let reads = |value: &'static str| move || Some(value.to_owned());
+        // Chromium's tab strip: AXPress on a background tab is accepted and
+        // the tab stays unselected.
+        assert!(!pixel_press_shown("AXRadioButton", Some("0"), reads("0")));
+        assert!(!pixel_press_shown("AXCheckBox", Some("0"), reads("0")));
+        assert!(!pixel_press_shown("AXCheckBox", Some("1"), reads("1")));
+        assert!(pixel_press_shown("AXRadioButton", Some("0"), reads("1")));
+        assert!(pixel_press_shown("AXCheckBox", Some("0"), reads("1")));
+        assert!(pixel_press_shown("AXCheckBox", Some("1"), reads("0")));
+    }
+
+    #[test]
+    fn a_pixel_press_counts_as_acted_where_no_value_can_show_it() {
+        let unread = || -> Option<String> { panic!("no read-back expected") };
+        assert!(pixel_press_shown("AXButton", Some("0"), unread));
+        assert!(
+            pixel_press_shown("AXRadioButton", Some("1"), unread),
+            "already selected"
+        );
+        assert!(pixel_press_shown("AXCheckBox", None, unread), "no value");
+        assert!(pixel_press_shown("AXStaticText", None, unread));
+    }
+
+    #[test]
+    fn a_press_on_chromium_web_content_is_taken_although_not_listed() {
+        let listed = |actions: &[&str]| actions.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let web = || {
+            vec![
+                "AXGroup".to_owned(),
+                "AXWebArea".to_owned(),
+                "AXWindow".to_owned(),
+            ]
+        };
+        let native = || vec!["AXGroup".to_owned(), "AXWindow".to_owned()];
+        let chrome_lists = listed(&["AXShowMenu", "AXScrollToVisible"]);
+        assert!(chromium_web_content_takes_press(
+            "AXPress",
+            &chrome_lists,
+            || true,
+            web
+        ));
+        assert!(
+            !chromium_web_content_takes_press("AXPress", &chrome_lists, || false, web),
+            "WebKit"
+        );
+        assert!(
+            !chromium_web_content_takes_press("AXPress", &chrome_lists, || true, native),
+            "browser UI"
+        );
+        assert!(!chromium_web_content_takes_press(
+            "AXShowMenu",
+            &chrome_lists,
+            || true,
+            web
+        ));
+        let unasked = || -> bool { panic!("already listed") };
+        assert!(!chromium_web_content_takes_press(
+            "AXPress",
+            &listed(&["AXPress"]),
+            unasked,
+            web
+        ));
     }
 
     /// Surface 5: schema must advertise the new `button` field with the three

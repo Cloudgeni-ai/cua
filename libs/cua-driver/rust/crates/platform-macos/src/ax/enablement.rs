@@ -271,7 +271,7 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
 
 /// Whether `pid` is a Chromium-family browser or an Electron or CEF app: a
 /// known browser identity, or an app bundle that ships Chromium's engine.
-fn chromium_app(pid: i32) -> bool {
+pub(crate) fn chromium_app(pid: i32) -> bool {
     crate::apps::bundle_id_for_pid(pid)
         .is_some_and(|bundle_id| crate::tools::is_chromium_identity(&bundle_id))
         || crate::apps::path_of_pid(pid)
