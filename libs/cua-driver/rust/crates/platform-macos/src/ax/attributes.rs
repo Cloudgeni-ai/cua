@@ -222,6 +222,24 @@ impl Drop for NodeAttributes {
     }
 }
 
+/// Read an element, asking once more when the first request timed out and
+/// `time_left` says the read still has time for it.
+///
+/// WebKit answers the first request made of an element that hosts
+/// out-of-process web content (the group inside a `WKWebView`, before its
+/// web area) with a timeout while it connects to the web content process,
+/// then answers the next request normally. Reading such an element only
+/// once dropped the whole web page from the first read of the window.
+pub fn read_retrying_once<T>(
+    mut read: impl FnMut() -> Result<T, ReadFailure>,
+    time_left: impl Fn() -> bool,
+) -> Result<T, ReadFailure> {
+    match read() {
+        Err(ReadFailure::TimedOut) if time_left() => read(),
+        first => first,
+    }
+}
+
 unsafe fn is_error_value(value: CFTypeRef) -> bool {
     CFGetTypeID(value) == AXValueGetTypeID()
         && AXValueGetType(value as AXValueRef) == kAXValueAXErrorType
@@ -437,5 +455,48 @@ mod tests {
         let read = unsafe { NodeAttributes::from_values(&values) };
         assert!(read.children.is_empty());
         assert!(read.children_timed_out);
+    }
+
+    #[test]
+    fn an_element_that_timed_out_once_is_asked_again_while_time_is_left() {
+        let mut answers = vec![Ok("web area"), Err(ReadFailure::TimedOut)];
+        let read = read_retrying_once(|| answers.pop().unwrap(), || true);
+        assert_eq!(read, Ok("web area"));
+        assert!(answers.is_empty(), "asked twice");
+    }
+
+    #[test]
+    fn an_element_is_asked_once_when_no_time_is_left_or_it_is_gone() {
+        let mut asked = 0;
+        let read: Result<(), _> = read_retrying_once(
+            || {
+                asked += 1;
+                Err(ReadFailure::TimedOut)
+            },
+            || false,
+        );
+        assert_eq!((read, asked), (Err(ReadFailure::TimedOut), 1));
+        let mut asked = 0;
+        let read: Result<(), _> = read_retrying_once(
+            || {
+                asked += 1;
+                Err(ReadFailure::Unreadable)
+            },
+            || true,
+        );
+        assert_eq!((read, asked), (Err(ReadFailure::Unreadable), 1));
+        let mut asked = 0;
+        let read = read_retrying_once(
+            || {
+                asked += 1;
+                Err::<(), _>(ReadFailure::TimedOut)
+            },
+            || true,
+        );
+        assert_eq!(
+            (read, asked),
+            (Err(ReadFailure::TimedOut), 2),
+            "only once more"
+        );
     }
 }

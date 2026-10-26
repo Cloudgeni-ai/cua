@@ -31,6 +31,14 @@ pub enum WindowScope {
     /// AX surface is not, so callers report a degraded (empty-tree) snapshot
     /// rather than an error.
     AxUnresolved { ax_window_count: usize },
+    /// The CGWindowID exists under the requested pid, but the application did
+    /// not answer accessibility in time to say which of its elements is the
+    /// window: an app whose main thread is busy (an open menu's tracking loop,
+    /// a long computation) leaves every request to its messaging timeout.
+    /// Nothing is walked, as for [`WindowScope::AxUnresolved`], but nothing is
+    /// known to be wrong with the window either, so its earlier snapshot is
+    /// kept and the read reports that it ran out of time.
+    Unanswered,
 }
 
 impl WindowScope {

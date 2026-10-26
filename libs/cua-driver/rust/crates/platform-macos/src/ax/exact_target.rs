@@ -88,15 +88,18 @@ pub unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
 ///
 /// `adopted` is whether the requested window adopts the element's own window
 /// into its tree (see [`window_adopts_element`]); it only matters when that
-/// window is another one.
+/// window is another one. `in_open_menu` is whether the element is in a menu
+/// the app has open outside its windows (see [`element_in_open_app_menu`]).
 fn element_ancestry(
     window: Option<u32>,
     adopted: bool,
     in_app_menu_bar: bool,
+    in_open_menu: bool,
     requested: u32,
 ) -> ElementAncestry {
     match window {
         Some(id) if id == requested => ElementAncestry::ProvenDescendant,
+        _ if in_open_menu => ElementAncestry::OpenAppMenu,
         Some(owner_window_id) if adopted => ElementAncestry::AdoptedWindow { owner_window_id },
         Some(owner_window_id) => ElementAncestry::OutsideTargetWindow { owner_window_id },
         None if in_app_menu_bar => ElementAncestry::ProvenDescendant,
@@ -236,6 +239,55 @@ fn adopted_within<E>(
         level = next;
     }
     false
+}
+
+/// Whether `element` is in a menu the application has open outside its
+/// windows: a bounded `AXParent` ascent that passes an `AXMenu` and then ends
+/// (no parent, or the application) without reaching a window, a sheet or the
+/// menu bar. WebKit lists a web `<select>`'s open menu inside the window's
+/// tree, but the menu names no parent and no window, so its items have no
+/// window ancestry at all; a context menu hangs off the application. A menu
+/// bar menu ends at the menu bar instead, and a Chromium `<select>`'s menu
+/// at its pop-up button inside the window.
+///
+/// # Safety
+///
+/// `element` must be a valid `AXUIElementRef`.
+unsafe fn element_in_open_app_menu(element: AXUIElementRef) -> bool {
+    let mut current = element;
+    let mut owned = false;
+    let mut in_menu = false;
+    let mut found = false;
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        match copy_string_attr(current, "AXRole").as_deref() {
+            Some("AXMenu") => in_menu = true,
+            Some("AXApplication") => {
+                found = in_menu;
+                break;
+            }
+            Some("AXWindow" | "AXSheet" | "AXMenuBar" | "AXMenuBarItem") | None => break,
+            _ => {}
+        }
+        let parent = copy_element_attr(current, "AXParent");
+        if owned {
+            CFRelease(current as CFTypeRef);
+        }
+        match parent {
+            Some(parent) => {
+                current = parent;
+                owned = true;
+            }
+            None => {
+                owned = false;
+                found = in_menu;
+                break;
+            }
+        }
+    }
+    if owned {
+        CFRelease(current as CFTypeRef);
+    }
+    found
 }
 
 /// Whether `element` sits under the application's own `AXMenuBar`: a bounded
@@ -474,7 +526,10 @@ pub fn gather_background_facts(
                 // A menu-bar item has no window ancestor: the menu bar hangs
                 // off the application. It still belongs to this app.
                 let in_menu_bar = window.is_none() && element_in_app_menu_bar(app, element);
-                element_ancestry(window, adopted, in_menu_bar, window_id)
+                // So does an item of a menu the app has open outside its
+                // windows (a web <select>'s list in WebKit, a context menu).
+                let in_open_menu = window != Some(window_id) && element_in_open_app_menu(element);
+                element_ancestry(window, adopted, in_menu_bar, in_open_menu, window_id)
             });
             let focused_window_id = copy_element_attr(app, "AXFocusedWindow").and_then(|window| {
                 let window_id = ax_get_window_id(window);
@@ -536,12 +591,36 @@ mod tests {
     fn menu_bar_item_is_proven_only_through_the_app_menu_bar() {
         use super::element_ancestry;
         use cua_driver_core::background_input::ElementAncestry::*;
-        assert_eq!(element_ancestry(None, false, true, 7), ProvenDescendant);
-        assert_eq!(element_ancestry(None, false, false, 7), Unproven);
-        assert_eq!(element_ancestry(Some(7), false, false, 7), ProvenDescendant);
         assert_eq!(
-            element_ancestry(Some(8), false, true, 7),
+            element_ancestry(None, false, true, false, 7),
+            ProvenDescendant
+        );
+        assert_eq!(element_ancestry(None, false, false, false, 7), Unproven);
+        assert_eq!(
+            element_ancestry(Some(7), false, false, false, 7),
+            ProvenDescendant
+        );
+        assert_eq!(
+            element_ancestry(Some(8), false, true, false, 7),
             OutsideTargetWindow { owner_window_id: 8 }
+        );
+    }
+
+    #[test]
+    fn item_of_a_menu_the_app_has_open_is_the_windows_to_press() {
+        use super::element_ancestry;
+        use cua_driver_core::background_input::ElementAncestry::*;
+        // A web <select>'s list in WebKit: the menu hangs off the app, and its
+        // items name no window or the menu's own one.
+        assert_eq!(element_ancestry(None, false, false, true, 7), OpenAppMenu);
+        assert_eq!(
+            element_ancestry(Some(90), false, false, true, 7),
+            OpenAppMenu
+        );
+        // An element of the window itself stays proven.
+        assert_eq!(
+            element_ancestry(Some(7), false, false, true, 7),
+            ProvenDescendant
         );
     }
 
@@ -552,19 +631,19 @@ mod tests {
         // Chrome's Save password? bubble (window 2142) adopted by the
         // browser window (2112) it is anchored to.
         assert_eq!(
-            element_ancestry(Some(2142), true, false, 2112),
+            element_ancestry(Some(2142), true, false, false, 2112),
             AdoptedWindow {
                 owner_window_id: 2142
             }
         );
         assert_eq!(
-            element_ancestry(Some(2142), false, false, 2112),
+            element_ancestry(Some(2142), false, false, false, 2112),
             OutsideTargetWindow {
                 owner_window_id: 2142
             }
         );
         // Adoption never stands in for an unreadable window.
-        assert_eq!(element_ancestry(None, true, false, 2112), Unproven);
+        assert_eq!(element_ancestry(None, true, false, false, 2112), Unproven);
     }
 
     /// A fake tree for the adoption search: children by index.

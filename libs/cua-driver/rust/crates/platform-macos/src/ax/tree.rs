@@ -11,7 +11,7 @@
 //! - AXStaticText with no title/value is omitted.
 //! - Tree is walked depth-first; element_index is assigned in DFS order.
 
-use super::attributes::{NodeAttributes, ReadFailure};
+use super::attributes::{read_retrying_once, NodeAttributes, ReadFailure};
 use super::bindings::*;
 use super::launch::{is_still_launching, LaunchStep, LaunchWait};
 use super::window_scope::{decide_window_scope, ScopeDecision, TopLevelCandidate, WindowScope};
@@ -54,15 +54,48 @@ const AX_MIN_BUDGETED_TIMEOUT_SECONDS: f32 = 0.1;
 
 /// [`set_messaging_timeout`], shortened to what is left of a timed walk.
 unsafe fn set_messaging_timeout_within(element: AXUIElementRef, budget: &WalkBudget) {
-    let seconds = budget
-        .remaining()
-        .map_or(AX_MESSAGING_TIMEOUT_SECONDS, |left| {
-            left.as_secs_f32().clamp(
-                AX_MIN_BUDGETED_TIMEOUT_SECONDS,
-                AX_MESSAGING_TIMEOUT_SECONDS,
-            )
-        });
-    let _ = AXUIElementSetMessagingTimeout(element, seconds);
+    let _ = AXUIElementSetMessagingTimeout(element, messaging_timeout_for(budget.remaining()));
+}
+
+/// The messaging timeout for a request with `left` of its time remaining
+/// (`None`: no time limit).
+fn messaging_timeout_for(left: Option<std::time::Duration>) -> f32 {
+    left.map_or(AX_MESSAGING_TIMEOUT_SECONDS, |left| {
+        left.as_secs_f32().clamp(
+            AX_MIN_BUDGETED_TIMEOUT_SECONDS,
+            AX_MESSAGING_TIMEOUT_SECONDS,
+        )
+    })
+}
+
+/// Deadline for the requests that find the requested window before the walk's
+/// own clock starts: the application's `AXChildren` and `AXWindows`, and the
+/// role of each of those. It is the walk's `timeout_ms` again (the budget's
+/// clock starts only at the first node, see [`WalkBudget`]) plus one full
+/// messaging timeout, so an app that answers each request late but within
+/// that timeout is still read as before. Without it an app that does not
+/// answer, such as one tracking an open menu on its main thread, held each of
+/// these requests for the full messaging timeout, and the read failed outright
+/// at its backstop instead of returning in time.
+struct SetupDeadline(Option<Instant>);
+
+impl SetupDeadline {
+    fn new(limit: Option<std::time::Duration>) -> Self {
+        let slack = std::time::Duration::from_secs_f32(AX_MESSAGING_TIMEOUT_SECONDS);
+        Self(limit.map(|limit| Instant::now() + limit + slack))
+    }
+
+    fn passed(&self) -> bool {
+        self.0.is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    /// Bound `element`'s next request by what is left before the deadline.
+    unsafe fn bound(&self, element: AXUIElementRef) {
+        let left = self
+            .0
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let _ = AXUIElementSetMessagingTimeout(element, messaging_timeout_for(left));
+    }
 }
 
 /// Gives an element the ordinary [`set_messaging_timeout`] back when dropped,
@@ -303,9 +336,11 @@ fn walk_tree_with_web_content(
             // has not started answering AX rejects the flip without caching the
             // refusal, so each launch-wait attempt asks again.
             let attempt_started = Instant::now();
+            let setup = SetupDeadline::new(budget.time_limit());
+            setup.bound(app_elem);
             super::enablement::ensure_chromium_ax_enabled(pid, app_elem);
 
-            let top_level = copy_top_level(app_elem, pid, window_id);
+            let top_level = copy_top_level(app_elem, pid, window_id, &setup);
 
             // Scope: keep non-window children (menu bar) + the target window —
             // but ONLY once the target window has actually been identified. When
@@ -313,10 +348,12 @@ fn walk_tree_with_web_content(
             // and walks nothing; it must never fall back to "everything that isn't
             // a window", which is how issue #2237 returned menu bars as panels.
             let Some(wid) = window_id else {
+                set_messaging_timeout(app_elem);
                 let walk = top_level.clone();
                 break (top_level, walk);
             };
-            let decision = scope_top_level(&top_level, pid, wid);
+            let mut decision = scope_top_level(&top_level, pid, wid, &setup);
+            set_messaging_timeout(app_elem);
             if matches!(decision.scope, WindowScope::AxUnresolved { .. }) {
                 match launch_wait.step(attempt_started, Instant::now(), || is_still_launching(pid))
                 {
@@ -328,6 +365,14 @@ fn walk_tree_with_web_content(
                     // Still unresolved because the app never finished
                     // launching: say so instead of blaming the window scope.
                     LaunchStep::TimedOut => budget.stop_for_app_lookup_timeout(),
+                    // The app ran out the time before saying which element
+                    // is the window: it did not answer, which says nothing
+                    // about the window. The window itself is the one element
+                    // left unread.
+                    LaunchStep::Proceed if setup.passed() => {
+                        decision.scope = WindowScope::Unanswered;
+                        budget.children_unread_for_timeout();
+                    }
                     LaunchStep::Proceed => {}
                 }
             }
@@ -395,10 +440,13 @@ unsafe fn copy_top_level(
     app_elem: AXUIElementRef,
     pid: i32,
     window_id: Option<u32>,
+    setup: &SetupDeadline,
 ) -> Vec<AXUIElementRef> {
+    setup.bound(app_elem);
     let mut top_level = copy_children(app_elem);
     // A requested window on another Space is absent from AXWindows; the
     // `_including` variant recovers it by exact CGWindowID.
+    setup.bound(app_elem);
     let from_windows = match window_id {
         Some(wid) => copy_ax_windows_including(app_elem, pid, wid),
         None => copy_ax_windows(app_elem),
@@ -422,17 +470,32 @@ unsafe fn copy_top_level(
 }
 
 /// Decide which of `top_level` a walk scoped to `wid` covers.
-unsafe fn scope_top_level(top_level: &[AXUIElementRef], pid: i32, wid: u32) -> ScopeDecision {
+///
+/// Elements left once `setup` has passed are not asked anything: an app that
+/// stopped answering would hold each request for its whole timeout.
+unsafe fn scope_top_level(
+    top_level: &[AXUIElementRef],
+    pid: i32,
+    wid: u32,
+    setup: &SetupDeadline,
+) -> ScopeDecision {
     let candidates: Vec<TopLevelCandidate> = top_level
         .iter()
         .map(|&child| {
-            set_messaging_timeout(child);
-            let role = copy_string_attr(child, "AXRole").unwrap_or_default();
-            let subrole = copy_string_attr(child, "AXSubrole");
-            let identifier = copy_string_attr(child, "AXIdentifier");
+            if setup.passed() {
+                return TopLevelCandidate::new("", None);
+            }
+            let read = |attribute: &str| {
+                setup.bound(child);
+                copy_string_attr(child, attribute)
+            };
+            let role = read("AXRole").unwrap_or_default();
+            let subrole = read("AXSubrole");
+            let identifier = read("AXIdentifier");
             // Match AX window element → CGWindowID via private SPI.
             // Only windows carry one, so skip the round-trip elsewhere.
             let ax_window_id = if role == "AXWindow" {
+                setup.bound(child);
                 ax_get_window_id(child)
             } else {
                 None
@@ -486,18 +549,26 @@ unsafe fn walk_element(
     // deadline; once the walk is done with it the element gets the ordinary
     // timeout back for the actions taken on it later.
     let _restore = RestoreMessagingTimeout(element);
-    set_messaging_timeout_within(element, budget);
-    // Every attribute below comes from this one request (see `attributes`).
-    let read = NodeAttributes::read(element);
+    // Every attribute below comes from this one request (see `attributes`),
+    // asked once more if it timed out with time left (see
+    // `read_retrying_once`).
+    let read = read_retrying_once(
+        || {
+            set_messaging_timeout_within(element, budget);
+            NodeAttributes::read(element)
+        },
+        || !budget.expired(),
+    );
     let mut attributes = match read {
         Ok(attributes) => attributes,
-        // The budget ran out while the app was answering: the element was
-        // not read, so it counts among the unread, not as an empty row.
-        Err(ReadFailure::TimedOut) if budget.expired() => {
+        // The app did not answer twice, or the budget ran out while it was
+        // answering: the element was not read, so it counts among the
+        // unread, not as an empty row whose subtree silently disappears.
+        Err(ReadFailure::TimedOut) => {
             budget.unread_for_timeout();
             return;
         }
-        // A dead or unanswering element reads as nothing, as it always did.
+        // A dead element reads as nothing, as it always did.
         Err(_) => NodeAttributes::default(),
     };
     // Children the app did not answer in time are missing from the tree, so

@@ -367,8 +367,11 @@ impl Tool for GetWindowStateTool {
         // `window_scope` is None only when no window_id was requested, which
         // this tool never does — so treat that as resolved.
         let scope_matched = window_scope.as_ref().is_none_or(|s| s.is_matched());
+        // An app that did not answer in time said nothing about its window:
+        // the earlier snapshot, and the element_tokens taken from it, stay.
+        let unanswered = matches!(window_scope, Some(crate::ax::WindowScope::Unanswered));
 
-        let removed = (!scope_matched && !observation_only)
+        let removed = (!scope_matched && !unanswered && !observation_only)
             .then(|| self.state.snapshots.remove(pid, u64::from(window_id)))
             .flatten();
 
@@ -799,6 +802,21 @@ impl Tool for GetWindowStateTool {
                                app settles, or act with delivery_mode:\"foreground\"."
                 });
             }
+            Degradation::AxAppUnresponsive => {
+                structured["degraded"] = serde_json::json!(true);
+                structured["degraded_reason"] = serde_json::json!(format!(
+                    "ax_app_unresponsive: pid {pid} did not answer accessibility within the \
+                     {timeout_ms} ms timeout_ms budget (an app busy on its main thread does \
+                     this, for example while it shows a menu), so no tree was read. The \
+                     screenshot is current, and element_tokens of the window's last snapshot \
+                     stay valid."
+                ));
+                structured["escalation"] = serde_json::json!({
+                    "recommended": "retry",
+                    "reason": "re-snapshot in a moment; element_tokens of the last snapshot \
+                               stay usable meanwhile."
+                });
+            }
         }
         // Additive read-only `background_input` capability section (macOS
         // background input v1): the same fresh facts that gate every
@@ -806,8 +824,9 @@ impl Tool for GetWindowStateTool {
         // before acting. Every action still revalidates — this is advisory,
         // not a promise. Old consumers ignore the extra field.
         // A display-only frame cannot ground input, so skip the input probe:
-        // previews poll several times a second.
-        if !display_only {
+        // previews poll several times a second. An app that did not answer
+        // the read would not answer the probe either.
+        if !display_only && !unanswered {
             let capture_available = screenshot_dims.is_some();
             let report = tokio::task::spawn_blocking(move || {
                 let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
@@ -975,7 +994,7 @@ fn window_scope_refusal(
     use crate::ax::WindowScope;
     match scope {
         // Resolved, or resolvable-as-degraded — the caller gets a response.
-        WindowScope::Matched | WindowScope::AxUnresolved { .. } => None,
+        WindowScope::Matched | WindowScope::AxUnresolved { .. } | WindowScope::Unanswered => None,
         WindowScope::NotFound => Some(
             ToolResult::error(format!(
                 "window_id {window_id} is not a live window (closed, or the id is stale). \
@@ -1035,6 +1054,10 @@ enum Degradation {
     /// lock). macOS then reports no AXWindows for any app, so an empty or
     /// unresolved tree has this cause rather than the app's own state.
     ScreenLocked,
+    /// The app did not answer accessibility within the caller's budget (busy
+    /// main thread, such as an open menu's tracking loop), so nothing was
+    /// read; the window's earlier snapshot stays valid.
+    AxAppUnresponsive,
 }
 
 /// Name the locked screen as the cause of an empty or unresolved tree.
@@ -1059,6 +1082,9 @@ fn degradation_for(
 ) -> Degradation {
     if !walk_attempted {
         return Degradation::None;
+    }
+    if let Some(crate::ax::WindowScope::Unanswered) = scope {
+        return Degradation::AxAppUnresponsive;
     }
     if let Some(crate::ax::WindowScope::AxUnresolved { ax_window_count }) = scope {
         if app_lookup_timed_out {
@@ -1278,6 +1304,20 @@ mod window_scope_contract_tests {
             window_scope_refusal(800, 11, &WindowScope::AxUnresolved { ax_window_count: 2 })
                 .is_none(),
             "a live same-pid window degrades; it does not error"
+        );
+        assert!(
+            window_scope_refusal(800, 11, &WindowScope::Unanswered).is_none(),
+            "an app that did not answer in time degrades; it does not error"
+        );
+    }
+
+    /// An app that let the read run out of time (busy in a menu's tracking
+    /// loop) is reported as unresponsive, not as a window it cannot place.
+    #[test]
+    fn an_unanswered_read_degrades_as_app_unresponsive() {
+        assert_eq!(
+            degradation_for(true, 0, Some(&WindowScope::Unanswered), false),
+            Degradation::AxAppUnresponsive
         );
     }
 

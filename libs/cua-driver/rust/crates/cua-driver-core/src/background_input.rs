@@ -57,6 +57,13 @@ pub enum ElementAncestry {
         /// The CGWindowID the element does belong to.
         owner_window_id: u32,
     },
+    /// The live element is in a menu the process has open outside every
+    /// window: the list of a pop-up button (a web `<select>` in WebKit) or a
+    /// context menu, which hang off the application, not off a window. It is
+    /// the requested window's to act on through accessibility; pointer and key
+    /// input stamped for the requested window would not reach the menu, so
+    /// they are refused.
+    OpenAppMenu,
     /// Ancestry could not be resolved (dead element, SPI failure). An address
     /// the shell cannot re-prove is not an exact target.
     Unproven,
@@ -281,6 +288,20 @@ pub fn decide_background_input(
                      accessibility action on the element instead: a single left click on its \
                      element_token (pressed through accessibility) or set_value",
                     target_window = target.window_id
+                ),
+                None,
+            );
+        }
+        ElementAncestry::OpenAppMenu if action == BackgroundAction::AxSemantic => {}
+        ElementAncestry::OpenAppMenu => {
+            return refuse(
+                refusal_codes::ELEMENT_IN_ATTACHED_WINDOW,
+                format!(
+                    "the addressed element is in a menu the app has open over window {}; \
+                     pointer and key input sent to that window would not reach the menu, so \
+                     none was sent. Use an accessibility action on the element instead: a \
+                     single left click on its element_token (pressed through accessibility)",
+                    target.window_id
                 ),
                 None,
             );
@@ -774,6 +795,32 @@ mod tests {
                     assert_eq!(refusal.code, refusal_codes::ELEMENT_IN_ATTACHED_WINDOW);
                     assert!(refusal.reason.contains("window 91, a bubble or popover"));
                     assert!(refusal.reason.contains("so none was sent"));
+                    assert!(refusal.advice.is_none());
+                }
+                other => panic!("{action:?} expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// An item of a menu the app has open (a web `<select>`'s list) is the
+    /// target window's to press through accessibility; pointer and key input
+    /// for the window would not reach the menu, so they are refused.
+    #[test]
+    fn open_app_menu_item_takes_only_semantic_actions() {
+        let facts = BackgroundTargetFacts {
+            element: ElementAncestry::OpenAppMenu,
+            ..matched_facts()
+        };
+        assert!(decide_background_input(TARGET, &facts, BackgroundAction::AxSemantic).is_execute());
+        for action in ALL_ACTIONS
+            .into_iter()
+            .chain([BackgroundAction::ExactWindowKeys])
+            .filter(|action| *action != BackgroundAction::AxSemantic)
+        {
+            match decide_background_input(TARGET, &facts, action) {
+                BackgroundInputDecision::Refuse(refusal) => {
+                    assert_eq!(refusal.code, refusal_codes::ELEMENT_IN_ATTACHED_WINDOW);
+                    assert!(refusal.reason.contains("a menu the app has open"));
                     assert!(refusal.advice.is_none());
                 }
                 other => panic!("{action:?} expected a refusal, got {other:?}"),

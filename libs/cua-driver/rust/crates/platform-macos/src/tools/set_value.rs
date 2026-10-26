@@ -1049,9 +1049,10 @@ fn release_options(options: &[PopupOption]) {
 
 /// The popup's options as AX exposes them: its direct children, or, when a
 /// child is an `AXMenu` (AppKit `NSPopUpButton`, Chromium `<select>`), that
-/// menu's `AXMenuItem` children. Menus without items yield nothing, so an
-/// unopened popup reads as empty instead of as one untitled option.
-fn popup_options(popup: AXUIElementRef) -> Vec<PopupOption> {
+/// menu's `AXMenuItem` children, or else the items of the menu it has open
+/// elsewhere (see [`anchored_open_menu`]). Menus without items yield nothing,
+/// so an unopened popup reads as empty instead of as one untitled option.
+fn popup_options(popup: AXUIElementRef, pid: i32) -> Vec<PopupOption> {
     let mut options = Vec::new();
     for child in unsafe { copy_children(popup) } {
         let role = unsafe { copy_string_attr(child, "AXRole") }.unwrap_or_default();
@@ -1065,7 +1066,93 @@ fn popup_options(popup: AXUIElementRef) -> Vec<PopupOption> {
         }
     }
     options.retain(|option| !(option.title.is_empty() && option.value.is_empty()));
+    if options.is_empty() {
+        if let Some(menu) = anchored_open_menu(popup, pid) {
+            for item in unsafe { copy_children(menu) } {
+                options.push(describe_option(item));
+            }
+            unsafe { CFRelease(menu as _) };
+            options.retain(|option| !(option.title.is_empty() && option.value.is_empty()));
+        }
+    }
     options
+}
+
+/// How far, in points, an open menu may reach past its pop-up button's frame
+/// and still be that button's menu. AppKit lays a pop-up button's menu over
+/// the button, with the chosen item on top of it.
+const MENU_ANCHOR_SLACK: f64 = 24.0;
+
+/// How many of a pop-up button's ancestors are searched for the menu it has
+/// open, up to its window.
+const MENU_HOLDER_DEPTH: usize = 16;
+
+/// Whether a menu with screen frame `menu` (x, y, width, height) is laid over
+/// a pop-up button with frame `popup`, as the menu the button opened is.
+fn menu_anchored_to(popup: [f64; 4], menu: [f64; 4]) -> bool {
+    let [px, py, pw, ph] = popup;
+    let [mx, my, mw, mh] = menu;
+    mw > 0.0
+        && mh > 0.0
+        && mx < px + pw + MENU_ANCHOR_SLACK
+        && mx + mw > px - MENU_ANCHOR_SLACK
+        && my < py + ph + MENU_ANCHOR_SLACK
+        && my + mh > py - MENU_ANCHOR_SLACK
+}
+
+/// The menu a pop-up button has open outside its own children, retained.
+///
+/// WebKit lists a web `<select>`'s open menu among the children of one of the
+/// button's ancestors (the menu itself names no parent), not under the
+/// button, and the button reports `AXExpanded` false all the while; other
+/// apps hang such a menu off the application. A menu found there is the
+/// button's when it lists items and lies over the button.
+fn anchored_open_menu(popup: AXUIElementRef, pid: i32) -> Option<AXUIElementRef> {
+    let popup_frame = unsafe { crate::ax::bindings::element_screen_rect(popup) }?;
+    let mut holders = Vec::new();
+    let mut current = popup;
+    for _ in 0..MENU_HOLDER_DEPTH {
+        let Some(parent) = (unsafe { crate::ax::bindings::copy_element_attr(current, "AXParent") })
+        else {
+            break;
+        };
+        holders.push(parent);
+        current = parent;
+        if unsafe { copy_string_attr(parent, "AXRole") }.as_deref() == Some("AXWindow") {
+            break;
+        }
+    }
+    let app = unsafe { crate::ax::bindings::AXUIElementCreateApplication(pid) };
+    if !app.is_null() {
+        holders.push(app);
+    }
+    let mut found = None;
+    for holder in holders {
+        unsafe {
+            crate::ax::bindings::AXUIElementSetMessagingTimeout(holder, POPUP_PRESS_TIMEOUT_SECONDS)
+        };
+        for child in unsafe { copy_children(holder) } {
+            let is_menu = found.is_none()
+                && unsafe { copy_string_attr(child, "AXRole") }.as_deref() == Some("AXMenu")
+                && unsafe { crate::ax::bindings::element_screen_rect(child) }
+                    .is_some_and(|frame| menu_anchored_to(popup_frame, frame))
+                && {
+                    let items = unsafe { copy_children(child) };
+                    let listed = !items.is_empty();
+                    for item in items {
+                        unsafe { CFRelease(item as _) };
+                    }
+                    listed
+                };
+            if is_menu {
+                found = Some(child);
+            } else {
+                unsafe { CFRelease(child as _) };
+            }
+        }
+        unsafe { CFRelease(holder as _) };
+    }
+    found
 }
 
 fn describe_option(element: AXUIElementRef) -> PopupOption {
@@ -1118,12 +1205,16 @@ fn describe_available(options: &[PopupOption]) -> String {
 ///
 /// A popup that reports `AXExpanded` says so itself. A Chromium `<select>`
 /// does, and has to be asked: once its menu has been opened, it keeps
-/// listing the items under an `AXMenu` after the menu closes. Otherwise an
+/// listing the items under an `AXMenu` after the menu closes. A WebKit
+/// `<select>` reports false even while its menu, hung elsewhere, is open, so
+/// a popup reading false is open when such a menu lies over it. Otherwise an
 /// `AXMenu` child that already lists items is an open menu: a closed AppKit
 /// popup has an empty `AXMenu` (or none).
-fn popup_menu_is_open(popup: AXUIElementRef) -> bool {
-    if let Some(expanded) = unsafe { copy_bool_attr(popup, "AXExpanded") } {
-        return expanded;
+fn popup_menu_is_open(popup: AXUIElementRef, pid: i32) -> bool {
+    match unsafe { copy_bool_attr(popup, "AXExpanded") } {
+        Some(true) => return true,
+        Some(false) => return has_anchored_open_menu(popup, pid),
+        None => {}
     }
     let mut open = false;
     for child in unsafe { copy_children(popup) } {
@@ -1136,18 +1227,28 @@ fn popup_menu_is_open(popup: AXUIElementRef) -> bool {
         }
         unsafe { CFRelease(child as _) };
     }
-    open
+    open || has_anchored_open_menu(popup, pid)
 }
 
-/// Send `AXCancel` to the popup's menu: closes an open AppKit menu, and does
-/// nothing to one that is closed.
-fn cancel_popup_menu(popup: AXUIElementRef) {
+fn has_anchored_open_menu(popup: AXUIElementRef, pid: i32) -> bool {
+    anchored_open_menu(popup, pid)
+        .map(|menu| unsafe { CFRelease(menu as _) })
+        .is_some()
+}
+
+/// Send `AXCancel` to the popup's menu, under it or open over it: closes an
+/// open AppKit or WebKit menu, and does nothing to one that is closed.
+fn cancel_popup_menu(popup: AXUIElementRef, pid: i32) {
     for child in unsafe { copy_children(popup) } {
         let role = unsafe { copy_string_attr(child, "AXRole") }.unwrap_or_default();
         if role == "AXMenu" {
             let _ = unsafe { perform_action(child, "AXCancel") };
         }
         unsafe { CFRelease(child as _) };
+    }
+    if let Some(menu) = anchored_open_menu(popup, pid) {
+        let _ = unsafe { perform_action(menu, "AXCancel") };
+        unsafe { CFRelease(menu as _) };
     }
 }
 
@@ -1156,29 +1257,30 @@ fn cancel_popup_menu(popup: AXUIElementRef) {
 /// the app (the open menu is what receives it). A popup that reports
 /// `AXExpanded` is a Chromium `<select>`: it gets Escape at once when it
 /// reads expanded, instead of after waiting out `AXCancel`, and nothing when
-/// it reads closed. Any other popup gets `AXCancel` (harmless when closed)
-/// and falls back to Escape when its menu is still open after that.
+/// it reads closed with no menu open over it (a WebKit `<select>` reads
+/// closed with its menu open). Any other popup gets `AXCancel` (harmless when
+/// closed) and falls back to Escape when its menu is still open after that.
 fn dismiss_popup_menu(popup: AXUIElementRef, pid: i32) {
     match unsafe { copy_bool_attr(popup, "AXExpanded") } {
-        Some(false) => return,
+        Some(false) if !has_anchored_open_menu(popup, pid) => return,
         Some(true) => {}
-        None => {
-            cancel_popup_menu(popup);
-            if popup_menu_closes(popup) {
+        _ => {
+            cancel_popup_menu(popup, pid);
+            if popup_menu_closes(popup, pid) {
                 return;
             }
         }
     }
     let _ = crate::input::keyboard::press_key_no_auth(pid, "escape", &[]);
-    popup_menu_closes(popup);
+    popup_menu_closes(popup, pid);
 }
 
 /// Poll until the popup's menu reads closed, for at most
 /// `POPUP_CLOSE_TIMEOUT`. Returns whether it closed.
-fn popup_menu_closes(popup: AXUIElementRef) -> bool {
+fn popup_menu_closes(popup: AXUIElementRef, pid: i32) -> bool {
     let deadline = std::time::Instant::now() + POPUP_CLOSE_TIMEOUT;
     loop {
-        if !popup_menu_is_open(popup) {
+        if !popup_menu_is_open(popup, pid) {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -1271,7 +1373,7 @@ fn select_chromium_popup_by_typeahead(
     let wanted = value.trim();
     if wanted.is_empty()
         || crate::apps::frontmost_pid() == Some(pid)
-        || popup_menu_is_open(popup)
+        || popup_menu_is_open(popup, pid)
         || !is_chromium_popup_owner(pid)
     {
         return None;
@@ -1325,7 +1427,7 @@ fn select_popup_option(
     // without choosing anything.
     let current = unsafe { copy_string_attr(element, "AXValue") }.unwrap_or_default();
     if already_selected(&current, value) {
-        if popup_menu_is_open(element) {
+        if popup_menu_is_open(element, pid) {
             dismiss_popup_menu(element, pid);
         }
         return Ok(format!(
@@ -1344,7 +1446,7 @@ fn select_popup_option(
     ) {
         return Ok(detail);
     }
-    let mut options = popup_options(element);
+    let mut options = popup_options(element, pid);
     let mut opened_menu = false;
     let mut press_thread = None;
 
@@ -1368,7 +1470,7 @@ fn select_popup_option(
         // the messaging timeout fires), so run it on its own thread and read
         // the items as soon as they appear: the menu, and with it the key
         // focus it holds, stays open for the shortest time.
-        let already_open = popup_menu_is_open(element);
+        let already_open = popup_menu_is_open(element, pid);
         let closed_titles = if already_open {
             Vec::new()
         } else {
@@ -1394,7 +1496,7 @@ fn select_popup_option(
         let mut last_seen: Vec<(String, String)> = Vec::new();
         let mut stable_polls = 0;
         loop {
-            options = popup_options(element);
+            options = popup_options(element, pid);
             let seen = option_pairs(&options);
             if matching_option(&seen, value).is_some() {
                 break;
@@ -1481,7 +1583,7 @@ fn select_popup_option(
 
 #[cfg(test)]
 mod popup_option_tests {
-    use super::{already_selected, matching_option};
+    use super::{already_selected, matching_option, menu_anchored_to};
 
     fn pairs(titles: &[&str]) -> Vec<(String, String)> {
         titles
@@ -1511,6 +1613,26 @@ mod popup_option_tests {
         assert!(!already_selected("Team", "Business"));
         assert!(!already_selected("", "Business"));
         assert!(!already_selected("", " "));
+    }
+
+    /// A WebKit `<select>`'s open menu lies over its button (the chosen item
+    /// on top of it), whichever display it is on; a menu elsewhere, such as a
+    /// context menu, is not the button's.
+    #[test]
+    fn a_menu_laid_over_the_button_is_the_buttons() {
+        let popup = [100.0, 200.0, 120.0, 22.0];
+        assert!(menu_anchored_to(popup, [96.0, 156.0, 140.0, 110.0]));
+        // Opened just below, or reaching it from above.
+        assert!(menu_anchored_to(popup, [100.0, 230.0, 140.0, 110.0]));
+        assert!(menu_anchored_to(popup, [100.0, 80.0, 140.0, 110.0]));
+        // A display left of and above the main one has negative coordinates.
+        assert!(menu_anchored_to(
+            [-780.0, -300.0, 160.0, 24.0],
+            [-784.0, -330.0, 170.0, 90.0]
+        ));
+        assert!(!menu_anchored_to(popup, [400.0, 200.0, 140.0, 110.0]));
+        assert!(!menu_anchored_to(popup, [100.0, 400.0, 140.0, 110.0]));
+        assert!(!menu_anchored_to(popup, [96.0, 156.0, 0.0, 0.0]));
     }
 }
 
