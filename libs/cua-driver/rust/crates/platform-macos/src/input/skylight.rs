@@ -69,6 +69,9 @@ pub struct KeyFocus {
     pub window: Option<u32>,
     /// The window holding the app's `AXFocusedUIElement`.
     pub element_window: Option<u32>,
+    /// When the focused window is a sheet (an Open or Save panel, an alert),
+    /// the window it is attached to.
+    pub sheet_of: Option<u32>,
 }
 
 impl KeyFocus {
@@ -78,8 +81,12 @@ impl KeyFocus {
     /// target when it held). The focused element is not used here: VCL keeps
     /// reporting a modeless dialog's field as focused after its document
     /// window has become key and is receiving the keys.
+    ///
+    /// A sheet attached to `target` counts as `target`: it is modal to that
+    /// window, AppKit keeps it key while it is up, and a person typing into
+    /// the window types into the sheet.
     fn routes_to(self, target: u32) -> bool {
-        self.window == Some(target)
+        self.window == Some(target) || self.sheet_of == Some(target)
     }
 
     /// `target` is key with nothing left to prime. A focused window without
@@ -228,6 +235,7 @@ fn key_focus_of_pid(pid: pid_t) -> KeyFocus {
     KeyFocus {
         window: crate::ax::bindings::focused_window_id_of_pid(pid),
         element_window: crate::ax::bindings::focused_element_window_id_of_pid(pid),
+        sheet_of: crate::ax::exact_target::focused_sheet_owner_of_pid(pid),
     }
 }
 
@@ -1706,6 +1714,7 @@ mod key_prime_tests {
         KeyFocus {
             window,
             element_window,
+            sheet_of: None,
         }
     }
 
@@ -1718,6 +1727,46 @@ mod key_prime_tests {
             || panic!("ax"),
         );
         assert_eq!(r, Ok(KeyPrime::AlreadyKey));
+    }
+
+    /// A sheet open on the target (an Open panel, an alert) is the app's key
+    /// window, with its own window id: keys addressed to the target go to it,
+    /// as a person's would, with nothing to prime and nothing to hand back.
+    #[test]
+    fn a_sheet_attached_to_the_target_takes_its_keys() {
+        let sheet = KeyFocus {
+            window: Some(21),
+            element_window: Some(21),
+            sheet_of: Some(7),
+        };
+        let r = prime_exact_window_key(7, || sheet, || panic!("record"), || panic!("ax"));
+        assert_eq!(r, Ok(KeyPrime::AlreadyKey));
+    }
+
+    /// A sheet on another window of the app is that window's, not the
+    /// target's: the target must still be made key and confirmed.
+    #[test]
+    fn a_sheet_on_another_window_does_not_stand_in_for_the_target() {
+        let focus = Cell::new(KeyFocus {
+            window: Some(21),
+            element_window: Some(21),
+            sheet_of: Some(9),
+        });
+        let r = prime_exact_window_key(7, || focus.get(), || true, || true);
+        assert!(r.is_err());
+        let records = Cell::new(0);
+        let r = prime_exact_window_key(
+            7,
+            || focus.get(),
+            || {
+                records.set(records.get() + 1);
+                focus.set(at(Some(7), Some(7)));
+                true
+            },
+            || panic!("ax"),
+        );
+        assert_eq!(r, Ok(KeyPrime::KeyRecords));
+        assert_eq!(records.get(), 1);
     }
 
     /// LibreOffice that was never active: AX names the window but no element

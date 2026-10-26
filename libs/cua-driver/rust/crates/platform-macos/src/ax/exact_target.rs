@@ -384,6 +384,40 @@ unsafe fn owning_window_id(window: AXUIElementRef) -> Option<u32> {
     )
 }
 
+/// The window `pid`'s focused window is attached to when that focused window
+/// is a sheet (a Save or Open panel, an alert shown on a window): AppKit
+/// makes the sheet key while it is up, and key events posted to the app go to
+/// it. `None` when the focused window is not a sheet or its parent window is
+/// not proven.
+pub fn focused_sheet_owner_of_pid(pid: i32) -> Option<u32> {
+    // SAFETY: every element created or copied here is released here.
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        let window = copy_element_attr(app, "AXFocusedWindow");
+        CFRelease(app as CFTypeRef);
+        let window = window?;
+        let owner = sheet_owner(window);
+        CFRelease(window as CFTypeRef);
+        owner
+    }
+}
+
+/// [`owning_window_id`] of a sheet, when it names a window other than the
+/// sheet's own.
+///
+/// # Safety
+///
+/// `window` must be a valid `AXUIElementRef` for the duration of the call.
+unsafe fn sheet_owner(window: AXUIElementRef) -> Option<u32> {
+    if copy_string_attr(window, "AXRole").as_deref() != Some("AXSheet") {
+        return None;
+    }
+    owning_window_id(window).filter(|owner| Some(*owner) != ax_get_window_id(window))
+}
+
 /// Pure sheet-to-parent resolution behind [`owning_window_id`].
 ///
 /// A sheet whose parent is not a window (or a sheet attached to another
@@ -566,8 +600,10 @@ pub fn gather_background_facts(
                     });
                 element_ancestry(window, adopted, in_menu_bar, in_open_menu, window_id)
             });
+            // A sheet attached to the target holds key for it: keys posted to
+            // the app go to the sheet, which is the target's to answer.
             let focused_window_id = copy_element_attr(app, "AXFocusedWindow").and_then(|window| {
-                let window_id = ax_get_window_id(window);
+                let window_id = sheet_owner(window).or_else(|| ax_get_window_id(window));
                 CFRelease(window as CFTypeRef);
                 window_id
             });
