@@ -161,33 +161,21 @@ fn toggle_press_shows(role: &str, before: &str, now: &str) -> bool {
     now != before && (role != "AXRadioButton" || now == "1")
 }
 
-/// Whether a background pixel click's AXPress on the hit-tested element shows
-/// that it acted. A checkbox or an unselected radio button shows a press in
-/// its own value; Chromium's tab strip accepts AXPress on a background tab
-/// (an `AXRadioButton`) and leaves it unselected, which used to be reported
-/// as a pressed click. When the value does not show the press, the caller
-/// delivers the routed pixel click instead. Elements whose value cannot show
-/// a press (buttons, a selected radio button) count as acted, as before.
-fn pixel_press_shown(
-    role: &str,
-    before: Option<&str>,
-    read: impl FnMut() -> Option<String>,
+/// Delivers a background pixel click as one AXPress on the hit-tested
+/// element. Returns false without pressing when the press would be hollow,
+/// so the caller sends the routed pixel click instead; otherwise it returns
+/// whether the press succeeded. A press that succeeded is never followed by
+/// the routed click: a page runs its handler from the press, and a value that
+/// shows the press only later, or a control the press replaced, would take a
+/// second click.
+fn pixel_hit_press(
+    advertised: &[String],
+    vcl: impl FnOnce() -> bool,
+    chromium: impl FnOnce() -> bool,
+    ancestor_roles: impl FnOnce() -> Vec<String>,
+    press: impl FnOnce() -> bool,
 ) -> bool {
-    let Some(before) = before.filter(|before| match role {
-        "AXCheckBox" => true,
-        "AXRadioButton" => *before != "1",
-        _ => false,
-    }) else {
-        return true;
-    };
-    settled_value(
-        |now| toggle_press_shows(role, before, now),
-        read,
-        SELECTION_READBACK_TIMEOUT,
-        SELECTION_READBACK_POLL,
-        SELECTION_READBACK_STABILITY,
-    )
-    .is_some()
+    !unlisted_pixel_press_is_hollow(advertised, vcl, chromium, ancestor_roles) && press()
 }
 
 /// Chromium performs AXPress on any node of a page as a click (a `div` with
@@ -1298,13 +1286,15 @@ impl Tool for ClickTool {
                         CFRelease(element as _);
                         return Ok(false);
                     }
-                    // An element that does not advertise AXPress can still
-                    // accept it as a no-op, which used to come back as a
-                    // pressed click; fall through to the pixel route instead
-                    // (which refuses on a toolkit that drops routed mouse
-                    // events).
-                    if !focus_only
-                        && unlisted_pixel_press_is_hollow(
+                    let delivered = if focus_only {
+                        crate::input::ax_actions::focus_element(element as usize).is_ok()
+                    } else {
+                        // An element that does not advertise AXPress can
+                        // still accept it as a no-op, which used to come back
+                        // as a pressed click; the pixel route takes those
+                        // (and refuses on a toolkit that drops routed mouse
+                        // events).
+                        pixel_hit_press(
                             &crate::ax::bindings::copy_action_names(element),
                             || {
                                 crate::input::pointer_toolkit::detect(pid)
@@ -1314,24 +1304,12 @@ impl Tool for ClickTool {
                             },
                             || crate::ax::enablement::chromium_app(pid),
                             || ancestor_roles(element),
+                            || {
+                                let press = core_foundation::string::CFString::new("AXPress");
+                                AXUIElementPerformAction(element, press.as_concrete_TypeRef())
+                                    == kAXErrorSuccess
+                            },
                         )
-                    {
-                        CFRelease(element as _);
-                        return Ok(false);
-                    }
-                    let delivered = if focus_only {
-                        crate::input::ax_actions::focus_element(element as usize).is_ok()
-                    } else {
-                        let role = copy_string_attr(element, "AXRole").unwrap_or_default();
-                        let read_value = || {
-                            crate::ax::bindings::copy_stringish_attr(element, "AXValue")
-                                .map(|value| value.state_value)
-                        };
-                        let before = read_value();
-                        let press = core_foundation::string::CFString::new("AXPress");
-                        AXUIElementPerformAction(element, press.as_concrete_TypeRef())
-                            == kAXErrorSuccess
-                            && pixel_press_shown(&role, before.as_deref(), read_value)
                     };
                     CFRelease(element as _);
                     Ok(delivered)
@@ -2292,28 +2270,51 @@ mod tests {
     }
 
     #[test]
-    fn a_pixel_press_a_toggle_does_not_show_falls_through_to_the_pixel_click() {
-        let reads = |value: &'static str| move || Some(value.to_owned());
-        // Chromium's tab strip: AXPress on a background tab is accepted and
-        // the tab stays unselected.
-        assert!(!pixel_press_shown("AXRadioButton", Some("0"), reads("0")));
-        assert!(!pixel_press_shown("AXCheckBox", Some("0"), reads("0")));
-        assert!(!pixel_press_shown("AXCheckBox", Some("1"), reads("1")));
-        assert!(pixel_press_shown("AXRadioButton", Some("0"), reads("1")));
-        assert!(pixel_press_shown("AXCheckBox", Some("0"), reads("1")));
-        assert!(pixel_press_shown("AXCheckBox", Some("1"), reads("0")));
-    }
-
-    #[test]
-    fn a_pixel_press_counts_as_acted_where_no_value_can_show_it() {
-        let unread = || -> Option<String> { panic!("no read-back expected") };
-        assert!(pixel_press_shown("AXButton", Some("0"), unread));
-        assert!(
-            pixel_press_shown("AXRadioButton", Some("1"), unread),
-            "already selected"
-        );
-        assert!(pixel_press_shown("AXCheckBox", None, unread), "no value");
-        assert!(pixel_press_shown("AXStaticText", None, unread));
+    fn a_pixel_press_that_succeeded_is_not_followed_by_a_routed_click() {
+        let listed = |actions: &[&str]| actions.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let web = || vec!["AXGroup".to_owned(), "AXWebArea".to_owned()];
+        let strip = || vec!["AXGroup".to_owned(), "AXWindow".to_owned()];
+        let presses = std::cell::Cell::new(0);
+        let press = || {
+            presses.set(presses.get() + 1);
+            true
+        };
+        // A page checkbox whose value changes 800 ms after the click, and one
+        // that replaces itself with a button: the press ran the handler, so
+        // the click counts as delivered and nothing is sent again.
+        for advertised in [listed(&["AXShowMenu"]), listed(&["AXPress", "AXShowMenu"])] {
+            presses.set(0);
+            assert!(pixel_hit_press(&advertised, || false, || true, web, press));
+            assert_eq!(presses.get(), 1);
+        }
+        // A native checkbox that lists AXPress.
+        presses.set(0);
+        assert!(pixel_hit_press(
+            &listed(&["AXPress"]),
+            || false,
+            || false,
+            strip,
+            press
+        ));
+        assert_eq!(presses.get(), 1);
+        // The browser's own views: no press, the routed click is sent once.
+        presses.set(0);
+        assert!(!pixel_hit_press(
+            &listed(&["AXShowMenu"]),
+            || false,
+            || true,
+            strip,
+            press
+        ));
+        assert_eq!(presses.get(), 0);
+        // A press the app refuses leaves the click to the routed path.
+        assert!(!pixel_hit_press(
+            &listed(&["AXPress"]),
+            || false,
+            || false,
+            strip,
+            || false
+        ));
     }
 
     #[test]

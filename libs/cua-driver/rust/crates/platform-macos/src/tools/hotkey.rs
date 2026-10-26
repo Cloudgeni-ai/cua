@@ -625,7 +625,12 @@ impl Tool for HotkeyTool {
                     ""
                 };
                 if let Some(item) = disabled_menu_item {
-                    return disabled_menu_shortcut_result(&key_display, pid, &item);
+                    return disabled_menu_shortcut_result(
+                        &key_display,
+                        pid,
+                        &item,
+                        &changes.result_suffix(),
+                    );
                 }
                 ToolResult::text(format!(
                     "Pressed {key_display} on pid {pid}{label}. Read the window before \
@@ -661,11 +666,17 @@ fn delivered_structured(foreground: bool) -> Value {
 /// app is in the background. Background key events never run a menu key
 /// equivalent, so a background `cmd+w` to Terminal (whose Close Window is
 /// disabled behind another app) closed nothing and used to read as pressed.
-fn disabled_menu_shortcut_result(key_display: &str, pid: i32, item: &str) -> ToolResult {
+fn disabled_menu_shortcut_result(
+    key_display: &str,
+    pid: i32,
+    item: &str,
+    window_changes: &str,
+) -> ToolResult {
     ToolResult::text(format!(
         "Sent {key_display} to pid {pid}, but its menu item {item} is disabled while the app \
          is in the background, and keys sent in the background cannot run a menu command, so \
-         it most likely did nothing. Use a control in the window, or another enabled menu item."
+         it most likely did nothing. Use a control in the window, or another enabled menu \
+         item.{window_changes}"
     ))
     .with_structured(serde_json::json!({
         "path": "key_events",
@@ -695,7 +706,12 @@ mod tests {
 
     #[test]
     fn keys_sent_for_a_disabled_menu_shortcut_report_a_likely_no_op() {
-        let result = disabled_menu_shortcut_result("⌘W", 42, "Shell > Close Window");
+        let result = disabled_menu_shortcut_result(
+            "cmd+w",
+            42,
+            "Shell > Close Window",
+            "\n\n🪟 It opened new window(s): x.",
+        );
         assert_ne!(result.is_error, Some(true), "the keys were sent");
         let structured = result.structured_content.as_ref().unwrap();
         assert_eq!(structured["effect"], "suspected_noop");
@@ -703,6 +719,10 @@ mod tests {
         let text = format!("{:?}", result.content);
         assert!(
             text.contains("Shell > Close Window is disabled while the app is in the background")
+        );
+        assert!(
+            text.contains("another enabled menu item.\\n\\n🪟 It opened"),
+            "{text}"
         );
     }
 
