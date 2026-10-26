@@ -64,6 +64,9 @@ pub struct TopLevelCandidate {
     /// `_AXUIElementGetWindow` result, when the SPI resolved one. Only read
     /// for `AXWindow` roles.
     pub ax_window_id: Option<u32>,
+    /// Not asked anything: the window lookup ran out of time before reaching
+    /// it. Its role is unknown, so it may be another window; never walked.
+    pub unread: bool,
 }
 
 impl TopLevelCandidate {
@@ -73,6 +76,15 @@ impl TopLevelCandidate {
             subrole: None,
             identifier: None,
             ax_window_id,
+            unread: false,
+        }
+    }
+
+    /// A top-level child the window lookup had no time left to ask about.
+    pub fn unread() -> Self {
+        Self {
+            unread: true,
+            ..Self::new("", None)
         }
     }
 
@@ -173,7 +185,8 @@ where
         .iter()
         .enumerate()
         .filter(|(i, c)| {
-            (c.role != "AXWindow" || matched.contains(i))
+            !c.unread
+                && (c.role != "AXWindow" || matched.contains(i))
                 && !(dialog_scope && c.role == "AXMenuBar")
         })
         .map(|(i, _)| i)
@@ -212,6 +225,22 @@ mod tests {
         let d = decide_window_scope(&candidates, 22, never_called);
         assert_eq!(d.scope, WindowScope::Matched);
         assert_eq!(d.walk, vec![0, 2], "menu bar + requested window only");
+    }
+
+    /// Top-level children the window lookup had no time to ask about may be
+    /// other windows: the walk leaves them out rather than reading them as
+    /// this window's non-window children.
+    #[test]
+    fn unasked_top_level_children_are_not_walked() {
+        let candidates = [
+            TopLevelCandidate::new("AXMenuBar", None),
+            TopLevelCandidate::new("AXWindow", Some(22)),
+            TopLevelCandidate::unread(),
+            TopLevelCandidate::unread(),
+        ];
+        let d = decide_window_scope(&candidates, 22, never_called);
+        assert_eq!(d.scope, WindowScope::Matched);
+        assert_eq!(d.walk, vec![0, 1]);
     }
 
     #[test]

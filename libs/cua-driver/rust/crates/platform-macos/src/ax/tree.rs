@@ -513,7 +513,7 @@ unsafe fn scope_top_level(
         .iter()
         .map(|&child| {
             if setup.passed() {
-                return TopLevelCandidate::new("", None);
+                return TopLevelCandidate::unread();
             }
             let read = |attribute: &str| {
                 setup.bound(child);
@@ -535,6 +535,7 @@ unsafe fn scope_top_level(
                 subrole,
                 identifier,
                 ax_window_id,
+                unread: false,
             }
         })
         .collect();

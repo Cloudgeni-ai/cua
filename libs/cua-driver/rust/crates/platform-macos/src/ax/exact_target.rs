@@ -250,19 +250,22 @@ fn adopted_within<E>(
 /// bar menu ends at the menu bar instead, and a Chromium `<select>`'s menu
 /// at its pop-up button inside the window.
 ///
+/// Returns the screen frame of the outermost menu passed, so the caller can
+/// tell which window the menu is open over.
+///
 /// # Safety
 ///
 /// `element` must be a valid `AXUIElementRef`.
-unsafe fn element_in_open_app_menu(element: AXUIElementRef) -> bool {
+unsafe fn element_in_open_app_menu(element: AXUIElementRef) -> Option<[f64; 4]> {
     let mut current = element;
     let mut owned = false;
-    let mut in_menu = false;
+    let mut menu_frame: Option<Option<[f64; 4]>> = None;
     let mut found = false;
     for _ in 0..MAX_ANCESTRY_DEPTH {
         match copy_string_attr(current, "AXRole").as_deref() {
-            Some("AXMenu") => in_menu = true,
+            Some("AXMenu") => menu_frame = Some(super::bindings::element_screen_rect(current)),
             Some("AXApplication") => {
-                found = in_menu;
+                found = menu_frame.is_some();
                 break;
             }
             Some("AXWindow" | "AXSheet" | "AXMenuBar" | "AXMenuBarItem") | None => break,
@@ -279,7 +282,7 @@ unsafe fn element_in_open_app_menu(element: AXUIElementRef) -> bool {
             }
             None => {
                 owned = false;
-                found = in_menu;
+                found = menu_frame.is_some();
                 break;
             }
         }
@@ -287,7 +290,27 @@ unsafe fn element_in_open_app_menu(element: AXUIElementRef) -> bool {
     if owned {
         CFRelease(current as CFTypeRef);
     }
-    found
+    if found {
+        menu_frame.flatten()
+    } else {
+        None
+    }
+}
+
+/// Whether a menu with screen frame `menu` is open over the window with frame
+/// `window` (both `[x, y, width, height]` in screen points): they overlap.
+/// A menu the app opens over another of its windows is that window's.
+fn menu_over_window(menu: [f64; 4], window: [f64; 4]) -> bool {
+    let [mx, my, mw, mh] = menu;
+    let [wx, wy, ww, wh] = window;
+    mw > 0.0
+        && mh > 0.0
+        && ww > 0.0
+        && wh > 0.0
+        && mx < wx + ww
+        && mx + mw > wx
+        && my < wy + wh
+        && my + mh > wy
 }
 
 /// Whether `element` sits under the application's own `AXMenuBar`: a bounded
@@ -500,6 +523,14 @@ pub fn gather_background_facts(
         }
     };
 
+    let windows = all_windows();
+    let window_frame = windows
+        .iter()
+        .find(|window| window.pid == pid && window.window_id == window_id)
+        .map(|window| {
+            let bounds = &window.bounds;
+            [bounds.x, bounds.y, bounds.width, bounds.height]
+        });
     // SAFETY: the application element is created and released here; window
     // elements are released inside ax_window_records; the caller guarantees
     // element_ptr stays retained.
@@ -527,8 +558,12 @@ pub fn gather_background_facts(
                 // off the application. It still belongs to this app.
                 let in_menu_bar = window.is_none() && element_in_app_menu_bar(app, element);
                 // So does an item of a menu the app has open outside its
-                // windows (a web <select>'s list in WebKit, a context menu).
-                let in_open_menu = window != Some(window_id) && element_in_open_app_menu(element);
+                // windows (a web <select>'s list in WebKit, a context menu),
+                // when it is open over this window rather than another.
+                let in_open_menu = window != Some(window_id)
+                    && element_in_open_app_menu(element).is_some_and(|menu| {
+                        window_frame.is_some_and(|frame| menu_over_window(menu, frame))
+                    });
                 element_ancestry(window, adopted, in_menu_bar, in_open_menu, window_id)
             });
             let focused_window_id = copy_element_attr(app, "AXFocusedWindow").and_then(|window| {
@@ -545,7 +580,7 @@ pub fn gather_background_facts(
     let competing_keyboard_destinations = count_competing_keyboard_destinations(
         pid,
         window_id,
-        all_windows().iter().map(|window| WindowServerRow {
+        windows.iter().map(|window| WindowServerRow {
             pid: window.pid,
             window_id: window.window_id,
             visible: window.is_on_screen
@@ -622,6 +657,27 @@ mod tests {
             element_ancestry(Some(7), false, false, true, 7),
             ProvenDescendant
         );
+    }
+
+    /// An open menu is a window's only when it is open over that window: a
+    /// context menu the app opens over another of its windows is not.
+    #[test]
+    fn an_open_menu_is_the_window_it_is_open_over() {
+        use super::menu_over_window;
+        // A web <select>'s menu inside its window, and one reaching past it.
+        let window = [-470.0, 1050.0, 420.0, 320.0];
+        assert!(menu_over_window([-447.0, 1117.0, 86.0, 142.0], window));
+        assert!(menu_over_window([-90.0, 1300.0, 160.0, 220.0], window));
+        // A context menu over another window of the app, side by side or
+        // just below.
+        assert!(!menu_over_window([300.0, 400.0, 180.0, 240.0], window));
+        assert!(!menu_over_window([-447.0, 1370.0, 86.0, 142.0], window));
+        // A menu or window without a size.
+        assert!(!menu_over_window([-447.0, 1117.0, 0.0, 0.0], window));
+        assert!(!menu_over_window(
+            [-447.0, 1117.0, 86.0, 142.0],
+            [0.0, 0.0, 0.0, 0.0]
+        ));
     }
 
     #[test]
