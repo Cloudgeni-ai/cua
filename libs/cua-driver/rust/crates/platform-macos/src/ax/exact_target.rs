@@ -411,7 +411,7 @@ pub fn focused_sheet_owner_of_pid(pid: i32) -> Option<u32> {
 /// # Safety
 ///
 /// `window` must be a valid `AXUIElementRef` for the duration of the call.
-unsafe fn sheet_owner(window: AXUIElementRef) -> Option<u32> {
+pub(crate) unsafe fn sheet_owner(window: AXUIElementRef) -> Option<u32> {
     if copy_string_attr(window, "AXRole").as_deref() != Some("AXSheet") {
         return None;
     }

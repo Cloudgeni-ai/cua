@@ -197,9 +197,70 @@ where
     }
 }
 
+/// The app's focused window when it is a sheet, reduced to what decides
+/// whether a walk of the requested window must add it.
+///
+/// AppKit lists a sheet among the `AXChildren` of the window it is attached
+/// to, so walking that window reads the sheet. A window class that filters
+/// its own `AXChildren` (Firefox keeps only its own web-content elements and
+/// the title-bar buttons) drops the sheet, and sheets are never in
+/// `AXWindows`, so an Open panel shown on such a window could not be read at
+/// all: not through the window, and not on its own window id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FocusedSheet {
+    /// The window the sheet is attached to (its `AXParent` chain), when that
+    /// is a window other than the sheet's own.
+    pub owner: Option<u32>,
+    /// Whether that window's `AXChildren` list the sheet already.
+    pub listed_by_owner: bool,
+}
+
+/// Whether a walk scoped to `requested` adds `sheet` beside the window: only a
+/// sheet attached to that very window, and only when the window's own children
+/// leave it out (otherwise it is walked there, and adding it would read it
+/// twice). A sheet on another window of the app is never added.
+pub fn adds_focused_sheet(sheet: FocusedSheet, requested: u32) -> bool {
+    sheet.owner == Some(requested) && !sheet.listed_by_owner
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Firefox's Open panel: a sheet on the requested window that the
+    /// window's children leave out is walked with it.
+    #[test]
+    fn a_sheet_its_window_leaves_out_is_added() {
+        let sheet = FocusedSheet {
+            owner: Some(22),
+            listed_by_owner: false,
+        };
+        assert!(adds_focused_sheet(sheet, 22));
+    }
+
+    /// AppKit lists the sheet under its window: reading it again would show
+    /// every control twice.
+    #[test]
+    fn a_sheet_its_window_lists_is_not_added_twice() {
+        let sheet = FocusedSheet {
+            owner: Some(22),
+            listed_by_owner: true,
+        };
+        assert!(!adds_focused_sheet(sheet, 22));
+    }
+
+    /// A sheet on another window of the app, or one whose window is not
+    /// proven, never lands in this window's snapshot.
+    #[test]
+    fn a_sheet_on_another_or_unknown_window_is_not_added() {
+        for owner in [Some(11), None] {
+            let sheet = FocusedSheet {
+                owner,
+                listed_by_owner: false,
+            };
+            assert!(!adds_focused_sheet(sheet, 22), "owner {owner:?}");
+        }
+    }
 
     fn panel_service_owner() -> WindowOwner {
         WindowOwner::ForeignPid {

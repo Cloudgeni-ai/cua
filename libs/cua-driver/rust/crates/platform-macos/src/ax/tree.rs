@@ -14,7 +14,10 @@
 use super::attributes::{read_retrying_once, NodeAttributes, ReadFailure};
 use super::bindings::*;
 use super::launch::{is_still_launching, LaunchStep, LaunchWait};
-use super::window_scope::{decide_window_scope, ScopeDecision, TopLevelCandidate, WindowScope};
+use super::window_scope::{
+    adds_focused_sheet, decide_window_scope, FocusedSheet, ScopeDecision, TopLevelCandidate,
+    WindowScope,
+};
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 use cua_driver_core::walk_budget::{WalkBudget, WalkOutcome};
 use std::time::Instant;
@@ -403,11 +406,20 @@ fn walk_tree_with_web_content(
                     LaunchStep::Proceed => {}
                 }
             }
-            let walk = decision
+            let mut walk: Vec<AXUIElementRef> = decision
                 .walk
                 .iter()
                 .map(|&index| top_level[index])
                 .collect();
+            let mut top_level = top_level;
+            if decision.scope.is_matched() && !setup.passed() {
+                if let Some(sheet) = copy_detached_sheet(app_elem, wid, &setup) {
+                    // Released with the other top-level elements.
+                    top_level.push(sheet);
+                    walk.push(sheet);
+                }
+                set_messaging_timeout(app_elem);
+            }
             window_scope = Some(decision.scope);
             break (top_level, walk);
         };
@@ -548,6 +560,57 @@ unsafe fn scope_top_level(
 unsafe fn release_all(elements: Vec<AXUIElementRef>) {
     for element in elements {
         CFRelease(element as CFTypeRef);
+    }
+}
+
+/// The app's focused window when it is a sheet attached to `wid` that the
+/// window's own `AXChildren` leave out (see [`FocusedSheet`]), retained for
+/// the caller to walk and release.
+///
+/// # Safety
+///
+/// `app_elem` must be the valid application element of the walked app.
+unsafe fn copy_detached_sheet(
+    app_elem: AXUIElementRef,
+    wid: u32,
+    setup: &SetupDeadline,
+) -> Option<AXUIElementRef> {
+    setup.bound(app_elem);
+    let window = copy_element_attr(app_elem, "AXFocusedWindow")?;
+    setup.bound(window);
+    let owner = super::exact_target::sheet_owner(window);
+    if owner != Some(wid) || setup.passed() {
+        CFRelease(window as CFTypeRef);
+        return None;
+    }
+    let listed_by_owner = match copy_element_attr(window, "AXParent") {
+        Some(parent) => {
+            setup.bound(parent);
+            let children = copy_children(parent);
+            let listed = children
+                .iter()
+                .any(|&child| CFEqual(child as CFTypeRef, window as CFTypeRef) != 0);
+            release_all(children);
+            set_messaging_timeout(parent);
+            CFRelease(parent as CFTypeRef);
+            listed
+        }
+        // The owner was found through the parent, so this is not expected;
+        // without the parent's children, leave the sheet to its window.
+        None => true,
+    };
+    if adds_focused_sheet(
+        FocusedSheet {
+            owner,
+            listed_by_owner,
+        },
+        wid,
+    ) {
+        set_messaging_timeout(window);
+        Some(window)
+    } else {
+        CFRelease(window as CFTypeRef);
+        None
     }
 }
 
