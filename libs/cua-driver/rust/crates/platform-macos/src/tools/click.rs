@@ -2381,13 +2381,10 @@ mod tests {
         assert_eq!(settled(vec![None]), None, "unreadable");
     }
 
-    /// Roles and frames by node index, and each node's children.
-    type Tree = (Vec<(&'static str, Option<[f64; 4]>)>, Vec<Vec<usize>>);
-
     /// A browser window whose page answers the hit test with the window
     /// itself: the toolbar spans the top, the page fills the rest, and a later
     /// full-window overlay sibling has no frame.
-    fn browser_tree() -> Tree {
+    fn browser_tree() -> (Vec<(&'static str, Option<[f64; 4]>)>, Vec<Vec<usize>>) {
         let nodes = vec![
             ("AXWindow", Some([0.0, 0.0, 900.0, 700.0])),     // 0
             ("AXGroup", Some([0.0, 0.0, 900.0, 80.0])),       // 1 toolbar
