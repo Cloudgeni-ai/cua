@@ -208,6 +208,23 @@ fn chromium_web_content_takes_press(
         && ancestor_roles().iter().any(|role| role == "AXWebArea")
 }
 
+/// Whether a background pixel click's AXPress on the hit-tested element,
+/// which does not list AXPress, would succeed without doing anything, so the
+/// routed pixel click is delivered instead. LibreOffice's Calc cells accept
+/// the press as a no-op. Chromium answers every press with success: in a
+/// page it runs a click, but in the browser's own views it does nothing, and
+/// the hit test there returns a container rather than the control under the
+/// point (a point on a tab resolves to the tab strip's group, not the tab).
+fn unlisted_pixel_press_is_hollow(
+    advertised: &[String],
+    vcl: impl FnOnce() -> bool,
+    chromium: impl FnOnce() -> bool,
+    ancestor_roles: impl FnOnce() -> Vec<String>,
+) -> bool {
+    !advertised.iter().any(|action| action == "AXPress")
+        && (vcl() || (chromium() && !ancestor_roles().iter().any(|role| role == "AXWebArea")))
+}
+
 /// The value `read` returns when, before `timeout`, it satisfies `shows` and
 /// a second read `stability` later agrees on it. Some apps (Finder's toolbar
 /// view switcher) apply a press and still return an AX error.
@@ -1282,16 +1299,22 @@ impl Tool for ClickTool {
                         return Ok(false);
                     }
                     // An element that does not advertise AXPress can still
-                    // accept it as a no-op. On a toolkit that drops routed
-                    // mouse events (LibreOffice's Calc cells) that no-op used
-                    // to come back as a pressed click; fall through so the
-                    // pixel route refuses instead.
+                    // accept it as a no-op, which used to come back as a
+                    // pressed click; fall through to the pixel route instead
+                    // (which refuses on a toolkit that drops routed mouse
+                    // events).
                     if !focus_only
-                        && !crate::ax::bindings::copy_action_names(element)
-                            .iter()
-                            .any(|action| action == "AXPress")
-                        && crate::input::pointer_toolkit::detect(pid)
-                            == Some(crate::input::pointer_toolkit::PointerReadingToolkit::Vcl)
+                        && unlisted_pixel_press_is_hollow(
+                            &crate::ax::bindings::copy_action_names(element),
+                            || {
+                                crate::input::pointer_toolkit::detect(pid)
+                                    == Some(
+                                        crate::input::pointer_toolkit::PointerReadingToolkit::Vcl,
+                                    )
+                            },
+                            || crate::ax::enablement::chromium_app(pid),
+                            || ancestor_roles(element),
+                        )
                     {
                         CFRelease(element as _);
                         return Ok(false);
@@ -2331,6 +2354,37 @@ mod tests {
             &listed(&["AXPress"]),
             unasked,
             web
+        ));
+    }
+
+    #[test]
+    fn a_pixel_press_chromium_answers_but_ignores_falls_through() {
+        let listed = |actions: &[&str]| actions.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let web = || vec!["AXWebArea".to_owned(), "AXWindow".to_owned()];
+        let strip = || vec!["AXGroup".to_owned(), "AXWindow".to_owned()];
+        let group = listed(&["AXShowMenu"]);
+        assert!(
+            unlisted_pixel_press_is_hollow(&group, || false, || true, strip),
+            "a point on a tab hits the tab strip's group"
+        );
+        assert!(
+            !unlisted_pixel_press_is_hollow(&group, || false, || true, web),
+            "a page runs the press as a click"
+        );
+        assert!(
+            unlisted_pixel_press_is_hollow(&listed(&[]), || true, || false, strip),
+            "Calc cell"
+        );
+        assert!(
+            !unlisted_pixel_press_is_hollow(&listed(&[]), || false, || false, strip),
+            "other apps refuse an unsupported press themselves"
+        );
+        let unasked = || -> bool { panic!("already listed") };
+        assert!(!unlisted_pixel_press_is_hollow(
+            &listed(&["AXPress"]),
+            unasked,
+            unasked,
+            || panic!("already listed")
         ));
     }
 
