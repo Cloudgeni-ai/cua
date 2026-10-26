@@ -89,18 +89,45 @@ impl SetupDeadline {
         self.0.is_some_and(|deadline| Instant::now() >= deadline)
     }
 
+    /// The messaging timeout for a request made now: what is left before the
+    /// deadline, within the ordinary limits.
+    fn timeout_now(&self) -> f32 {
+        messaging_timeout_for(
+            self.0
+                .map(|deadline| deadline.saturating_duration_since(Instant::now())),
+        )
+    }
+
     /// Bound `element`'s next request by what is left before the deadline.
     unsafe fn bound(&self, element: AXUIElementRef) {
-        let left = self
-            .0
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
-        let _ = AXUIElementSetMessagingTimeout(element, messaging_timeout_for(left));
+        let _ = AXUIElementSetMessagingTimeout(element, self.timeout_now());
     }
 }
 
 /// Gives an element the ordinary [`set_messaging_timeout`] back when dropped,
 /// whichever way the walk leaves it.
 struct RestoreMessagingTimeout(AXUIElementRef);
+
+/// What the walk makes of an element whose attributes could not be read.
+#[derive(Debug, PartialEq, Eq)]
+enum FailedRead {
+    /// Counted among the unread: the read says it was cut short.
+    Unread,
+    /// Shown as an empty row, its subtree unknown.
+    EmptyRow,
+}
+
+/// In a timed read, an element the app did not answer (twice, or as the
+/// budget ran out) was not read, so it counts among the unread and the read
+/// says it was cut short, rather than showing an empty row whose subtree
+/// silently disappeared. A walk with no time limit has no cut-short reading
+/// to report, so there it stays an empty row, as does a dead element.
+fn failed_read(failure: ReadFailure, time_limited: bool) -> FailedRead {
+    match failure {
+        ReadFailure::TimedOut if time_limited => FailedRead::Unread,
+        _ => FailedRead::EmptyRow,
+    }
+}
 
 impl Drop for RestoreMessagingTimeout {
     fn drop(&mut self) {
@@ -448,7 +475,10 @@ unsafe fn copy_top_level(
     // `_including` variant recovers it by exact CGWindowID.
     setup.bound(app_elem);
     let from_windows = match window_id {
-        Some(wid) => copy_ax_windows_including(app_elem, pid, wid),
+        // Each window's id is a request to the app too.
+        Some(wid) => {
+            copy_ax_windows_including_bounded(app_elem, pid, wid, |window| setup.bound(window))
+        }
         None => copy_ax_windows(app_elem),
     };
     for w in from_windows {
@@ -561,15 +591,13 @@ unsafe fn walk_element(
     );
     let mut attributes = match read {
         Ok(attributes) => attributes,
-        // The app did not answer twice, or the budget ran out while it was
-        // answering: the element was not read, so it counts among the
-        // unread, not as an empty row whose subtree silently disappears.
-        Err(ReadFailure::TimedOut) => {
-            budget.unread_for_timeout();
-            return;
-        }
-        // A dead element reads as nothing, as it always did.
-        Err(_) => NodeAttributes::default(),
+        Err(failure) => match failed_read(failure, budget.time_limit().is_some()) {
+            FailedRead::Unread => {
+                budget.unread_for_timeout();
+                return;
+            }
+            FailedRead::EmptyRow => NodeAttributes::default(),
+        },
     };
     // Children the app did not answer in time are missing from the tree, so
     // the read says it was cut off rather than showing a childless element.
@@ -1047,6 +1075,45 @@ fn leading_indent_depth(line: &str) -> usize {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn an_unanswering_element_is_unread_only_in_a_timed_read() {
+        assert_eq!(failed_read(ReadFailure::TimedOut, true), FailedRead::Unread);
+        assert_eq!(
+            failed_read(ReadFailure::TimedOut, false),
+            FailedRead::EmptyRow
+        );
+        assert_eq!(
+            failed_read(ReadFailure::Unreadable, true),
+            FailedRead::EmptyRow
+        );
+        assert_eq!(
+            failed_read(ReadFailure::Unreadable, false),
+            FailedRead::EmptyRow
+        );
+    }
+
+    #[test]
+    fn the_window_lookup_deadline_bounds_each_request_by_what_is_left() {
+        // An untimed read: no deadline, ordinary timeout.
+        let untimed = SetupDeadline::new(None);
+        assert!(!untimed.passed());
+        assert_eq!(untimed.timeout_now(), AX_MESSAGING_TIMEOUT_SECONDS);
+        // A timed read gets its timeout_ms plus one messaging timeout.
+        let timed = SetupDeadline::new(Some(std::time::Duration::from_millis(1000)));
+        let left = timed.0.unwrap().saturating_duration_since(Instant::now());
+        assert!(left > std::time::Duration::from_millis(2900));
+        assert!(left <= std::time::Duration::from_millis(3000));
+        assert!(!timed.passed());
+        assert_eq!(timed.timeout_now(), AX_MESSAGING_TIMEOUT_SECONDS);
+        // Close to the deadline each request gets only what is left.
+        let near = SetupDeadline(Some(Instant::now() + std::time::Duration::from_millis(500)));
+        assert!(near.timeout_now() <= 0.5 && near.timeout_now() > 0.3);
+        // Past it, requests get the shortest timeout and the lookup stops.
+        let past = SetupDeadline(Some(Instant::now() - std::time::Duration::from_millis(1)));
+        assert!(past.passed());
+        assert_eq!(past.timeout_now(), AX_MIN_BUDGETED_TIMEOUT_SECONDS);
+    }
 
     #[test]
     fn writable_value_controls_are_addressable_without_actions() {

@@ -1038,6 +1038,9 @@ struct PopupOption {
     element: AXUIElementRef,
     title: String,
     value: String,
+    /// Read from a menu found open outside the button (see
+    /// [`anchored_open_menu`]) rather than from the button's own children.
+    outside: bool,
 }
 
 /// Release every retained option.
@@ -1069,7 +1072,10 @@ fn popup_options(popup: AXUIElementRef, pid: i32) -> Vec<PopupOption> {
     if options.is_empty() {
         if let Some(menu) = anchored_open_menu(popup, pid) {
             for item in unsafe { copy_children(menu) } {
-                options.push(describe_option(item));
+                options.push(PopupOption {
+                    outside: true,
+                    ..describe_option(item)
+                });
             }
             unsafe { CFRelease(menu as _) };
             options.retain(|option| !(option.title.is_empty() && option.value.is_empty()));
@@ -1078,26 +1084,53 @@ fn popup_options(popup: AXUIElementRef, pid: i32) -> Vec<PopupOption> {
     options
 }
 
-/// How far, in points, an open menu may reach past its pop-up button's frame
-/// and still be that button's menu. AppKit lays a pop-up button's menu over
-/// the button, with the chosen item on top of it.
-const MENU_ANCHOR_SLACK: f64 = 24.0;
+/// How far, in points, the middle of an open menu's chosen item may lie
+/// outside its pop-up button's frame and still be over the button.
+const CHOSEN_ITEM_SLACK: f64 = 4.0;
 
 /// How many of a pop-up button's ancestors are searched for the menu it has
 /// open, up to its window.
 const MENU_HOLDER_DEPTH: usize = 16;
 
-/// Whether a menu with screen frame `menu` (x, y, width, height) is laid over
-/// a pop-up button with frame `popup`, as the menu the button opened is.
-fn menu_anchored_to(popup: [f64; 4], menu: [f64; 4]) -> bool {
-    let [px, py, pw, ph] = popup;
-    let [mx, my, mw, mh] = menu;
-    mw > 0.0
-        && mh > 0.0
-        && mx < px + pw + MENU_ANCHOR_SLACK
-        && mx + mw > px - MENU_ANCHOR_SLACK
-        && my < py + ph + MENU_ANCHOR_SLACK
-        && my + mh > py - MENU_ANCHOR_SLACK
+/// What an open menu's item reads, for telling whose menu it is.
+struct MenuItemFacts {
+    title: String,
+    value: String,
+    selected: Option<bool>,
+    /// `[x, y, width, height]` in screen points.
+    frame: Option<[f64; 4]>,
+}
+
+/// Whether an open menu listing `items` is the menu of the pop-up button with
+/// frame `popup` that shows `shown`.
+///
+/// AppKit lays a pop-up button's menu over the button with the chosen item
+/// (the option the button shows, the one item reading selected as the menu
+/// opens) on top of it. So the menu is the button's only when its one
+/// selected item is the option the button shows and lies over the button. A
+/// menu merely lying over the button (the tall open menu of a select just
+/// above it, a context menu) is not: its selected item names another value,
+/// lies elsewhere, or there is none.
+fn menu_is_the_buttons(popup: [f64; 4], shown: &str, items: &[MenuItemFacts]) -> bool {
+    let selected: Vec<&MenuItemFacts> = items
+        .iter()
+        .filter(|item| item.selected == Some(true))
+        .collect();
+    let [chosen] = selected.as_slice() else {
+        return false;
+    };
+    let Some([x, y, width, height]) = chosen.frame else {
+        return false;
+    };
+    let [px, py, pwidth, pheight] = popup;
+    let middle = y + height / 2.0;
+    (already_selected(shown, &chosen.title) || already_selected(shown, &chosen.value))
+        && width > 0.0
+        && height > 0.0
+        && middle >= py - CHOSEN_ITEM_SLACK
+        && middle <= py + pheight + CHOSEN_ITEM_SLACK
+        && x < px + pwidth
+        && x + width > px
 }
 
 /// The menu a pop-up button has open outside its own children, retained.
@@ -1106,9 +1139,10 @@ fn menu_anchored_to(popup: [f64; 4], menu: [f64; 4]) -> bool {
 /// button's ancestors (the menu itself names no parent), not under the
 /// button, and the button reports `AXExpanded` false all the while; other
 /// apps hang such a menu off the application. A menu found there is the
-/// button's when it lists items and lies over the button.
+/// button's only when [`menu_is_the_buttons`] says so.
 fn anchored_open_menu(popup: AXUIElementRef, pid: i32) -> Option<AXUIElementRef> {
     let popup_frame = unsafe { crate::ax::bindings::element_screen_rect(popup) }?;
+    let shown = unsafe { copy_string_attr(popup, "AXValue") }.unwrap_or_default();
     let mut holders = Vec::new();
     let mut current = popup;
     for _ in 0..MENU_HOLDER_DEPTH {
@@ -1134,15 +1168,25 @@ fn anchored_open_menu(popup: AXUIElementRef, pid: i32) -> Option<AXUIElementRef>
         for child in unsafe { copy_children(holder) } {
             let is_menu = found.is_none()
                 && unsafe { copy_string_attr(child, "AXRole") }.as_deref() == Some("AXMenu")
-                && unsafe { crate::ax::bindings::element_screen_rect(child) }
-                    .is_some_and(|frame| menu_anchored_to(popup_frame, frame))
                 && {
-                    let items = unsafe { copy_children(child) };
-                    let listed = !items.is_empty();
-                    for item in items {
-                        unsafe { CFRelease(item as _) };
-                    }
-                    listed
+                    let items: Vec<MenuItemFacts> = unsafe { copy_children(child) }
+                        .into_iter()
+                        .map(|item| unsafe {
+                            crate::ax::bindings::AXUIElementSetMessagingTimeout(
+                                item,
+                                POPUP_PRESS_TIMEOUT_SECONDS,
+                            );
+                            let facts = MenuItemFacts {
+                                title: copy_string_attr(item, "AXTitle").unwrap_or_default(),
+                                value: copy_string_attr(item, "AXValue").unwrap_or_default(),
+                                selected: copy_bool_attr(item, "AXSelected"),
+                                frame: crate::ax::bindings::element_screen_rect(item),
+                            };
+                            CFRelease(item as _);
+                            facts
+                        })
+                        .collect();
+                    menu_is_the_buttons(popup_frame, &shown, &items)
                 };
             if is_menu {
                 found = Some(child);
@@ -1160,6 +1204,30 @@ fn describe_option(element: AXUIElementRef) -> PopupOption {
         element,
         title: unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default(),
         value: unsafe { copy_string_attr(element, "AXValue") }.unwrap_or_default(),
+        outside: false,
+    }
+}
+
+/// How long a pop-up button may take to show the option whose menu item was
+/// pressed.
+const POPUP_VALUE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Whether the pop-up button comes to show the option titled `title` (or
+/// valued `value`) within [`POPUP_VALUE_TIMEOUT`]. A button whose value cannot
+/// be read is taken at its word, as before.
+fn popup_shows_option(popup: AXUIElementRef, title: &str, value: &str) -> bool {
+    let deadline = std::time::Instant::now() + POPUP_VALUE_TIMEOUT;
+    loop {
+        let Some(shown) = (unsafe { copy_string_attr(popup, "AXValue") }) else {
+            return true;
+        };
+        if already_selected(&shown, title) || already_selected(&shown, value) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        crate::timing::sleep(POPUP_POLL_INTERVAL);
     }
 }
 
@@ -1537,12 +1605,27 @@ fn select_popup_option(
         Some(i) => {
             let option = &options[i];
             let err = unsafe { perform_action(option.element, "AXPress") };
-            if err == kAXErrorSuccess {
-                let label = if option.title.is_empty() {
-                    &option.value
-                } else {
-                    &option.title
-                };
+            let label = if option.title.is_empty() {
+                &option.value
+            } else {
+                &option.title
+            };
+            // An item of a menu found outside the button is checked on the
+            // button afterwards: it must now show that option.
+            let took =
+                || !option.outside || popup_shows_option(element, &option.title, &option.value);
+            if err == kAXErrorSuccess && !took() {
+                if opened_menu {
+                    dismiss_popup_menu(element, pid);
+                }
+                let shown = unsafe { copy_string_attr(element, "AXValue") }.unwrap_or_default();
+                Err(anyhow::anyhow!(
+                    "AXPopUpButton [{element_index}] \"{element_title}\" shows '{}' after its \
+                     '{label}' menu item was pressed, so the selection did not take. Read the \
+                     window again before retrying.",
+                    shown.trim()
+                ))
+            } else if err == kAXErrorSuccess {
                 Ok(format!(
                     "✅ Selected '{label}' in AXPopUpButton [{element_index}] \
                      \"{element_title}\" via AX menu item AXPress{}.",
@@ -1583,7 +1666,7 @@ fn select_popup_option(
 
 #[cfg(test)]
 mod popup_option_tests {
-    use super::{already_selected, matching_option, menu_anchored_to};
+    use super::{already_selected, matching_option, menu_is_the_buttons, MenuItemFacts};
 
     fn pairs(titles: &[&str]) -> Vec<(String, String)> {
         titles
@@ -1615,24 +1698,49 @@ mod popup_option_tests {
         assert!(!already_selected("", " "));
     }
 
-    /// A WebKit `<select>`'s open menu lies over its button (the chosen item
-    /// on top of it), whichever display it is on; a menu elsewhere, such as a
-    /// context menu, is not the button's.
+    fn months(selected: usize, top: f64) -> Vec<MenuItemFacts> {
+        ["January", "February", "March", "April", "May", "June"]
+            .iter()
+            .enumerate()
+            .map(|(index, title)| MenuItemFacts {
+                title: (*title).to_owned(),
+                value: String::new(),
+                selected: Some(index == selected),
+                frame: Some([-447.0, top + 22.0 * index as f64, 86.0, 22.0]),
+            })
+            .collect()
+    }
+
+    /// Two stacked WebKit selects with the same options, as read with the
+    /// first one's menu open: the menu (January chosen) lies over both.
+    const FROM: [f64; 4] = [-432.0, 1125.0, 80.0, 20.0];
+    const TO: [f64; 4] = [-432.0, 1162.0, 80.0, 20.0];
+
     #[test]
-    fn a_menu_laid_over_the_button_is_the_buttons() {
-        let popup = [100.0, 200.0, 120.0, 22.0];
-        assert!(menu_anchored_to(popup, [96.0, 156.0, 140.0, 110.0]));
-        // Opened just below, or reaching it from above.
-        assert!(menu_anchored_to(popup, [100.0, 230.0, 140.0, 110.0]));
-        assert!(menu_anchored_to(popup, [100.0, 80.0, 140.0, 110.0]));
-        // A display left of and above the main one has negative coordinates.
-        assert!(menu_anchored_to(
-            [-780.0, -300.0, 160.0, 24.0],
-            [-784.0, -330.0, 170.0, 90.0]
+    fn an_open_menu_is_the_buttons_whose_option_it_lays_over_it() {
+        assert!(menu_is_the_buttons(FROM, "January", &months(0, 1122.0)));
+        // Opened near the top of a display, laid over it all the same.
+        assert!(menu_is_the_buttons(
+            [-432.0, -300.0, 80.0, 20.0],
+            "March",
+            &months(2, -346.0)
         ));
-        assert!(!menu_anchored_to(popup, [400.0, 200.0, 140.0, 110.0]));
-        assert!(!menu_anchored_to(popup, [100.0, 400.0, 140.0, 110.0]));
-        assert!(!menu_anchored_to(popup, [96.0, 156.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn another_selects_open_menu_over_the_button_is_not_its_menu() {
+        let from_menu = months(0, 1122.0);
+        // The neighbour shows another month, or the same one.
+        assert!(!menu_is_the_buttons(TO, "February", &from_menu));
+        assert!(!menu_is_the_buttons(TO, "January", &from_menu));
+        // Even the item lying right over the neighbour, naming its value.
+        assert!(!menu_is_the_buttons(TO, "March", &from_menu));
+        // A menu with no selected item (a context menu) is no button's.
+        let mut context = months(0, 1122.0);
+        context[0].selected = Some(false);
+        assert!(!menu_is_the_buttons(FROM, "January", &context));
+        // Nor is one whose selected item is not what the button shows.
+        assert!(!menu_is_the_buttons(FROM, "February", &from_menu));
     }
 }
 

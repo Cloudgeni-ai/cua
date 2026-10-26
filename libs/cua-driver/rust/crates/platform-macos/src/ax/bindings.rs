@@ -1010,10 +1010,27 @@ pub unsafe fn copy_ax_windows_including(
     pid: i32,
     window_id: u32,
 ) -> Vec<AXUIElementRef> {
+    copy_ax_windows_including_bounded(app, pid, window_id, |_| {})
+}
+
+/// [`copy_ax_windows_including`], calling `bound` on each window element
+/// before its window id is read, so a caller with a deadline can bound that
+/// request (it is answered by the application) like its others.
+///
+/// # Safety
+///
+/// As [`copy_ax_windows_including`].
+pub unsafe fn copy_ax_windows_including_bounded(
+    app: AXUIElementRef,
+    pid: i32,
+    window_id: u32,
+    bound: impl Fn(AXUIElementRef),
+) -> Vec<AXUIElementRef> {
     let mut windows = copy_ax_windows(app);
-    let listed = windows
-        .iter()
-        .any(|&window| ax_get_window_id(window) == Some(window_id));
+    let listed = windows.iter().any(|&window| {
+        bound(window);
+        ax_get_window_id(window) == Some(window_id)
+    });
     if should_probe_off_space_window(listed, || {
         crate::windows::window_space_view_by_id(window_id)
     }) {

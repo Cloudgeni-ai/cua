@@ -147,6 +147,8 @@ pub mod refusal_codes {
     pub const SAME_PID_KEYBOARD_AMBIGUITY: &str = "same_pid_keyboard_ambiguity";
     pub const ELEMENT_OUTSIDE_TARGET_WINDOW: &str = "element_outside_target_window";
     pub const ELEMENT_IN_ATTACHED_WINDOW: &str = "element_in_attached_window";
+    /// The element is an item of a menu the app has open over the window.
+    pub const ELEMENT_IN_OPEN_MENU: &str = "element_in_open_menu";
     pub const SCREEN_LOCKED: &str = "screen_locked";
 }
 
@@ -295,7 +297,7 @@ pub fn decide_background_input(
         ElementAncestry::OpenAppMenu if action == BackgroundAction::AxSemantic => {}
         ElementAncestry::OpenAppMenu => {
             return refuse(
-                refusal_codes::ELEMENT_IN_ATTACHED_WINDOW,
+                refusal_codes::ELEMENT_IN_OPEN_MENU,
                 format!(
                     "the addressed element is in a menu the app has open over window {}; \
                      pointer and key input sent to that window would not reach the menu, so \
@@ -819,7 +821,7 @@ mod tests {
         {
             match decide_background_input(TARGET, &facts, action) {
                 BackgroundInputDecision::Refuse(refusal) => {
-                    assert_eq!(refusal.code, refusal_codes::ELEMENT_IN_ATTACHED_WINDOW);
+                    assert_eq!(refusal.code, refusal_codes::ELEMENT_IN_OPEN_MENU);
                     assert!(refusal.reason.contains("a menu the app has open"));
                     assert!(refusal.advice.is_none());
                 }
