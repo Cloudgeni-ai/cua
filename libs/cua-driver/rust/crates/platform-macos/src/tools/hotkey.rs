@@ -297,6 +297,10 @@ impl Tool for HotkeyTool {
         // item in the background instead (verified for Save), or refuse when
         // macOS keeps it disabled. No key events are sent on this route.
         let mut key_scope: Option<crate::input::skylight::WindowKeyScope> = None;
+        // The combo's menu item when macOS keeps it disabled while the app is
+        // in the background. The keys are still sent (a view of the window
+        // can handle them), but they cannot run that menu command.
+        let mut disabled_menu_item: Option<String> = None;
         if !fg && px.is_none() {
             if let (Some(wid), Some(combo)) = (
                 window_id,
@@ -338,7 +342,7 @@ impl Tool for HotkeyTool {
                     let menu_result = super::invoke_menu::run_in_background(
                         pid,
                         wid,
-                        item.path,
+                        item.path.clone(),
                         super::invoke_menu::MenuRequest::KeyEquivalent(key_display.clone()),
                     )
                     .await;
@@ -347,6 +351,7 @@ impl Tool for HotkeyTool {
                     if !menu_allows_key_fallback(&menu_result) {
                         return menu_result;
                     }
+                    disabled_menu_item = Some(item.path.join(" > "));
                 }
             }
         }
@@ -619,6 +624,9 @@ impl Tool for HotkeyTool {
                 } else {
                     ""
                 };
+                if let Some(item) = disabled_menu_item {
+                    return disabled_menu_shortcut_result(&key_display, pid, &item);
+                }
                 ToolResult::text(format!(
                     "Pressed {key_display} on pid {pid}{label}. Read the window before \
                      sending it again.{}",
@@ -649,6 +657,24 @@ fn delivered_structured(foreground: bool) -> Value {
     })
 }
 
+/// Keys sent for a shortcut whose menu item macOS keeps disabled while the
+/// app is in the background. Background key events never run a menu key
+/// equivalent, so a background `cmd+w` to Terminal (whose Close Window is
+/// disabled behind another app) closed nothing and used to read as pressed.
+fn disabled_menu_shortcut_result(key_display: &str, pid: i32, item: &str) -> ToolResult {
+    ToolResult::text(format!(
+        "Sent {key_display} to pid {pid}, but its menu item {item} is disabled while the app \
+         is in the background, and keys sent in the background cannot run a menu command, so \
+         it most likely did nothing. Use a control in the window, or another enabled menu item."
+    ))
+    .with_structured(serde_json::json!({
+        "path": "key_events",
+        "verified": false,
+        "effect": "suspected_noop",
+        "code": "menu_item_disabled_in_background",
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +691,19 @@ mod tests {
         }
         assert!(!menu_allows_key_fallback(&ToolResult::error("unknown")));
         assert!(!menu_allows_key_fallback(&ToolResult::text("done")));
+    }
+
+    #[test]
+    fn keys_sent_for_a_disabled_menu_shortcut_report_a_likely_no_op() {
+        let result = disabled_menu_shortcut_result("⌘W", 42, "Shell > Close Window");
+        assert_ne!(result.is_error, Some(true), "the keys were sent");
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(structured["effect"], "suspected_noop");
+        assert_eq!(structured["code"], "menu_item_disabled_in_background");
+        let text = format!("{:?}", result.content);
+        assert!(
+            text.contains("Shell > Close Window is disabled while the app is in the background")
+        );
     }
 
     #[test]
