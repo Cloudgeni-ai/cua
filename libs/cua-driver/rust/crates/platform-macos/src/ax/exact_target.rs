@@ -49,7 +49,7 @@ const MAX_ADOPTION_NODES: usize = 400;
 /// `element` must be a valid `AXUIElementRef` for the duration of the call.
 pub unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
     if let Some(window) = copy_element_attr(element, "AXWindow") {
-        let window_id = owning_window_id(window);
+        let window_id = owning_window_id(window, &|_| true);
         CFRelease(window as CFTypeRef);
         if window_id.is_some() {
             return window_id;
@@ -62,7 +62,7 @@ pub unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
     for _ in 0..MAX_ANCESTRY_DEPTH {
         match copy_string_attr(current, "AXRole").as_deref() {
             Some("AXWindow") | Some("AXSheet") => {
-                resolved = owning_window_id(current);
+                resolved = owning_window_id(current, &|_| true);
                 break;
             }
             Some("AXApplication") | None => break,
