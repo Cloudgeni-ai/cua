@@ -690,6 +690,13 @@ impl Tool for GetWindowStateTool {
             structured["snapshot_id"] =
                 serde_json::json!(cua_driver_core::element_token::format_snapshot_id(sid));
         }
+        // Chromium performs AXPress on any node of a page as a click, but in
+        // the accessibility mode CUA enables it lists the action on none of
+        // them; `click` takes the press there anyway. Additive, so a consumer
+        // can offer a press on a page's controls by their role.
+        if crate::ax::enablement::chromium_app(pid) {
+            structured["web_content_takes_press"] = serde_json::json!(true);
+        }
         let invalidated: Vec<String> = removed
             .into_iter()
             .chain(replaced.into_iter().flatten())
