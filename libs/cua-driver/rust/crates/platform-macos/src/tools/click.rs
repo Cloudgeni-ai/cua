@@ -178,114 +178,6 @@ fn pixel_hit_press(
     !unlisted_pixel_press_is_hollow(advertised, vcl, chromium, ancestor_roles) && press()
 }
 
-/// Deepest levels and frame reads [`path_to_point`] may take, so a very large
-/// or cyclic tree cannot stall the click.
-const FRAME_DESCENT_DEPTH: usize = 64;
-const FRAME_DESCENT_READS: usize = 2_000;
-
-/// The path below `root` to the element under `point`, found by frame instead
-/// of the app's hit test: at each level the last child whose frame contains
-/// the point (a later sibling is drawn over an earlier one). A child without a
-/// frame is not entered. Empty when no child of `root` contains the point.
-fn path_to_point<N: Copy>(
-    root: N,
-    point: (f64, f64),
-    mut children: impl FnMut(N) -> Vec<N>,
-    mut frame: impl FnMut(N) -> Option<[f64; 4]>,
-    max_reads: usize,
-) -> Vec<N> {
-    let contains =
-        |[x, y, w, h]: [f64; 4]| point.0 >= x && point.0 < x + w && point.1 >= y && point.1 < y + h;
-    let mut path = Vec::new();
-    let mut reads = 0;
-    let mut current = root;
-    'descend: for _ in 0..FRAME_DESCENT_DEPTH {
-        for child in children(current).into_iter().rev() {
-            if reads >= max_reads {
-                break 'descend;
-            }
-            reads += 1;
-            if frame(child).is_some_and(contains) {
-                path.push(child);
-                current = child;
-                continue 'descend;
-            }
-        }
-        break;
-    }
-    path
-}
-
-/// Roles above the last element of a [`path_to_point`] path, nearest first,
-/// ending with the window the path starts below: what [`ancestor_roles`]
-/// reads for an element through `AXParent`.
-fn path_ancestor_roles(path_roles: &[String]) -> Vec<String> {
-    let mut roles: Vec<String> = path_roles.iter().rev().skip(1).cloned().collect();
-    roles.push("AXWindow".to_owned());
-    roles
-}
-
-/// `pid`'s element under a screen point, when it is in window `window_id`.
-/// Chromium can answer the hit test for a point on a page with the window
-/// itself (seen in a background window after switching tabs), although the
-/// page's elements are in the tree with their frames; a press on the window
-/// does nothing and the routed click does not reach the page. For a Chromium
-/// window hit, the element is found by frame instead, and its ancestor roles
-/// come from that path, since the page may not answer `AXParent` either.
-/// Returns the retained element, which the caller releases, and the ancestor
-/// roles when it was found by frame.
-///
-/// # Safety
-///
-/// Performs AX calls on `pid`'s elements; call from a blocking context.
-unsafe fn element_in_window_at(
-    pid: i32,
-    window_id: u32,
-    x: f64,
-    y: f64,
-) -> Option<(AXUIElementRef, Option<Vec<String>>)> {
-    let hit = element_at_screen_position(pid, x, y)?;
-    if crate::ax::exact_target::element_window_id(hit) != Some(window_id) {
-        CFRelease(hit as CFTypeRef);
-        return None;
-    }
-    if copy_string_attr(hit, "AXRole").as_deref() != Some("AXWindow")
-        || !crate::ax::enablement::chromium_app(pid)
-    {
-        return Some((hit, None));
-    }
-    let mut held: Vec<AXUIElementRef> = Vec::new();
-    let path = path_to_point(
-        hit as usize,
-        (x, y),
-        |node| {
-            let children = copy_children(node as AXUIElementRef);
-            held.extend(children.iter().copied());
-            children.into_iter().map(|child| child as usize).collect()
-        },
-        |node| element_screen_rect(node as AXUIElementRef),
-        FRAME_DESCENT_READS,
-    );
-    let found = path.last().map(|&node| {
-        core_foundation::base::CFRetain(node as CFTypeRef);
-        node as AXUIElementRef
-    });
-    let roles: Vec<String> = path
-        .iter()
-        .map(|&node| copy_string_attr(node as AXUIElementRef, "AXRole").unwrap_or_default())
-        .collect();
-    for child in held {
-        CFRelease(child as CFTypeRef);
-    }
-    match found {
-        Some(element) => {
-            CFRelease(hit as CFTypeRef);
-            Some((element, Some(path_ancestor_roles(&roles))))
-        }
-        None => Some((hit, None)),
-    }
-}
-
 /// Chromium performs AXPress on any node of a page as a click (a `div` with
 /// a click handler shows as `AXStaticText`), but lists AXPress only in some
 /// accessibility modes: with the manual opt-in CUA uses, a page's buttons list
@@ -1342,17 +1234,11 @@ impl Tool for ClickTool {
             // menu and raise the browser window (CUA-1795).
             if let Some(select_wid) = window_id.filter(|_| !delivery_mode.is_foreground()) {
                 let refusal = tokio::task::spawn_blocking(move || unsafe {
-                    let (element, frame_roles) =
-                        element_in_window_at(pid, select_wid, screen_x, screen_y)?;
-                    let is_select = match &frame_roles {
-                        // Found by frame, which happens only in a Chromium window.
-                        Some(roles) => {
-                            copy_string_attr(element, "AXRole").as_deref() == Some("AXPopUpButton")
-                                && roles.iter().any(|role| role == "AXWebArea")
-                        }
-                        None => super::set_value::is_chromium_web_select(pid, select_wid, element),
-                    };
-                    let refusal = is_select.then(|| {
+                    let element = element_at_screen_position(pid, screen_x, screen_y)?;
+                    let refusal = (crate::ax::exact_target::element_window_id(element)
+                        == Some(select_wid)
+                        && super::set_value::is_chromium_web_select(pid, select_wid, element))
+                    .then(|| {
                         super::set_value::chromium_select_open_refusal(
                             pid, select_wid, None, element,
                         )
@@ -1388,16 +1274,18 @@ impl Tool for ClickTool {
             }) {
                 let focus_only = action == "focus";
                 let ax_result = tokio::task::spawn_blocking(move || unsafe {
+                    let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
+                        return Ok::<bool, anyhow::Error>(false);
+                    };
                     // The pid-scoped hit-test can resolve an element from a
                     // same-process sibling overlapping the requested point.
                     // Require proven ancestry in the requested window before
                     // acting; otherwise fall through to the routed pixel path
                     // (already gated for this exact window).
-                    let Some((element, frame_roles)) =
-                        element_in_window_at(pid, hit_test_wid, screen_x, screen_y)
-                    else {
-                        return Ok::<bool, anyhow::Error>(false);
-                    };
+                    if crate::ax::exact_target::element_window_id(element) != Some(hit_test_wid) {
+                        CFRelease(element as _);
+                        return Ok(false);
+                    }
                     let delivered = if focus_only {
                         crate::input::ax_actions::focus_element(element as usize).is_ok()
                     } else {
@@ -1415,7 +1303,7 @@ impl Tool for ClickTool {
                                     )
                             },
                             || crate::ax::enablement::chromium_app(pid),
-                            || frame_roles.unwrap_or_else(|| ancestor_roles(element)),
+                            || ancestor_roles(element),
                             || {
                                 let press = core_foundation::string::CFString::new("AXPress");
                                 AXUIElementPerformAction(element, press.as_concrete_TypeRef())
@@ -2379,101 +2267,6 @@ mod tests {
         assert_eq!(settled(vec![Some("1"), None]), None, "second read failed");
         assert_eq!(settled(vec![Some("0")]), None, "never moved");
         assert_eq!(settled(vec![None]), None, "unreadable");
-    }
-
-    /// A browser window whose page answers the hit test with the window
-    /// itself: the toolbar spans the top, the page fills the rest, and a later
-    /// full-window overlay sibling has no frame.
-    fn browser_tree() -> (Vec<(&'static str, Option<[f64; 4]>)>, Vec<Vec<usize>>) {
-        let nodes = vec![
-            ("AXWindow", Some([0.0, 0.0, 900.0, 700.0])),     // 0
-            ("AXGroup", Some([0.0, 0.0, 900.0, 80.0])),       // 1 toolbar
-            ("AXGroup", Some([0.0, 0.0, 900.0, 700.0])),      // 2 browser view
-            ("AXWebArea", Some([0.0, 80.0, 900.0, 620.0])),   // 3
-            ("AXGroup", Some([0.0, 80.0, 900.0, 300.0])),     // 4
-            ("AXCheckBox", Some([20.0, 100.0, 260.0, 44.0])), // 5
-            ("AXCheckBox", Some([20.0, 160.0, 260.0, 44.0])), // 6
-            ("AXButton", Some([10.0, 10.0, 30.0, 30.0])),     // 7 toolbar button
-            ("AXGroup", None),                                // 8 frameless overlay
-        ];
-        let children = vec![
-            vec![1, 2, 8],
-            vec![7],
-            vec![3],
-            vec![4],
-            vec![5, 6],
-            vec![],
-            vec![],
-            vec![],
-            vec![5],
-        ];
-        (nodes, children)
-    }
-
-    fn roles_at(point: (f64, f64), max_reads: usize) -> Vec<&'static str> {
-        let (nodes, children) = browser_tree();
-        path_to_point(
-            0usize,
-            point,
-            |n| children[n].clone(),
-            |n| nodes[n].1,
-            max_reads,
-        )
-        .into_iter()
-        .map(|n| nodes[n].0)
-        .collect()
-    }
-
-    #[test]
-    fn a_point_on_a_page_the_hit_test_answered_with_the_window_is_found_by_frame() {
-        let path = roles_at((150.0, 180.0), FRAME_DESCENT_READS);
-        assert_eq!(path, ["AXGroup", "AXWebArea", "AXGroup", "AXCheckBox"]);
-        let path: Vec<String> = path.into_iter().map(str::to_owned).collect();
-        let ancestors = path_ancestor_roles(&path);
-        assert_eq!(ancestors, ["AXGroup", "AXWebArea", "AXGroup", "AXWindow"]);
-        // The page element lists no AXPress, as in that state; with the roles
-        // of its path it is pressed once instead of routed.
-        let presses = std::cell::Cell::new(0);
-        assert!(pixel_hit_press(
-            &["AXShowMenu".to_owned()],
-            || false,
-            || true,
-            || ancestors,
-            || {
-                presses.set(presses.get() + 1);
-                true
-            },
-        ));
-        assert_eq!(presses.get(), 1);
-        // A frameless sibling is not entered even though it is later (through
-        // it the path would be just a group and the checkbox).
-        assert_eq!(
-            roles_at((150.0, 120.0), FRAME_DESCENT_READS),
-            ["AXGroup", "AXWebArea", "AXGroup", "AXCheckBox"]
-        );
-    }
-
-    #[test]
-    fn a_point_on_the_browser_ui_found_by_frame_is_not_under_a_web_area() {
-        // The later full-window view covers the toolbar's frame too, so the
-        // descent ends at the deepest element inside it, which is no page
-        // element: the routed click still takes it.
-        let path: Vec<String> = roles_at((25.0, 25.0), FRAME_DESCENT_READS)
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        assert_eq!(path, ["AXGroup"]);
-        assert!(!pixel_hit_press(
-            &[],
-            || false,
-            || true,
-            || path_ancestor_roles(&path),
-            || panic!("no press on browser UI"),
-        ));
-        // Outside every child: nothing found, the window hit stays.
-        assert!(roles_at((950.0, 750.0), FRAME_DESCENT_READS).is_empty());
-        // The read budget bounds the descent.
-        assert_eq!(roles_at((150.0, 180.0), 2), ["AXGroup"]);
     }
 
     #[test]
