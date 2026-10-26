@@ -662,8 +662,8 @@ pub fn gather_background_facts(
 #[cfg(test)]
 mod tests {
     use super::{
-        count_competing_keyboard_destinations, resolve_owning_window, AxWindowRecord,
-        sheet_takes_posted_keys, WindowServerRow,
+        count_competing_keyboard_destinations, resolve_owning_window, sheet_takes_posted_keys,
+        AxWindowRecord, WindowServerRow,
     };
 
     /// An alert or prompt sheet types what is posted to its app; an Open or
