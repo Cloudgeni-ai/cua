@@ -1010,12 +1010,15 @@ pub unsafe fn copy_ax_windows_including(
     pid: i32,
     window_id: u32,
 ) -> Vec<AXUIElementRef> {
-    copy_ax_windows_including_bounded(app, pid, window_id, |_| {})
+    copy_ax_windows_including_bounded(app, pid, window_id, |_| true)
 }
 
-/// [`copy_ax_windows_including`], calling `bound` on each window element
-/// before its window id is read, so a caller with a deadline can bound that
-/// request (it is answered by the application) like its others.
+/// [`copy_ax_windows_including`], calling `ask` on each window element before
+/// its window id is read, so a caller with a deadline can bound that request
+/// (it is answered by the application) like its others, or, once `ask`
+/// returns false, stop asking. Windows left unasked are returned all the
+/// same, and the requested window is not looked for elsewhere: the caller
+/// treats what it could not ask about as unread.
 ///
 /// # Safety
 ///
@@ -1024,19 +1027,38 @@ pub unsafe fn copy_ax_windows_including_bounded(
     app: AXUIElementRef,
     pid: i32,
     window_id: u32,
-    bound: impl Fn(AXUIElementRef),
+    ask: impl Fn(AXUIElementRef) -> bool,
 ) -> Vec<AXUIElementRef> {
     let mut windows = copy_ax_windows(app);
-    let listed = windows.iter().any(|&window| {
-        bound(window);
-        ax_get_window_id(window) == Some(window_id)
-    });
-    if should_probe_off_space_window(listed, || {
-        crate::windows::window_space_view_by_id(window_id)
+    let listed = listed_window(&windows, window_id, ask, |window| ax_get_window_id(window));
+    if listed.is_some_and(|listed| {
+        should_probe_off_space_window(listed, || {
+            crate::windows::window_space_view_by_id(window_id)
+        })
     }) {
         windows.extend(copy_ax_window_by_remote_token(pid, window_id));
     }
     windows
+}
+
+/// Whether `windows` lists the window `window_id`, reading each one's id with
+/// `id_of` once `may_ask` allows it. `None` when `may_ask` stopped the search
+/// before it could tell; no id is read after that.
+fn listed_window<E: Copy>(
+    windows: &[E],
+    window_id: u32,
+    may_ask: impl Fn(E) -> bool,
+    id_of: impl Fn(E) -> Option<u32>,
+) -> Option<bool> {
+    for &window in windows {
+        if !may_ask(window) {
+            return None;
+        }
+        if id_of(window) == Some(window_id) {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 #[cfg(test)]
@@ -1044,6 +1066,30 @@ mod tests {
     use super::*;
     use crate::windows::WindowSpaceView;
     use core_foundation::{boolean::CFBoolean, number::CFNumber};
+
+    #[test]
+    fn no_window_id_is_asked_for_once_asking_stops() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let id_of = |window: u32| {
+            asked.borrow_mut().push(window);
+            Some(window * 10)
+        };
+        // Found before the stop.
+        assert_eq!(listed_window(&[1, 2, 3], 20, |_| true, id_of), Some(true));
+        assert_eq!(*asked.borrow(), vec![1, 2]);
+        asked.borrow_mut().clear();
+        // Not listed, every id read.
+        assert_eq!(listed_window(&[1, 2, 3], 40, |_| true, id_of), Some(false));
+        assert_eq!(*asked.borrow(), vec![1, 2, 3]);
+        asked.borrow_mut().clear();
+        // Asking stops at the second window: nothing more is read, and the
+        // answer is unknown rather than "not listed".
+        assert_eq!(
+            listed_window(&[1, 2, 3], 30, |window| window < 2, id_of),
+            None
+        );
+        assert_eq!(*asked.borrow(), vec![1]);
+    }
 
     #[test]
     fn remote_token_layout_is_pid_zero_coco_element_id() {

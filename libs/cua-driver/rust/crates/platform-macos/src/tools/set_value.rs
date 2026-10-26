@@ -1097,26 +1097,45 @@ struct MenuItemFacts {
     title: String,
     value: String,
     selected: Option<bool>,
+    /// Whether the item carries a mark (`AXMenuItemMarkChar`): the check a
+    /// pop-up button's menu puts on the option the button shows.
+    marked: bool,
     /// `[x, y, width, height]` in screen points.
     frame: Option<[f64; 4]>,
+}
+
+/// The item an open menu has chosen: its one marked item, or, in a menu that
+/// marks none, its one selected item. `AXSelected` follows the highlight,
+/// which the pointer or the arrow keys move off the chosen option while the
+/// menu stays open; the mark stays on the option the button shows.
+fn chosen_item(items: &[MenuItemFacts]) -> Option<&MenuItemFacts> {
+    let marked: Vec<&MenuItemFacts> = items.iter().filter(|item| item.marked).collect();
+    let candidates = if marked.is_empty() {
+        items
+            .iter()
+            .filter(|item| item.selected == Some(true))
+            .collect()
+    } else {
+        marked
+    };
+    match candidates.as_slice() {
+        [chosen] => Some(chosen),
+        _ => None,
+    }
 }
 
 /// Whether an open menu listing `items` is the menu of the pop-up button with
 /// frame `popup` that shows `shown`.
 ///
 /// AppKit lays a pop-up button's menu over the button with the chosen item
-/// (the option the button shows, the one item reading selected as the menu
-/// opens) on top of it. So the menu is the button's only when its one
-/// selected item is the option the button shows and lies over the button. A
-/// menu merely lying over the button (the tall open menu of a select just
-/// above it, a context menu) is not: its selected item names another value,
-/// lies elsewhere, or there is none.
+/// (the option the button shows, marked, and the one item reading selected
+/// as the menu opens; see [`chosen_item`]) on top of it. So the menu is the
+/// button's only when its chosen item is the option the button shows and
+/// lies over the button. A menu merely lying over the button (the tall open
+/// menu of a select just above it, a context menu) is not: its chosen item
+/// names another value, lies elsewhere, or there is none.
 fn menu_is_the_buttons(popup: [f64; 4], shown: &str, items: &[MenuItemFacts]) -> bool {
-    let selected: Vec<&MenuItemFacts> = items
-        .iter()
-        .filter(|item| item.selected == Some(true))
-        .collect();
-    let [chosen] = selected.as_slice() else {
+    let Some(chosen) = chosen_item(items) else {
         return false;
     };
     let Some([x, y, width, height]) = chosen.frame else {
@@ -1133,16 +1152,9 @@ fn menu_is_the_buttons(popup: [f64; 4], shown: &str, items: &[MenuItemFacts]) ->
         && x + width > px
 }
 
-/// The menu a pop-up button has open outside its own children, retained.
-///
-/// WebKit lists a web `<select>`'s open menu among the children of one of the
-/// button's ancestors (the menu itself names no parent), not under the
-/// button, and the button reports `AXExpanded` false all the while; other
-/// apps hang such a menu off the application. A menu found there is the
-/// button's only when [`menu_is_the_buttons`] says so.
-fn anchored_open_menu(popup: AXUIElementRef, pid: i32) -> Option<AXUIElementRef> {
-    let popup_frame = unsafe { crate::ax::bindings::element_screen_rect(popup) }?;
-    let shown = unsafe { copy_string_attr(popup, "AXValue") }.unwrap_or_default();
+/// Where a pop-up button's menu may be open outside its own children, each
+/// retained: the button's ancestors up to its window, and the application.
+fn menu_holders(popup: AXUIElementRef, pid: i32) -> Vec<AXUIElementRef> {
     let mut holders = Vec::new();
     let mut current = popup;
     for _ in 0..MENU_HOLDER_DEPTH {
@@ -1160,43 +1172,122 @@ fn anchored_open_menu(popup: AXUIElementRef, pid: i32) -> Option<AXUIElementRef>
     if !app.is_null() {
         holders.push(app);
     }
-    let mut found = None;
-    for holder in holders {
+    holders
+}
+
+/// Every menu open outside the pop-up button's own children (see
+/// [`menu_holders`]), each retained.
+///
+/// WebKit lists a web `<select>`'s open menu among the children of one of the
+/// button's ancestors (the menu itself names no parent), not under the
+/// button, and the button reports `AXExpanded` false all the while; other
+/// apps hang such a menu off the application.
+fn open_menus(popup: AXUIElementRef, pid: i32) -> Vec<AXUIElementRef> {
+    let mut menus = Vec::new();
+    for holder in menu_holders(popup, pid) {
         unsafe {
             crate::ax::bindings::AXUIElementSetMessagingTimeout(holder, POPUP_PRESS_TIMEOUT_SECONDS)
         };
         for child in unsafe { copy_children(holder) } {
-            let is_menu = found.is_none()
-                && unsafe { copy_string_attr(child, "AXRole") }.as_deref() == Some("AXMenu")
-                && {
-                    let items: Vec<MenuItemFacts> = unsafe { copy_children(child) }
-                        .into_iter()
-                        .map(|item| unsafe {
-                            crate::ax::bindings::AXUIElementSetMessagingTimeout(
-                                item,
-                                POPUP_PRESS_TIMEOUT_SECONDS,
-                            );
-                            let facts = MenuItemFacts {
-                                title: copy_string_attr(item, "AXTitle").unwrap_or_default(),
-                                value: copy_string_attr(item, "AXValue").unwrap_or_default(),
-                                selected: copy_bool_attr(item, "AXSelected"),
-                                frame: crate::ax::bindings::element_screen_rect(item),
-                            };
-                            CFRelease(item as _);
-                            facts
-                        })
-                        .collect();
-                    menu_is_the_buttons(popup_frame, &shown, &items)
-                };
-            if is_menu {
-                found = Some(child);
+            if unsafe { copy_string_attr(child, "AXRole") }.as_deref() == Some("AXMenu") {
+                menus.push(child);
             } else {
                 unsafe { CFRelease(child as _) };
             }
         }
         unsafe { CFRelease(holder as _) };
     }
+    menus
+}
+
+fn menu_item_facts(menu: AXUIElementRef) -> Vec<MenuItemFacts> {
+    unsafe { copy_children(menu) }
+        .into_iter()
+        .map(|item| unsafe {
+            crate::ax::bindings::AXUIElementSetMessagingTimeout(item, POPUP_PRESS_TIMEOUT_SECONDS);
+            let facts = MenuItemFacts {
+                title: copy_string_attr(item, "AXTitle").unwrap_or_default(),
+                value: copy_string_attr(item, "AXValue").unwrap_or_default(),
+                selected: copy_bool_attr(item, "AXSelected"),
+                marked: copy_string_attr(item, "AXMenuItemMarkChar")
+                    .is_some_and(|mark| !mark.trim().is_empty()),
+                frame: crate::ax::bindings::element_screen_rect(item),
+            };
+            CFRelease(item as _);
+            facts
+        })
+        .collect()
+}
+
+/// The menu a pop-up button has open outside its own children (see
+/// [`open_menus`]), retained: the one [`menu_is_the_buttons`] says is its.
+fn anchored_open_menu(popup: AXUIElementRef, pid: i32) -> Option<AXUIElementRef> {
+    let popup_frame = unsafe { crate::ax::bindings::element_screen_rect(popup) }?;
+    let shown = unsafe { copy_string_attr(popup, "AXValue") }.unwrap_or_default();
+    let mut found = None;
+    for menu in open_menus(popup, pid) {
+        if found.is_none() && menu_is_the_buttons(popup_frame, &shown, &menu_item_facts(menu)) {
+            found = Some(menu);
+        } else {
+            unsafe { CFRelease(menu as _) };
+        }
+    }
     found
+}
+
+/// The entries of `now` that are not in `before`, by `same`.
+fn opened_since<E: Copy>(before: &[E], now: &[E], same: impl Fn(E, E) -> bool) -> Vec<E> {
+    now.iter()
+        .copied()
+        .filter(|menu| !before.iter().any(|earlier| same(*earlier, *menu)))
+        .collect()
+}
+
+fn same_element(a: AXUIElementRef, b: AXUIElementRef) -> bool {
+    unsafe {
+        core_foundation::base::CFEqual(
+            a as core_foundation::base::CFTypeRef,
+            b as core_foundation::base::CFTypeRef,
+        ) != 0
+    }
+}
+
+fn release_elements(elements: &[AXUIElementRef]) {
+    for element in elements {
+        unsafe { CFRelease(*element as _) };
+    }
+}
+
+/// Close every menu open outside the popup now that was not open in
+/// `before` (from [`open_menus`] before this call opened the popup's menu):
+/// one this call opened but could not tell for the popup's, which
+/// [`dismiss_popup_menu`] leaves alone. `AXCancel` first, then Escape when
+/// one is still open.
+fn close_menus_opened_since(popup: AXUIElementRef, pid: i32, before: &[AXUIElementRef]) {
+    let still_open = || {
+        let now = open_menus(popup, pid);
+        let opened = !opened_since(before, &now, same_element).is_empty();
+        release_elements(&now);
+        opened
+    };
+    let now = open_menus(popup, pid);
+    let opened = opened_since(before, &now, same_element);
+    for menu in &opened {
+        let _ = unsafe { perform_action(*menu, "AXCancel") };
+    }
+    let any_opened = !opened.is_empty();
+    release_elements(&now);
+    if !any_opened {
+        return;
+    }
+    let deadline = std::time::Instant::now() + POPUP_CLOSE_TIMEOUT;
+    while still_open() {
+        if std::time::Instant::now() >= deadline {
+            let _ = crate::input::keyboard::press_key_no_auth(pid, "escape", &[]);
+            return;
+        }
+        crate::timing::sleep(POPUP_POLL_INTERVAL);
+    }
 }
 
 fn describe_option(element: AXUIElementRef) -> PopupOption {
@@ -1517,6 +1608,16 @@ fn select_popup_option(
     let mut options = popup_options(element, pid);
     let mut opened_menu = false;
     let mut press_thread = None;
+    // The menus open outside the popup before this call opened its menu, so
+    // that a refusal can close the one it opened even when it cannot tell it
+    // for the popup's.
+    let mut menus_before: Option<Vec<AXUIElementRef>> = None;
+    let close_opened = |menus_before: &Option<Vec<AXUIElementRef>>| {
+        dismiss_popup_menu(element, pid);
+        if let Some(before) = menus_before {
+            close_menus_opened_since(element, pid, before);
+        }
+    };
 
     if matching_option(&option_pairs(&options), value).is_none() {
         // Safari/WebKit: no AX children while the popup is closed. Set the
@@ -1549,6 +1650,7 @@ fn select_popup_option(
         // A menu left open by an earlier click is already showing its items;
         // pressing again would close it.
         if !already_open {
+            menus_before = Some(open_menus(element, pid));
             let popup_address = element as usize;
             press_thread = Some(std::thread::spawn(move || unsafe {
                 let popup = popup_address as AXUIElementRef;
@@ -1589,9 +1691,12 @@ fn select_popup_option(
             crate::timing::sleep(POPUP_POLL_INTERVAL);
         }
         if options.is_empty() {
-            dismiss_popup_menu(element, pid);
+            close_opened(&menus_before);
             if let Some(press) = press_thread.take() {
                 let _ = press.join();
+            }
+            if let Some(before) = menus_before.take() {
+                release_elements(&before);
             }
             anyhow::bail!(
                 "AXPopUpButton [{element_index}] \"{element_title}\" exposed no options even \
@@ -1616,7 +1721,7 @@ fn select_popup_option(
                 || !option.outside || popup_shows_option(element, &option.title, &option.value);
             if err == kAXErrorSuccess && !took() {
                 if opened_menu {
-                    dismiss_popup_menu(element, pid);
+                    close_opened(&menus_before);
                 }
                 let shown = unsafe { copy_string_attr(element, "AXValue") }.unwrap_or_default();
                 Err(anyhow::anyhow!(
@@ -1637,7 +1742,7 @@ fn select_popup_option(
                 ))
             } else {
                 if opened_menu {
-                    dismiss_popup_menu(element, pid);
+                    close_opened(&menus_before);
                 }
                 Err(anyhow::anyhow!(
                     "AXPress on menu item failed with error {err}"
@@ -1646,7 +1751,7 @@ fn select_popup_option(
         }
         None => {
             if opened_menu {
-                dismiss_popup_menu(element, pid);
+                close_opened(&menus_before);
             }
             Err(anyhow::anyhow!(
                 "No option matching '{value}' in AXPopUpButton [{element_index}] \
@@ -1660,13 +1765,18 @@ fn select_popup_option(
     if let Some(press) = press_thread {
         let _ = press.join();
     }
+    if let Some(before) = menus_before {
+        release_elements(&before);
+    }
     release_options(&options);
     result
 }
 
 #[cfg(test)]
 mod popup_option_tests {
-    use super::{already_selected, matching_option, menu_is_the_buttons, MenuItemFacts};
+    use super::{
+        already_selected, matching_option, menu_is_the_buttons, opened_since, MenuItemFacts,
+    };
 
     fn pairs(titles: &[&str]) -> Vec<(String, String)> {
         titles
@@ -1706,6 +1816,7 @@ mod popup_option_tests {
                 title: (*title).to_owned(),
                 value: String::new(),
                 selected: Some(index == selected),
+                marked: false,
                 frame: Some([-447.0, top + 22.0 * index as f64, 86.0, 22.0]),
             })
             .collect()
@@ -1741,6 +1852,45 @@ mod popup_option_tests {
         assert!(!menu_is_the_buttons(FROM, "January", &context));
         // Nor is one whose selected item is not what the button shows.
         assert!(!menu_is_the_buttons(FROM, "February", &from_menu));
+    }
+
+    /// The first select's menu with January marked, as it opened, and the
+    /// highlight (`AXSelected`) since moved down onto March, which lies over
+    /// the second select.
+    fn from_menu_highlighting_march() -> Vec<MenuItemFacts> {
+        let mut menu = months(2, 1122.0);
+        menu[0].marked = true;
+        menu
+    }
+
+    #[test]
+    fn a_moved_highlight_does_not_hand_the_menu_to_another_select() {
+        let menu = from_menu_highlighting_march();
+        // Without the mark, the highlight alone would make it the second
+        // select's menu: March is selected, shown there, and over it.
+        let unmarked: Vec<MenuItemFacts> = months(2, 1122.0);
+        assert!(menu_is_the_buttons(TO, "March", &unmarked));
+        // The marked option decides: it is the first select's menu still.
+        assert!(!menu_is_the_buttons(TO, "March", &menu));
+        assert!(menu_is_the_buttons(FROM, "January", &menu));
+    }
+
+    #[test]
+    fn a_menu_marking_several_items_is_no_buttons() {
+        let mut menu = months(0, 1122.0);
+        menu[0].marked = true;
+        menu[3].marked = true;
+        assert!(!menu_is_the_buttons(FROM, "January", &menu));
+    }
+
+    #[test]
+    fn menus_opened_since_are_the_new_ones() {
+        assert_eq!(
+            opened_since(&[1, 2], &[2, 3, 1, 4], |a, b| a == b),
+            vec![3, 4]
+        );
+        assert!(opened_since(&[1, 2], &[2, 1], |a, b| a == b).is_empty());
+        assert_eq!(opened_since(&[], &[5], |a: i32, b| a == b), vec![5]);
     }
 }
 
