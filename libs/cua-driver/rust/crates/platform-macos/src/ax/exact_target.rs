@@ -385,10 +385,10 @@ unsafe fn owning_window_id(window: AXUIElementRef) -> Option<u32> {
 }
 
 /// The window `pid`'s focused window is attached to when that focused window
-/// is a sheet (a Save or Open panel, an alert shown on a window): AppKit
-/// makes the sheet key while it is up, and key events posted to the app go to
-/// it. `None` when the focused window is not a sheet or its parent window is
-/// not proven.
+/// is a sheet that takes posted keys (an alert or prompt shown on a window):
+/// AppKit makes the sheet key while it is up, and key events posted to the
+/// app go to it. `None` when the focused window is not such a sheet or its
+/// parent window is not proven.
 pub fn focused_sheet_owner_of_pid(pid: i32) -> Option<u32> {
     // SAFETY: every element created or copied here is released here.
     unsafe {
@@ -399,10 +399,30 @@ pub fn focused_sheet_owner_of_pid(pid: i32) -> Option<u32> {
         let window = copy_element_attr(app, "AXFocusedWindow");
         CFRelease(app as CFTypeRef);
         let window = window?;
-        let owner = sheet_owner(window);
+        let owner = key_sheet_owner(window);
         CFRelease(window as CFTypeRef);
         owner
     }
+}
+
+/// Whether a sheet with this `AXIdentifier` acts on keys posted to its app.
+/// An Open or Save panel (`open-panel`, `save-panel`) does not: its file
+/// browser is served by another process, and keys posted to the app while it
+/// is in the background never reach it (Escape leaves it open). Its controls
+/// still take accessibility actions through the window it is attached to.
+fn sheet_takes_posted_keys(identifier: Option<&str>) -> bool {
+    !matches!(identifier, Some("open-panel" | "save-panel"))
+}
+
+/// [`sheet_owner`] of a sheet that takes posted keys, so that keys addressed
+/// to its window may go to it.
+///
+/// # Safety
+///
+/// `window` must be a valid `AXUIElementRef` for the duration of the call.
+unsafe fn key_sheet_owner(window: AXUIElementRef) -> Option<u32> {
+    let owner = sheet_owner(window)?;
+    sheet_takes_posted_keys(copy_string_attr(window, "AXIdentifier").as_deref()).then_some(owner)
 }
 
 /// [`owning_window_id`] of a sheet, when it names a window other than the
@@ -601,9 +621,10 @@ pub fn gather_background_facts(
                 element_ancestry(window, adopted, in_menu_bar, in_open_menu, window_id)
             });
             // A sheet attached to the target holds key for it: keys posted to
-            // the app go to the sheet, which is the target's to answer.
+            // the app go to the sheet, which is the target's to answer (an
+            // Open or Save panel never takes them, so it stays a competitor).
             let focused_window_id = copy_element_attr(app, "AXFocusedWindow").and_then(|window| {
-                let window_id = sheet_owner(window).or_else(|| ax_get_window_id(window));
+                let window_id = key_sheet_owner(window).or_else(|| ax_get_window_id(window));
                 CFRelease(window as CFTypeRef);
                 window_id
             });
@@ -642,8 +663,18 @@ pub fn gather_background_facts(
 mod tests {
     use super::{
         count_competing_keyboard_destinations, resolve_owning_window, AxWindowRecord,
-        WindowServerRow,
+        sheet_takes_posted_keys, WindowServerRow,
     };
+
+    /// An alert or prompt sheet types what is posted to its app; an Open or
+    /// Save panel's file browser never sees it, so keys stay refused there.
+    #[test]
+    fn only_sheets_other_than_file_panels_take_posted_keys() {
+        assert!(sheet_takes_posted_keys(None));
+        assert!(sheet_takes_posted_keys(Some("_NS:87")));
+        assert!(!sheet_takes_posted_keys(Some("open-panel")));
+        assert!(!sheet_takes_posted_keys(Some("save-panel")));
+    }
 
     /// A fake AX node: (role, AXParent index, CGWindowID).
     type FakeNode = (&'static str, Option<usize>, Option<u32>);

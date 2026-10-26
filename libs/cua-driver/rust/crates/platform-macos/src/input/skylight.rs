@@ -69,8 +69,8 @@ pub struct KeyFocus {
     pub window: Option<u32>,
     /// The window holding the app's `AXFocusedUIElement`.
     pub element_window: Option<u32>,
-    /// When the focused window is a sheet (an Open or Save panel, an alert),
-    /// the window it is attached to.
+    /// When the focused window is a sheet that takes posted keys (an alert or
+    /// prompt; not an Open or Save panel), the window it is attached to.
     pub sheet_of: Option<u32>,
 }
 
@@ -82,9 +82,9 @@ impl KeyFocus {
     /// reporting a modeless dialog's field as focused after its document
     /// window has become key and is receiving the keys.
     ///
-    /// A sheet attached to `target` counts as `target`: it is modal to that
-    /// window, AppKit keeps it key while it is up, and a person typing into
-    /// the window types into the sheet.
+    /// A sheet attached to `target` that takes posted keys counts as
+    /// `target`: it is modal to that window, AppKit keeps it key while it is
+    /// up, and a person typing into the window types into the sheet.
     fn routes_to(self, target: u32) -> bool {
         self.window == Some(target) || self.sheet_of == Some(target)
     }
@@ -1729,7 +1729,7 @@ mod key_prime_tests {
         assert_eq!(r, Ok(KeyPrime::AlreadyKey));
     }
 
-    /// A sheet open on the target (an Open panel, an alert) is the app's key
+    /// A sheet open on the target (an alert or prompt) is the app's key
     /// window, with its own window id: keys addressed to the target go to it,
     /// as a person's would, with nothing to prime and nothing to hand back.
     #[test]
