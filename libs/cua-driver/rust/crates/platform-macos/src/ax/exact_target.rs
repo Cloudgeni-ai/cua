@@ -367,11 +367,23 @@ unsafe fn element_in_app_menu_bar(app: AXUIElementRef, element: AXUIElementRef) 
 /// # Safety
 ///
 /// `window` must be a valid `AXUIElementRef` for the duration of the call.
-unsafe fn owning_window_id(window: AXUIElementRef) -> Option<u32> {
+unsafe fn owning_window_id(
+    window: AXUIElementRef,
+    admit: &dyn Fn(AXUIElementRef) -> bool,
+) -> Option<u32> {
     resolve_owning_window(
         RetainedElement::retain(window as usize),
         MAX_SHEET_NESTING,
-        |element| copy_string_attr(element.as_ptr() as AXUIElementRef, "AXRole"),
+        // An element not admitted reads as no role, so the walk stops there
+        // and the sheet keeps its own window id.
+        |element| {
+            let element = element.as_ptr() as AXUIElementRef;
+            if admit(element) {
+                copy_string_attr(element, "AXRole")
+            } else {
+                None
+            }
+        },
         |element| {
             copy_element_attr(element.as_ptr() as AXUIElementRef, "AXParent").map(|parent| {
                 // copy_element_attr returned +1; hand that reference over.
@@ -432,10 +444,25 @@ unsafe fn key_sheet_owner(window: AXUIElementRef) -> Option<u32> {
 ///
 /// `window` must be a valid `AXUIElementRef` for the duration of the call.
 pub(crate) unsafe fn sheet_owner(window: AXUIElementRef) -> Option<u32> {
+    sheet_owner_within(window, &|_| true)
+}
+
+/// [`sheet_owner`] for a read with a deadline: `admit` is asked before the
+/// requests to each element on the way to the parent window, bounds them by
+/// what is left and returns `false` once the deadline has passed. A walk cut
+/// short proves no parent, so the sheet stands in for no other window.
+///
+/// # Safety
+///
+/// `window` must be a valid `AXUIElementRef` for the duration of the call.
+pub(crate) unsafe fn sheet_owner_within(
+    window: AXUIElementRef,
+    admit: &dyn Fn(AXUIElementRef) -> bool,
+) -> Option<u32> {
     if copy_string_attr(window, "AXRole").as_deref() != Some("AXSheet") {
         return None;
     }
-    owning_window_id(window).filter(|owner| Some(*owner) != ax_get_window_id(window))
+    owning_window_id(window, admit).filter(|owner| Some(*owner) != ax_get_window_id(window))
 }
 
 /// Pure sheet-to-parent resolution behind [`owning_window_id`].
@@ -854,6 +881,30 @@ mod tests {
             ("AXSheet", Some(0), Some(173)),
         ];
         assert_eq!(resolve(&tree, 0), Some(172));
+    }
+
+    #[test]
+    fn sheet_walk_cut_short_by_the_deadline_keeps_its_own_id() {
+        // Window 167 <- sheet 172 <- sheet 180; the deadline passes after the
+        // first two elements are asked, so 167 is never reached or proven.
+        let tree = [
+            ("AXWindow", None, Some(167)),
+            ("AXSheet", Some(0), Some(172)),
+            ("AXSheet", Some(1), Some(180)),
+        ];
+        let asked = std::cell::Cell::new(0);
+        let owner = resolve_owning_window(
+            2,
+            8,
+            |&index| {
+                asked.set(asked.get() + 1);
+                (asked.get() <= 2).then(|| tree[index].0.to_owned())
+            },
+            |&index| tree[index].1,
+            |&index| tree[index].2,
+        );
+        assert_eq!(owner, Some(180));
+        assert_eq!(asked.get(), 3);
     }
 
     fn ax_window(window_id: u32, minimized: Option<bool>) -> AxWindowRecord {

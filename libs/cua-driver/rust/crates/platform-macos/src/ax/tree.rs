@@ -105,6 +105,16 @@ impl SetupDeadline {
     unsafe fn bound(&self, element: AXUIElementRef) {
         let _ = AXUIElementSetMessagingTimeout(element, self.timeout_now());
     }
+
+    /// Before the deadline, bound `element`'s next request by what is left
+    /// and return `true`; after it, leave `element` unasked and return `false`.
+    unsafe fn admit(&self, element: AXUIElementRef) -> bool {
+        if self.passed() {
+            return false;
+        }
+        self.bound(element);
+        true
+    }
 }
 
 /// Gives an element the ordinary [`set_messaging_timeout`] back when dropped,
@@ -578,7 +588,7 @@ unsafe fn copy_detached_sheet(
     setup.bound(app_elem);
     let window = copy_element_attr(app_elem, "AXFocusedWindow")?;
     setup.bound(window);
-    let owner = super::exact_target::sheet_owner(window);
+    let owner = super::exact_target::sheet_owner_within(window, &|element| setup.admit(element));
     if owner != Some(wid) || setup.passed() {
         CFRelease(window as CFTypeRef);
         return None;
@@ -1177,6 +1187,9 @@ mod tests {
         let past = SetupDeadline(Some(Instant::now() - std::time::Duration::from_millis(1)));
         assert!(past.passed());
         assert_eq!(past.timeout_now(), AX_MIN_BUDGETED_TIMEOUT_SECONDS);
+        // Past it, the sheet-owner walk asks nothing more: the element is
+        // not touched (a null one would be an error to bound).
+        assert!(!unsafe { past.admit(std::ptr::null_mut()) });
     }
 
     #[test]
