@@ -754,7 +754,12 @@ fn takes_text(role: &str) -> bool {
 
 /// Whether a write is followed by `AXConfirm`: a native (not web) combo box
 /// whose new value the read-back shows.
-fn confirms_combo_box(role: &str, web: bool, verified: Option<bool>, changed: Option<bool>) -> bool {
+fn confirms_combo_box(
+    role: &str,
+    web: bool,
+    verified: Option<bool>,
+    changed: Option<bool>,
+) -> bool {
     role == "AXComboBox" && !web && verified == Some(true) && changed == Some(true)
 }
 
@@ -1621,12 +1626,19 @@ pub(super) fn choose_popup_option_item(
     unsafe { CFRelease(popup as _) };
     Some(match chosen {
         Ok(detail) => {
-            let confirmed = shown.as_deref().is_some_and(|s| already_selected(s, &wanted));
-            ToolResult::text(detail).with_structured(serde_json::json!({
+            let confirmed = shown
+                .as_deref()
+                .is_some_and(|s| already_selected(s, &wanted));
+            let mut structured = serde_json::json!({
                 "path": "ax",
                 "verified": confirmed,
                 "effect": if confirmed { "confirmed" } else { "unverifiable" },
-            }))
+            });
+            // The button read back showing the option is the proof.
+            if confirmed {
+                structured["evidence"] = serde_json::json!([{ "kind": "accessibility_readback" }]);
+            }
+            ToolResult::text(detail).with_structured(structured)
         }
         Err(error) => ToolResult::error(format!("click: {error}")),
     })
@@ -2341,14 +2353,39 @@ mod tests {
 
     #[test]
     fn a_native_combo_box_is_confirmed_once_it_shows_a_new_value() {
-        assert!(confirms_combo_box("AXComboBox", false, Some(true), Some(true)));
+        assert!(confirms_combo_box(
+            "AXComboBox",
+            false,
+            Some(true),
+            Some(true)
+        ));
         // Web content, an unchanged or unconfirmed value, or another role:
         // nothing more is sent.
-        assert!(!confirms_combo_box("AXComboBox", true, Some(true), Some(true)));
-        assert!(!confirms_combo_box("AXComboBox", false, Some(true), Some(false)));
-        assert!(!confirms_combo_box("AXComboBox", false, Some(false), Some(true)));
+        assert!(!confirms_combo_box(
+            "AXComboBox",
+            true,
+            Some(true),
+            Some(true)
+        ));
+        assert!(!confirms_combo_box(
+            "AXComboBox",
+            false,
+            Some(true),
+            Some(false)
+        ));
+        assert!(!confirms_combo_box(
+            "AXComboBox",
+            false,
+            Some(false),
+            Some(true)
+        ));
         assert!(!confirms_combo_box("AXComboBox", false, None, None));
-        assert!(!confirms_combo_box("AXTextField", false, Some(true), Some(true)));
+        assert!(!confirms_combo_box(
+            "AXTextField",
+            false,
+            Some(true),
+            Some(true)
+        ));
     }
 
     #[test]
