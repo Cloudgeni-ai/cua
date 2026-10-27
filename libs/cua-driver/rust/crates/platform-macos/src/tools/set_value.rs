@@ -1586,6 +1586,19 @@ pub(super) fn popup_of_option(element: AXUIElementRef) -> Option<AXUIElementRef>
     None
 }
 
+/// How a choice through an option names its pop-up button: by its title, or
+/// by its accessibility description when it has no title (an AppKit pop-up
+/// labelled for accessibility), or by role alone.
+fn popup_option_subject(title: &str, description: Option<&str>, item_index: usize) -> String {
+    let name = Some(title.trim())
+        .filter(|name| !name.is_empty())
+        .or_else(|| description.map(str::trim).filter(|name| !name.is_empty()));
+    match name {
+        Some(name) => format!("the AXPopUpButton \"{name}\" of menu item [{item_index}]"),
+        None => format!("the AXPopUpButton of menu item [{item_index}]"),
+    }
+}
+
 /// What a press on an option of a pop-up button does: it chooses that option
 /// on the button, as `set_value` with the option's text does. `None` when
 /// `item` is no pop-up button's option, or has no text to choose it by.
@@ -1612,7 +1625,11 @@ pub(super) fn choose_popup_option_item(
     }
     let popup = popup_of_option(item)?;
     let popup_title = unsafe { copy_string_attr(popup, "AXTitle") }.unwrap_or_default();
-    let subject = format!("the AXPopUpButton \"{popup_title}\" of menu item [{item_index}]");
+    let subject = popup_option_subject(
+        &popup_title,
+        unsafe { copy_string_attr(popup, "AXDescription") }.as_deref(),
+        item_index,
+    );
     let chosen = select_popup_option(
         popup,
         item_index,
@@ -2349,6 +2366,23 @@ mod tests {
         for role in ["AXSlider", "AXIncrementor", "AXStepper", "AXValueIndicator"] {
             assert!(!takes_text(role), "{role}");
         }
+    }
+
+    #[test]
+    fn a_choice_through_an_option_names_its_pop_up_by_title_or_description() {
+        assert_eq!(
+            popup_option_subject("Microphone", None, 83),
+            "the AXPopUpButton \"Microphone\" of menu item [83]"
+        );
+        // An AppKit pop-up labelled only for accessibility has no title.
+        assert_eq!(
+            popup_option_subject("", Some("Size"), 4),
+            "the AXPopUpButton \"Size\" of menu item [4]"
+        );
+        assert_eq!(
+            popup_option_subject(" ", Some(" "), 4),
+            "the AXPopUpButton of menu item [4]"
+        );
     }
 
     #[test]
