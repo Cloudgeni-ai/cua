@@ -700,7 +700,7 @@ fn modifier_flags(modifiers: &[&str]) -> CGEventFlags {
 /// with spaces, `_` and `-` dropped, and common spellings folded onto one
 /// name, so "Page_Down", "page-down", "PgDn" and "ArrowLeft" all work. Single
 /// characters ("-", "_" never reaches here as a name) pass through unchanged.
-fn canonical_key_name(key: &str) -> String {
+pub(crate) fn canonical_key_name(key: &str) -> String {
     let lower = key.trim().to_lowercase();
     if lower.chars().count() < 2 {
         return lower;
