@@ -1333,12 +1333,10 @@ fn type_text_blocking(
     {
         match super::key_scope(pid, route.window_id) {
             Ok(scope) => scope,
-            Err(reason) => {
-                return Ok(TypeTextDelivery::Refused(BackgroundRefusal {
-                    code: super::WINDOW_NOT_KEY,
-                    reason,
-                    advice: Some("foreground"),
-                }))
+            Err(unconfirmed) => {
+                return Ok(TypeTextDelivery::Refused(super::key_window_refusal(
+                    unconfirmed,
+                )))
             }
         }
     } else {

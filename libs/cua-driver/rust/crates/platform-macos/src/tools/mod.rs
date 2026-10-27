@@ -438,12 +438,15 @@ pub(crate) fn window_keyboard_action(
 
 /// Make `window_id` the app's key window, confirmed, for pid-routed keys.
 /// `Ok(None)` when no window is addressed or the SPIs are missing (keys go
-/// where they always did). `Err` carries the refusal text: no key may be
-/// posted, it could reach a sibling window.
+/// where they always did). `Err` says why it could not be confirmed: no key
+/// may be posted, it could reach a sibling window.
 pub(crate) fn key_scope(
     pid: i32,
     window_id: Option<u32>,
-) -> Result<Option<crate::input::skylight::WindowKeyScope>, String> {
+) -> Result<
+    Option<crate::input::skylight::WindowKeyScope>,
+    crate::input::skylight::KeyWindowUnconfirmed,
+> {
     match window_id {
         Some(wid) if crate::input::skylight::is_focus_without_raise_available() => {
             crate::input::skylight::enter_exact_window_key(pid as libc::pid_t, wid).map(Some)
@@ -453,8 +456,8 @@ pub(crate) fn key_scope(
 }
 
 /// [`key_scope`] for an async tool: runs the blocking prime off the runtime and
-/// turns an unconfirmed key window into the structured `window_not_key`
-/// refusal. Foreground requests and pid-only calls hold no scope.
+/// turns an unconfirmed key window into the structured `window_not_key` (or
+/// `key_focus_unknown`) refusal. Foreground requests and pid-only calls hold no scope.
 pub(crate) async fn acquire_key_scope(
     pid: i32,
     window_id: Option<u32>,
@@ -468,14 +471,10 @@ pub(crate) async fn acquire_key_scope(
         Ok(Err(_)) if crate::input::skylight::windowserver_connection_invalid() => {
             Err(windowserver_connection_refusal(pid, Some(wid)))
         }
-        Ok(Err(reason)) => Err(background_refusal_result(
+        Ok(Err(unconfirmed)) => Err(background_refusal_result(
             pid,
             wid,
-            &cua_driver_core::background_input::BackgroundRefusal {
-                code: WINDOW_NOT_KEY,
-                reason,
-                advice: Some("foreground"),
-            },
+            &key_window_refusal(unconfirmed),
         )),
         Err(error) => Err(cua_driver_core::protocol::ToolResult::error(format!(
             "Could not prepare the key window for pid {pid}: {error}"
@@ -486,6 +485,27 @@ pub(crate) async fn acquire_key_scope(
 /// Refusal code when the addressed window cannot be confirmed as the app's
 /// key window: no key is sent, none could be proven to reach it.
 pub(crate) const WINDOW_NOT_KEY: &str = "window_not_key";
+
+/// Refusal code when the app named no focused window (or did not answer in
+/// time), so where keys would go is unknown: none is sent.
+pub(crate) const KEY_FOCUS_UNKNOWN: &str = "key_focus_unknown";
+
+/// The refusal for a window that could not be confirmed as the app's key
+/// window: [`KEY_FOCUS_UNKNOWN`] when the app named no focused window,
+/// otherwise [`WINDOW_NOT_KEY`] (another of its windows has focus).
+pub(crate) fn key_window_refusal(
+    unconfirmed: crate::input::skylight::KeyWindowUnconfirmed,
+) -> cua_driver_core::background_input::BackgroundRefusal {
+    cua_driver_core::background_input::BackgroundRefusal {
+        code: if unconfirmed.focus_unknown {
+            KEY_FOCUS_UNKNOWN
+        } else {
+            WINDOW_NOT_KEY
+        },
+        reason: unconfirmed.reason,
+        advice: Some("foreground"),
+    }
+}
 
 /// Acquire the per-PID mutation coordinator, gather fresh exact-target facts,
 /// and ask the pure core for one background decision. `element_ptr` must stay
@@ -1227,6 +1247,29 @@ pub fn register_all(
     // Recording / replay + session-lifecycle tools are platform-independent.
     registry.register_recording_tools();
     registry.register_session_tools();
+}
+
+#[cfg(test)]
+mod key_window_refusal_tests {
+    use crate::input::skylight::KeyWindowUnconfirmed;
+
+    /// An app that names no focused window is not said to have another
+    /// window focused: its refusal has its own code.
+    #[test]
+    fn an_unknown_focus_has_its_own_code() {
+        for (focus_unknown, code) in [
+            (true, super::KEY_FOCUS_UNKNOWN),
+            (false, super::WINDOW_NOT_KEY),
+        ] {
+            let refusal = super::key_window_refusal(KeyWindowUnconfirmed {
+                focus_unknown,
+                reason: "r".into(),
+            });
+            assert_eq!(refusal.code, code);
+            assert_eq!(refusal.reason, "r");
+            assert_eq!(refusal.advice, Some("foreground"));
+        }
+    }
 }
 
 #[cfg(test)]

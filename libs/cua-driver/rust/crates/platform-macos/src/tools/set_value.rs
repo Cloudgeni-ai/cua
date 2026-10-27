@@ -1261,9 +1261,15 @@ fn release_elements(elements: &[AXUIElementRef]) {
 /// Close every menu open outside the popup now that was not open in
 /// `before` (from [`open_menus`] before this call opened the popup's menu):
 /// one this call opened but could not tell for the popup's, which
-/// [`dismiss_popup_menu`] leaves alone. `AXCancel` first, then Escape when
-/// one is still open.
-fn close_menus_opened_since(popup: AXUIElementRef, pid: i32, before: &[AXUIElementRef]) {
+/// [`dismiss_popup_menu`] leaves alone. `AXCancel` first, then Escape only
+/// when WindowServer still shows a menu window that was not on screen in
+/// `windows_before`. Returns whether the menus are seen closed.
+fn close_menus_opened_since(
+    popup: AXUIElementRef,
+    pid: i32,
+    before: &[AXUIElementRef],
+    windows_before: Option<&[u32]>,
+) -> bool {
     let still_open = || {
         let now = open_menus(popup, pid);
         let opened = !opened_since(before, &now, same_element).is_empty();
@@ -1278,15 +1284,65 @@ fn close_menus_opened_since(popup: AXUIElementRef, pid: i32, before: &[AXUIEleme
     let any_opened = !opened.is_empty();
     release_elements(&now);
     if !any_opened {
-        return;
+        return true;
     }
     let deadline = std::time::Instant::now() + POPUP_CLOSE_TIMEOUT;
     while still_open() {
         if std::time::Instant::now() >= deadline {
-            let _ = crate::input::keyboard::press_key_no_auth(pid, "escape", &[]);
-            return;
+            let menu_windows =
+                windows_before.and_then(|before| crate::windows::new_menu_windows(pid, before));
+            return match lingering_menu(menu_windows) {
+                LingeringMenu::Closed => true,
+                LingeringMenu::Unknown => false,
+                // The Escape goes to the app, not to the menu: only a menu
+                // window really on screen makes it land on the menu rather
+                // than in the app's key window.
+                LingeringMenu::Open => {
+                    let _ = crate::input::keyboard::press_key_no_auth(pid, "escape", &[]);
+                    windows_before
+                        .and_then(|before| crate::windows::wait_for_new_menus_closed(pid, before))
+                        == Some(true)
+                }
+            };
         }
         crate::timing::sleep(POPUP_POLL_INTERVAL);
+    }
+    true
+}
+
+/// A menu element that outlasted `AXCancel`, as WindowServer shows it.
+#[derive(Debug, PartialEq, Eq)]
+enum LingeringMenu {
+    /// A menu window opened since is on screen: Escape reaches the menu.
+    Open,
+    /// No menu window opened since is on screen: the menu closed and only its
+    /// accessibility element lingers. Escape would reach the app's window.
+    Closed,
+    /// The window list could not be read: send nothing, say so.
+    Unknown,
+}
+
+/// [`LingeringMenu`] from the count of menu windows on screen that were not
+/// before the call (`None` when unknown).
+fn lingering_menu(new_menu_windows: Option<usize>) -> LingeringMenu {
+    match new_menu_windows {
+        Some(0) => LingeringMenu::Closed,
+        Some(_) => LingeringMenu::Open,
+        None => LingeringMenu::Unknown,
+    }
+}
+
+/// Appended to a refusal when a menu the call opened could not be seen to
+/// close.
+const MENU_MAY_STILL_BE_OPEN: &str = " A menu it opened may still be open.";
+
+/// `suffix` for a message that does not end its last sentence: it ends it
+/// first, and adds nothing when there is nothing to add.
+fn after_sentence(suffix: &str) -> String {
+    if suffix.is_empty() {
+        String::new()
+    } else {
+        format!(".{suffix}")
     }
 }
 
@@ -1612,10 +1668,26 @@ fn select_popup_option(
     // that a refusal can close the one it opened even when it cannot tell it
     // for the popup's.
     let mut menus_before: Option<Vec<AXUIElementRef>> = None;
-    let close_opened = |menus_before: &Option<Vec<AXUIElementRef>>| {
+    // The app's menu windows on screen then, as WindowServer lists them.
+    let mut menu_windows_before: Option<Vec<u32>> = None;
+    // Closes what this call opened; the suffix for its refusal says when a
+    // menu could not be seen to close.
+    let close_opened = |menus_before: &Option<Vec<AXUIElementRef>>,
+                        menu_windows_before: &Option<Vec<u32>>|
+     -> &'static str {
         dismiss_popup_menu(element, pid);
-        if let Some(before) = menus_before {
-            close_menus_opened_since(element, pid, before);
+        match menus_before {
+            Some(before)
+                if !close_menus_opened_since(
+                    element,
+                    pid,
+                    before,
+                    menu_windows_before.as_deref(),
+                ) =>
+            {
+                MENU_MAY_STILL_BE_OPEN
+            }
+            _ => "",
         }
     };
 
@@ -1651,6 +1723,7 @@ fn select_popup_option(
         // pressing again would close it.
         if !already_open {
             menus_before = Some(open_menus(element, pid));
+            menu_windows_before = crate::windows::menu_window_ids(pid);
             let popup_address = element as usize;
             press_thread = Some(std::thread::spawn(move || unsafe {
                 let popup = popup_address as AXUIElementRef;
@@ -1691,7 +1764,7 @@ fn select_popup_option(
             crate::timing::sleep(POPUP_POLL_INTERVAL);
         }
         if options.is_empty() {
-            close_opened(&menus_before);
+            let still_open = close_opened(&menus_before, &menu_windows_before);
             if let Some(press) = press_thread.take() {
                 let _ = press.join();
             }
@@ -1701,7 +1774,8 @@ fn select_popup_option(
             anyhow::bail!(
                 "AXPopUpButton [{element_index}] \"{element_title}\" exposed no options even \
                  after its menu was opened, so nothing was selected. Click the popup, then \
-                 choose the option with press_key (down, return) or a pixel click on the item."
+                 choose the option with press_key (down, return) or a pixel click on the \
+                 item.{still_open}"
             )
         }
     }
@@ -1720,14 +1794,16 @@ fn select_popup_option(
             let took =
                 || !option.outside || popup_shows_option(element, &option.title, &option.value);
             if err == kAXErrorSuccess && !took() {
-                if opened_menu {
-                    close_opened(&menus_before);
-                }
+                let still_open = if opened_menu {
+                    close_opened(&menus_before, &menu_windows_before)
+                } else {
+                    ""
+                };
                 let shown = unsafe { copy_string_attr(element, "AXValue") }.unwrap_or_default();
                 Err(anyhow::anyhow!(
                     "AXPopUpButton [{element_index}] \"{element_title}\" shows '{}' after its \
                      '{label}' menu item was pressed, so the selection did not take. Read the \
-                     window again before retrying.",
+                     window again before retrying.{still_open}",
                     shown.trim()
                 ))
             } else if err == kAXErrorSuccess {
@@ -1741,22 +1817,28 @@ fn select_popup_option(
                     }
                 ))
             } else {
-                if opened_menu {
-                    close_opened(&menus_before);
-                }
+                let still_open = if opened_menu {
+                    close_opened(&menus_before, &menu_windows_before)
+                } else {
+                    ""
+                };
                 Err(anyhow::anyhow!(
-                    "AXPress on menu item failed with error {err}"
+                    "AXPress on menu item failed with error {err}{}",
+                    after_sentence(still_open)
                 ))
             }
         }
         None => {
-            if opened_menu {
-                close_opened(&menus_before);
-            }
+            let still_open = if opened_menu {
+                close_opened(&menus_before, &menu_windows_before)
+            } else {
+                ""
+            };
             Err(anyhow::anyhow!(
                 "No option matching '{value}' in AXPopUpButton [{element_index}] \
-                 \"{element_title}\". Available: [{}]",
-                describe_available(&options)
+                 \"{element_title}\". Available: [{}]{}",
+                describe_available(&options),
+                after_sentence(still_open)
             ))
         }
     };
@@ -1775,8 +1857,19 @@ fn select_popup_option(
 #[cfg(test)]
 mod popup_option_tests {
     use super::{
-        already_selected, matching_option, menu_is_the_buttons, opened_since, MenuItemFacts,
+        already_selected, lingering_menu, matching_option, menu_is_the_buttons, opened_since,
+        LingeringMenu, MenuItemFacts,
     };
+
+    /// A menu element that outlasts `AXCancel` gets an Escape only while a
+    /// menu window opened since is really on screen; otherwise the Escape
+    /// would land in the app's key window.
+    #[test]
+    fn escape_goes_only_to_a_menu_window_on_screen() {
+        assert_eq!(lingering_menu(Some(1)), LingeringMenu::Open);
+        assert_eq!(lingering_menu(Some(0)), LingeringMenu::Closed);
+        assert_eq!(lingering_menu(None), LingeringMenu::Unknown);
+    }
 
     fn pairs(titles: &[&str]) -> Vec<(String, String)> {
         titles

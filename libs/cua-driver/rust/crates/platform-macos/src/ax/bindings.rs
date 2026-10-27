@@ -651,33 +651,61 @@ pub fn raise_focused_window_of_pid(pid: i32) -> bool {
 /// element: a LibreOffice that has never been active names a focused window
 /// but has no focused element, and drops every key posted to it.
 pub fn focused_element_window_id_of_pid(pid: i32) -> Option<u32> {
-    focused_element_window_id_of_pid_within(pid, &|_| true)
+    focused_element_windows_of_pid_within(pid, &|_| true).window
 }
 
-/// [`focused_element_window_id_of_pid`] with `admit` asked before each
+/// The windows `pid`'s focused UI element is in, as Accessibility names them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FocusedElementWindows {
+    /// Its `AXWindow`. For a control of a sheet, and for a sheet that holds
+    /// the focus itself (one with only buttons), AppKit names the window the
+    /// sheet is attached to.
+    pub window: Option<u32>,
+    /// Its `AXTopLevelUIElement`, or the element itself when it is a window
+    /// or sheet: the sheet a sheet's control is in.
+    pub top_level: Option<u32>,
+}
+
+/// [`FocusedElementWindows`] of `pid`, with `admit` asked before each
 /// element's requests, as in [`focused_window_id_of_pid_within`].
-pub(crate) fn focused_element_window_id_of_pid_within(
+pub(crate) fn focused_element_windows_of_pid_within(
     pid: i32,
     admit: &dyn Fn(AXUIElementRef) -> bool,
-) -> Option<u32> {
+) -> FocusedElementWindows {
+    // The window id of `attribute` of `element`, read under `admit`.
+    let window_of = |element: AXUIElementRef, attribute: &str| unsafe {
+        let window = admit(element)
+            .then(|| copy_element_attr(element, attribute))
+            .flatten()?;
+        let window_id = admit(window).then(|| ax_get_window_id(window)).flatten();
+        CFRelease(window as CFTypeRef);
+        window_id
+    };
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
-            return None;
+            return FocusedElementWindows::default();
         }
         let element = admit(app)
             .then(|| copy_element_attr(app, "AXFocusedUIElement"))
             .flatten();
         CFRelease(app as CFTypeRef);
-        let element = element?;
-        let window = admit(element)
-            .then(|| copy_element_attr(element, "AXWindow"))
-            .flatten();
+        let Some(element) = element else {
+            return FocusedElementWindows::default();
+        };
+        let window = window_of(element, "AXWindow");
+        let is_window = admit(element)
+            && matches!(
+                copy_string_attr(element, "AXRole").as_deref(),
+                Some("AXWindow" | "AXSheet")
+            );
+        let top_level = if is_window {
+            admit(element).then(|| ax_get_window_id(element)).flatten()
+        } else {
+            window_of(element, "AXTopLevelUIElement")
+        };
         CFRelease(element as CFTypeRef);
-        let window = window?;
-        let window_id = admit(window).then(|| ax_get_window_id(window)).flatten();
-        CFRelease(window as CFTypeRef);
-        window_id
+        FocusedElementWindows { window, top_level }
     }
 }
 

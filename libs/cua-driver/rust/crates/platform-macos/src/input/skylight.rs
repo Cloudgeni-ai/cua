@@ -69,6 +69,11 @@ pub struct KeyFocus {
     pub window: Option<u32>,
     /// The window holding the app's `AXFocusedUIElement`.
     pub element_window: Option<u32>,
+    /// The window of the focused element's top-level element: the sheet a
+    /// sheet's control is in, or the sheet itself when it holds the focus.
+    /// (Its `AXWindow`, [`Self::element_window`], is the window the sheet is
+    /// attached to.)
+    pub element_top_level: Option<u32>,
     /// When the focused window is a sheet that takes posted keys (an alert or
     /// prompt; not an Open or Save panel), the window it is attached to.
     pub sheet_of: Option<u32>,
@@ -85,15 +90,16 @@ impl KeyFocus {
     /// A sheet attached to `target` that takes posted keys counts as
     /// `target`: it is modal to that window, AppKit keeps it key while it is
     /// up, and a person typing into the window types into the sheet.
-    /// Only when the app's focused element is proven inside the sheet,
-    /// though: a panel whose contents another process serves (a file panel,
-    /// whatever it calls itself) shows no focused element of its own, and
-    /// keys posted to the app never reach it.
+    /// Only when the app's focused element is proven to be the sheet or in
+    /// it (its top-level element is the sheet), though: a panel whose
+    /// contents another process serves (a file panel, whatever it calls
+    /// itself) shows no focused element of its own, and keys posted to the
+    /// app never reach it.
     fn routes_to(self, target: u32) -> bool {
         self.window == Some(target)
             || (self.sheet_of == Some(target)
                 && self.window.is_some()
-                && self.element_window == self.window)
+                && self.element_top_level == self.window)
     }
 
     /// `target` is key with nothing left to prime. A focused window without
@@ -102,6 +108,16 @@ impl KeyFocus {
     fn settled_on(self, target: u32) -> bool {
         self.routes_to(target) && self.element_window.is_some()
     }
+}
+
+/// Keys were not posted: the target could not be confirmed as the window
+/// keys posted to the app go to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyWindowUnconfirmed {
+    /// The app named no focused window (or did not answer in time), so
+    /// where keys would go is unknown, rather than another of its windows.
+    pub focus_unknown: bool,
+    pub reason: String,
 }
 
 /// Make `target` the app's key window and PROVE it before any key is posted.
@@ -117,7 +133,7 @@ pub fn prime_exact_window_key(
     mut focus: impl FnMut() -> KeyFocus,
     mut key_records: impl FnMut() -> bool,
     mut ax_focus: impl FnMut() -> bool,
-) -> Result<KeyPrime, String> {
+) -> Result<KeyPrime, KeyWindowUnconfirmed> {
     if focus().settled_on(target) {
         return Ok(KeyPrime::AlreadyKey);
     }
@@ -133,13 +149,16 @@ pub fn prime_exact_window_key(
         return Ok(KeyPrime::AxFocusedWindow);
     }
     let now = focus();
-    Err(format!(
-        "window {target} could not be confirmed as the app's key window (the app's focused \
-         window is {:?}, its focused element is in window {:?}), so no keys were sent: they \
-         could have gone to another window of the same app. Close the other window, or use \
-         delivery_mode:\"foreground\"",
-        now.window, now.element_window
-    ))
+    Err(KeyWindowUnconfirmed {
+        focus_unknown: now.window.is_none(),
+        reason: format!(
+            "window {target} could not be confirmed as the app's key window (the app's focused \
+             window is {:?}, its focused element is in window {:?}), so no keys were sent: they \
+             could have gone to another window of the same app. Close the other window, or use \
+             delivery_mode:\"foreground\"",
+            now.window, now.element_window
+        ),
+    })
 }
 
 /// Holds an exact window as the app's key window; hands key back on drop
@@ -252,9 +271,12 @@ fn key_focus_of_pid_within(
     pid: pid_t,
     admit: &dyn Fn(crate::ax::bindings::AXUIElementRef) -> bool,
 ) -> KeyFocus {
+    let window = crate::ax::bindings::focused_window_id_of_pid_within(pid, admit);
+    let element = crate::ax::bindings::focused_element_windows_of_pid_within(pid, admit);
     KeyFocus {
-        window: crate::ax::bindings::focused_window_id_of_pid_within(pid, admit),
-        element_window: crate::ax::bindings::focused_element_window_id_of_pid_within(pid, admit),
+        window,
+        element_window: element.window,
+        element_top_level: element.top_level,
         sheet_of: crate::ax::exact_target::focused_sheet_owner_of_pid(pid, admit),
     }
 }
@@ -320,7 +342,10 @@ fn await_key_focus(pid: pid_t, target: u32, budget: std::time::Duration) {
 /// Make `target_wid` the app's key window (no activation, no raise, no
 /// pointer), confirmed by re-reading the app's focus, and return a guard that
 /// hands key back. `Err` when it cannot be confirmed.
-pub fn enter_exact_window_key(pid: pid_t, target_wid: u32) -> Result<WindowKeyScope, String> {
+pub fn enter_exact_window_key(
+    pid: pid_t,
+    target_wid: u32,
+) -> Result<WindowKeyScope, KeyWindowUnconfirmed> {
     let before = key_focus_of_pid(pid);
     let previous = before.window;
     let order_before = app_window_order(pid);
@@ -1736,6 +1761,7 @@ mod key_prime_tests {
         KeyFocus {
             window,
             element_window,
+            element_top_level: element_window,
             sheet_of: None,
         }
     }
@@ -1751,17 +1777,36 @@ mod key_prime_tests {
         assert_eq!(r, Ok(KeyPrime::AlreadyKey));
     }
 
-    /// A sheet open on the target (an alert or prompt) is the app's key
-    /// window, with its own window id: keys addressed to the target go to it,
-    /// as a person's would, with nothing to prime and nothing to hand back.
+    /// A prompt sheet open on the target, as AppKit reports it (measured on
+    /// macOS): the app's focused window is the sheet (1729), its focused
+    /// element is the sheet's text field, whose `AXWindow` is the window the
+    /// sheet is attached to (1721) and whose `AXTopLevelUIElement` is the
+    /// sheet. Keys addressed to the target go to the sheet, as a person's
+    /// would, with nothing to prime and nothing to hand back.
     #[test]
-    fn a_sheet_attached_to_the_target_takes_its_keys() {
+    fn a_prompt_sheet_attached_to_the_target_takes_its_keys() {
         let sheet = KeyFocus {
-            window: Some(21),
-            element_window: Some(21),
-            sheet_of: Some(7),
+            window: Some(1729),
+            element_window: Some(1721),
+            element_top_level: Some(1729),
+            sheet_of: Some(1721),
         };
-        let r = prime_exact_window_key(7, || sheet, || panic!("record"), || panic!("ax"));
+        let r = prime_exact_window_key(1721, || sheet, || panic!("record"), || panic!("ax"));
+        assert_eq!(r, Ok(KeyPrime::AlreadyKey));
+    }
+
+    /// A sheet with only buttons holds the focus itself: the focused element
+    /// is the sheet, whose `AXWindow` is again the host window. Return must
+    /// reach its default button.
+    #[test]
+    fn a_button_only_sheet_attached_to_the_target_takes_its_keys() {
+        let sheet = KeyFocus {
+            window: Some(1729),
+            element_window: Some(1721),
+            element_top_level: Some(1729),
+            sheet_of: Some(1721),
+        };
+        let r = prime_exact_window_key(1721, || sheet, || panic!("record"), || panic!("ax"));
         assert_eq!(r, Ok(KeyPrime::AlreadyKey));
     }
 
@@ -1771,15 +1816,36 @@ mod key_prime_tests {
     /// does a sheet whose focused element is proven in another window.
     #[test]
     fn a_sheet_without_its_own_focused_element_does_not_take_keys() {
-        for element_window in [None, Some(7), Some(30)] {
+        for (element_window, element_top_level) in [
+            (None, None),
+            (Some(1721), None),
+            (Some(1721), Some(1721)),
+            (Some(30), Some(30)),
+        ] {
             let focus = KeyFocus {
-                window: Some(21),
+                window: Some(1729),
                 element_window,
-                sheet_of: Some(7),
+                element_top_level,
+                sheet_of: Some(1721),
             };
-            let r = prime_exact_window_key(7, || focus, || true, || true);
-            assert!(r.is_err(), "{element_window:?}");
+            let r = prime_exact_window_key(1721, || focus, || true, || true);
+            let err = r.unwrap_err();
+            assert!(
+                !err.focus_unknown,
+                "{element_window:?} {element_top_level:?}"
+            );
         }
+    }
+
+    /// With no focused window named (or none read in time), where keys
+    /// would go is unknown, which the refusal says, rather than naming
+    /// another window.
+    #[test]
+    fn an_unknown_focus_is_refused_as_unknown() {
+        let r = prime_exact_window_key(7, || at(None, None), || true, || true);
+        assert!(r.unwrap_err().focus_unknown);
+        let r = prime_exact_window_key(7, || at(Some(9), Some(9)), || true, || true);
+        assert!(!r.unwrap_err().focus_unknown);
     }
 
     /// A focus reading past its deadline asks nothing more and knows
@@ -1796,6 +1862,7 @@ mod key_prime_tests {
             KeyFocus {
                 window: None,
                 element_window: None,
+                element_top_level: None,
                 sheet_of: None,
             }
         );
@@ -1810,7 +1877,8 @@ mod key_prime_tests {
     fn a_sheet_on_another_window_does_not_stand_in_for_the_target() {
         let focus = Cell::new(KeyFocus {
             window: Some(21),
-            element_window: Some(21),
+            element_window: Some(9),
+            element_top_level: Some(21),
             sheet_of: Some(9),
         });
         let r = prime_exact_window_key(7, || focus.get(), || true, || true);
@@ -1942,7 +2010,7 @@ mod key_prime_tests {
     fn unconfirmed_key_window_refuses_instead_of_leaking() {
         for focused in [at(Some(9), Some(9)), at(None, None), at(Some(9), Some(7))] {
             let r = prime_exact_window_key(7, || focused, || true, || true);
-            assert!(r.unwrap_err().contains("no keys were sent"));
+            assert!(r.unwrap_err().reason.contains("no keys were sent"));
         }
     }
 }
