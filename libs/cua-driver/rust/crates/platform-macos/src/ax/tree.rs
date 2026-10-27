@@ -497,10 +497,16 @@ unsafe fn copy_top_level(
     // `_including` variant recovers it by exact CGWindowID.
     setup.bound(app_elem);
     let from_windows = match window_id {
-        // Each window's id is a request to the app too.
-        Some(wid) => {
-            copy_ax_windows_including_bounded(app_elem, pid, wid, |window| setup.bound(window))
-        }
+        // Each window's id is a request to the app too; none is asked for
+        // once the deadline has passed (the windows left are then unread,
+        // see `scope_top_level`).
+        Some(wid) => copy_ax_windows_including_bounded(app_elem, pid, wid, |window| {
+            if setup.passed() {
+                return false;
+            }
+            setup.bound(window);
+            true
+        }),
         None => copy_ax_windows(app_elem),
     };
     for w in from_windows {
