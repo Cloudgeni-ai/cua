@@ -749,14 +749,17 @@ impl Tool for ClickTool {
 
             // A background press or show-menu on a Chromium <select> would
             // open its menu and raise the browser window (CUA-1795): steer to
-            // set_value before anything is sent.
+            // set_value before anything is sent. A window already in front
+            // has nothing to raise.
             if !delivery_mode.is_foreground()
                 && matches!(effective_action.as_str(), "press" | "show_menu")
             {
                 let select_guard = element_guard.clone();
                 let refusal = tokio::task::spawn_blocking(move || {
                     let element = select_guard.as_ptr() as AXUIElementRef;
-                    super::set_value::is_chromium_web_select(pid, wid, element).then(|| {
+                    (super::set_value::is_chromium_web_select(pid, wid, element)
+                        && !super::set_value::select_window_in_front(wid))
+                    .then(|| {
                         super::set_value::chromium_select_open_refusal(pid, wid, Some(idx), element)
                     })
                 })
@@ -1828,7 +1831,8 @@ enum AxClickDelivery {
 /// The refusal for a background pixel press at `element` that would open a
 /// Chromium `<select>`'s menu (CUA-1795): the element is the select, or the
 /// option a closed select lists, which opens the menu as much. `None` for any
-/// other element, or one outside `window_id`.
+/// other element, one outside `window_id`, or when `window_id` is already the
+/// front window, which the menu cannot raise.
 ///
 /// # Safety
 ///
@@ -1843,8 +1847,9 @@ unsafe fn select_open_refusal_at(
     }
     let option_of = super::set_value::popup_of_option(element);
     let select = option_of.unwrap_or(element);
-    let refusal = super::set_value::is_chromium_web_select(pid, window_id, select)
-        .then(|| super::set_value::chromium_select_open_refusal(pid, window_id, None, select));
+    let refusal = (super::set_value::is_chromium_web_select(pid, window_id, select)
+        && !super::set_value::select_window_in_front(window_id))
+    .then(|| super::set_value::chromium_select_open_refusal(pid, window_id, None, select));
     if let Some(popup) = option_of {
         CFRelease(popup as _);
     }

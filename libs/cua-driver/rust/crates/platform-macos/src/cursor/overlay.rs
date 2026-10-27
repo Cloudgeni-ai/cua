@@ -1199,7 +1199,7 @@ fn dispatch_order_front(win_ptr: usize) {
 ///
 /// `NSWindowAbove = 1`; `orderWindow:relativeTo:` accepts any CGWindowID as
 /// the `relativeTo` argument — it works cross-application via CGS.
-fn target_is_frontmost_visible_window(
+pub(crate) fn target_is_frontmost_visible_window(
     target_wid: u64,
     frontmost_pid: Option<i32>,
     windows: &[crate::windows::WindowInfo],

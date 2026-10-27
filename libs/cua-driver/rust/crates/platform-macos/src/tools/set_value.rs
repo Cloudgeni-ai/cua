@@ -1674,6 +1674,17 @@ pub(super) fn is_chromium_web_select(pid: i32, window_id: u32, element: AXUIElem
         )
 }
 
+/// Whether `window_id` is already the front window: its app is the active
+/// one and the window is that app's topmost on-screen window. Opening a
+/// `<select>`'s menu there brings nothing forward, so it is not refused.
+pub(super) fn select_window_in_front(window_id: u32) -> bool {
+    crate::cursor::overlay::target_is_frontmost_visible_window(
+        u64::from(window_id),
+        crate::apps::frontmost_pid(),
+        &crate::windows::visible_windows(),
+    )
+}
+
 /// Refusal for a background press that would open a Chromium `<select>` menu
 /// (CUA-1795). Opening it orders the browser window above the user's window
 /// for at least a frame, which undoing afterwards cannot hide; `set_value`
