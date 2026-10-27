@@ -242,9 +242,8 @@ fn set_app_focused_window(pid: pid_t, wid: u32) -> bool {
 /// Every request of the reading shares one deadline: what it could not ask
 /// in time reads as unknown, which never routes keys anywhere.
 fn key_focus_of_pid(pid: pid_t) -> KeyFocus {
-    let deadline = crate::ax::bindings::RequestDeadline::after(
-        crate::ax::bindings::FOCUS_READ_BUDGET,
-    );
+    let deadline =
+        crate::ax::bindings::RequestDeadline::after(crate::ax::bindings::FOCUS_READ_BUDGET);
     key_focus_of_pid_within(pid, &|element| unsafe { deadline.admit(element) })
 }
 
