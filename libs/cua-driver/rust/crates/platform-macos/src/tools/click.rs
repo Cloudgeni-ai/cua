@@ -166,25 +166,21 @@ fn toggle_press_shows(role: &str, before: &str, now: &str) -> bool {
 const CLOSED_WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
 const CLOSED_WINDOW_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Whether a press the app answered with `err` closed the window it was sent
-/// to: a dialog's button that closes its dialog can be answered with an error
-/// (its element went away with the window, or the app answered late) although
-/// it did what it does. The window was there when the press was sent: the
-/// background gate checks it just before. Errors that mean the request never
-/// reached the app (an illegal argument, accessibility turned off) are not
-/// counted, whatever the window does.
+/// Whether a press the app answered with "cannot complete" closed the window
+/// it was sent to: a dialog's button that closes its dialog can leave the app
+/// unable to answer the press in time although it did what it does. The
+/// window was there when the press was sent: the background gate checks it
+/// just before. Any other error is not counted, whatever the window does: an
+/// element that was already gone (`kAXErrorInvalidUIElement`) or a request
+/// that never reached the app says the press was not taken, so a window that
+/// closes meanwhile closed for another reason.
 fn press_closed_its_window(
     err: crate::ax::bindings::AXError,
     mut window_shown: impl FnMut() -> bool,
     timeout: std::time::Duration,
     poll: std::time::Duration,
 ) -> bool {
-    /// `kAXErrorIllegalArgument`.
-    const ILLEGAL_ARGUMENT: crate::ax::bindings::AXError = -25201;
-    if matches!(
-        err,
-        ILLEGAL_ARGUMENT | crate::ax::bindings::kAXErrorAPIDisabled
-    ) {
+    if err != crate::ax::bindings::kAXErrorCannotComplete {
         return false;
     }
     let deadline = std::time::Instant::now() + timeout;
@@ -1996,7 +1992,7 @@ fn perform_ax_click(
             }
         }
         // A dialog's button that closes its dialog: the closed window shows
-        // the press was taken, whatever the app answered.
+        // the press was taken although the app could not complete its answer.
         if press_closed_its_window(
             err,
             || crate::windows::window_info_by_id(window_id).is_some_and(|w| w.is_on_screen),
@@ -2293,29 +2289,32 @@ mod tests {
         }
     }
 
-    /// A press answered with an error whose window then closed (a dialog
-    /// button that closes its dialog) was taken; one whose window stays, or
-    /// that never reached the app, was not.
+    /// A press answered with "cannot complete" whose window then closed (a
+    /// dialog button that closes its dialog) was taken; one whose window
+    /// stays was not, and no other error counts, whatever the window does.
     #[test]
     fn a_press_answered_with_an_error_that_closed_its_window_was_taken() {
         let fast = std::time::Duration::from_millis(1);
         let timeout = std::time::Duration::from_millis(50);
-        for err in [-25200, -25202, -25204, -25205, -25206] {
-            let mut reads = 0;
-            let closes_on_third_read = || {
-                reads += 1;
-                reads < 3
-            };
-            assert!(
-                press_closed_its_window(err, closes_on_third_read, timeout, fast),
-                "{err}"
-            );
-            assert!(
-                !press_closed_its_window(err, || true, timeout, fast),
-                "{err} window stays"
-            );
-        }
-        for refused in [-25201, -25211] {
+        let mut reads = 0;
+        let closes_on_third_read = || {
+            reads += 1;
+            reads < 3
+        };
+        assert!(press_closed_its_window(
+            -25204,
+            closes_on_third_read,
+            timeout,
+            fast
+        ));
+        assert!(
+            !press_closed_its_window(-25204, || true, timeout, fast),
+            "the window stays"
+        );
+        // The element was already gone, the action is unsupported, the
+        // request failed or never reached the app: a window closing then
+        // closed for another reason.
+        for refused in [-25200, -25201, -25202, -25205, -25206, -25211] {
             let mut read = false;
             assert!(!press_closed_its_window(
                 refused,

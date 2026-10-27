@@ -46,8 +46,6 @@ mod permission_observation;
 #[cfg(target_os = "macos")]
 pub mod permissions;
 #[cfg(target_os = "macos")]
-pub mod person_input;
-#[cfg(target_os = "macos")]
 pub mod pip;
 #[cfg(target_os = "macos")]
 pub mod pointer_shape;

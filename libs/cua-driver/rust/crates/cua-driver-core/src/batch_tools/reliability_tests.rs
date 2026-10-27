@@ -440,11 +440,6 @@ struct RerenderState {
     /// Clicks that re-render the window just before they land, so the
     /// token they carry is from the snapshot before.
     rerender_on_click: u32,
-    /// A dialog whose button closes it: the press is answered with an
-    /// invalid-element error, and the window is gone for any later input,
-    /// while a read still finds it closing.
-    closes_on_click: bool,
-    closed: bool,
     /// From this snapshot on, these rows replace `rows` (a list that a
     /// search filters a moment after it was typed).
     later_rows: Option<(u32, Vec<(&'static str, &'static str)>)>,
@@ -487,13 +482,6 @@ impl Tool for Rerender {
                 }))
             }
             "click" => {
-                if state.closed {
-                    return ToolResult::error(
-                        "Background input refused (window_not_found): WindowServer has no record \
-                         of window 7 (closed or stale); re-enumerate windows and re-target",
-                    )
-                    .with_structured(json!({"code": "window_not_found", "effect": "refused"}));
-                }
                 if state.rerender_on_click > 0 {
                     state.rerender_on_click -= 1;
                     state.snapshot += 1;
@@ -513,12 +501,6 @@ impl Tool for Rerender {
                 let row: usize = token[current.len()..].parse().unwrap();
                 let label = state.rows[row - 1].1.to_owned();
                 state.clicked.push(label.clone());
-                if state.closes_on_click {
-                    state.closed = true;
-                    return ToolResult::error(
-                        "AX action failed: AXUIElementPerformAction(AXPress) returned -25202",
-                    );
-                }
                 ToolResult::text(format!("clicked {label}"))
             }
             "list_windows" => ToolResult::text("windows").with_structured(json!({"windows": [{
@@ -692,40 +674,6 @@ async fn a_named_step_whose_page_rerendered_before_the_press_finds_it_again() {
         text(&result)
     );
     assert_eq!(state.lock().unwrap().clicked, vec!["Search accounts"]);
-}
-
-#[tokio::test]
-async fn a_press_that_closed_its_own_window_is_done_and_not_sent_again() {
-    // A dialog's button that closes its dialog, answered with an error: the
-    // step finds the button again while the dialog is still closing, and the
-    // second press is refused because the window is gone by then. The first
-    // press closed it; the step did what it was asked, once.
-    for refind_stale in [false, true] {
-        let (registry, state) =
-            rerender_registry(vec![("AXButton", "Deny"), ("AXButton", "Allow")]);
-        let step = json!({"click": {"pid": 42, "window_id": 7, "role": "button", "name": "Allow", "exact": true}});
-        state.lock().unwrap().closes_on_click = true;
-        let result = registry
-            .invoke(
-                super::super::RUN_STEPS_TOOL,
-                json!({ "refind_stale": refind_stale, "steps": [step] }),
-            )
-            .await;
-        assert_ne!(result.is_error, Some(true), "{}", text(&result));
-        assert!(
-            text(&result).contains(
-                "its window closed after the first press, so the press was not sent again"
-            ),
-            "{}",
-            text(&result)
-        );
-        assert!(
-            !text(&result).contains("window_not_found"),
-            "{}",
-            text(&result)
-        );
-        assert_eq!(state.lock().unwrap().clicked, vec!["Allow"]);
-    }
 }
 
 #[tokio::test]

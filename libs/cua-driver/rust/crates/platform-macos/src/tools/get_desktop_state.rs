@@ -170,12 +170,6 @@ impl Tool for GetDesktopStateTool {
              (screen {screen_width}x{screen_height} pts @ {scale_factor}x)"
         );
         cursor_overlay::capture_exclusion::append_summary_note(&mut summary, &overlay_capture);
-        // Whether a person is using the Mac: HIDIdleTime cannot say, because
-        // the keys agents send to apps in the background reset it.
-        let person_idle = crate::person_input::idle_seconds();
-        if let Some(seconds) = person_idle {
-            summary.push_str(&person_idle_line(seconds));
-        }
         content.push(Content::text(summary));
 
         let mut structured = serde_json::json!({
@@ -189,7 +183,6 @@ impl Tool for GetDesktopStateTool {
             "screenshot_mime_type": "image/png",
             "capture_id": capture_id,
             "agent_overlay_capture": overlay_capture,
-            "person_input_idle_seconds": person_idle.map(|seconds| seconds.floor() as u64),
         });
         if full_size != (screenshot_width, screenshot_height) {
             structured["screenshot_original_width"] = serde_json::json!(full_size.0);
@@ -208,27 +201,9 @@ impl Tool for GetDesktopStateTool {
     }
 }
 
-/// The summary's line on how long ago the keyboard, mouse or trackpad was used.
-fn person_idle_line(seconds: f64) -> String {
-    format!(
-        "\nThe keyboard, mouse or trackpad was last used {} s ago (input sent to apps in the \
-         background does not count).",
-        seconds.floor() as u64
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_summary_says_how_long_ago_a_person_used_the_mac() {
-        assert_eq!(
-            person_idle_line(42.9),
-            "\nThe keyboard, mouse or trackpad was last used 42 s ago (input sent to apps in \
-             the background does not count)."
-        );
-    }
 
     #[test]
     fn schema_has_no_pid_or_window_id_and_is_read_only() {

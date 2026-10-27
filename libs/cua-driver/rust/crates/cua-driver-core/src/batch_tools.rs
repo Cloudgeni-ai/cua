@@ -1251,18 +1251,6 @@ async fn run_step(
                 index + 1
             ));
             }
-            // The second try of a press that failed as stale was refused
-            // because its window no longer exists: the window closed after
-            // the first press, as a dialog's button that closes its dialog
-            // does when the app answers the press with an error. That press
-            // is what the step did; nothing more was sent.
-            if refound_note.is_some() && window_gone(&result) {
-                result = ToolResult::text(CLOSED_AFTER_FIRST_PRESS);
-                refound_note = None;
-                if let Some(report) = report.as_object_mut() {
-                    report.remove("refound");
-                }
-            }
             let ok = result.is_error != Some(true);
             let mut message = bounded_message(&result);
             if let (false, Some(hint)) = (ok, &foreground_hint) {
@@ -1663,23 +1651,6 @@ fn wants_foreground(result: &ToolResult) -> bool {
         .unwrap_or("");
     text.contains("Retry this action with delivery_mode:\"foreground\"")
         || text.contains("Retry with delivery_mode:\"foreground\"")
-}
-
-/// A step's message when its press closed its own window and the press was
-/// therefore not sent again.
-const CLOSED_AFTER_FIRST_PRESS: &str =
-    "its window closed after the first press, so the press was not sent again";
-
-/// Whether an action was refused because WindowServer no longer has its
-/// window (it closed).
-fn window_gone(result: &ToolResult) -> bool {
-    result.is_error == Some(true)
-        && result.structured_content.as_ref().and_then(|value| {
-            value
-                .get("code")
-                .or_else(|| value.pointer("/refusal/code"))
-                .and_then(Value::as_str)
-        }) == Some("window_not_found")
 }
 
 /// Whether an action failed because its element target died: the element
