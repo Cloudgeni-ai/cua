@@ -85,8 +85,15 @@ impl KeyFocus {
     /// A sheet attached to `target` that takes posted keys counts as
     /// `target`: it is modal to that window, AppKit keeps it key while it is
     /// up, and a person typing into the window types into the sheet.
+    /// Only when the app's focused element is proven inside the sheet,
+    /// though: a panel whose contents another process serves (a file panel,
+    /// whatever it calls itself) shows no focused element of its own, and
+    /// keys posted to the app never reach it.
     fn routes_to(self, target: u32) -> bool {
-        self.window == Some(target) || self.sheet_of == Some(target)
+        self.window == Some(target)
+            || (self.sheet_of == Some(target)
+                && self.window.is_some()
+                && self.element_window == self.window)
     }
 
     /// `target` is key with nothing left to prime. A focused window without
@@ -231,11 +238,25 @@ fn set_app_focused_window(pid: pid_t, wid: u32) -> bool {
 }
 
 /// The app's focus as Accessibility reports it.
+///
+/// Every request of the reading shares one deadline: what it could not ask
+/// in time reads as unknown, which never routes keys anywhere.
 fn key_focus_of_pid(pid: pid_t) -> KeyFocus {
+    let deadline = crate::ax::bindings::RequestDeadline::after(
+        crate::ax::bindings::FOCUS_READ_BUDGET,
+    );
+    key_focus_of_pid_within(pid, &|element| unsafe { deadline.admit(element) })
+}
+
+/// [`key_focus_of_pid`] with `admit` asked before each element's requests.
+fn key_focus_of_pid_within(
+    pid: pid_t,
+    admit: &dyn Fn(crate::ax::bindings::AXUIElementRef) -> bool,
+) -> KeyFocus {
     KeyFocus {
-        window: crate::ax::bindings::focused_window_id_of_pid(pid),
-        element_window: crate::ax::bindings::focused_element_window_id_of_pid(pid),
-        sheet_of: crate::ax::exact_target::focused_sheet_owner_of_pid(pid),
+        window: crate::ax::bindings::focused_window_id_of_pid_within(pid, admit),
+        element_window: crate::ax::bindings::focused_element_window_id_of_pid_within(pid, admit),
+        sheet_of: crate::ax::exact_target::focused_sheet_owner_of_pid(pid, admit),
     }
 }
 
@@ -1707,7 +1728,9 @@ mod tests {
 
 #[cfg(test)]
 mod key_prime_tests {
-    use super::{prime_exact_window_key, restore_target, KeyFocus, KeyPrime};
+    use super::{
+        key_focus_of_pid_within, prime_exact_window_key, restore_target, KeyFocus, KeyPrime,
+    };
     use std::cell::Cell;
 
     fn at(window: Option<u32>, element_window: Option<u32>) -> KeyFocus {
@@ -1741,6 +1764,45 @@ mod key_prime_tests {
         };
         let r = prime_exact_window_key(7, || sheet, || panic!("record"), || panic!("ax"));
         assert_eq!(r, Ok(KeyPrime::AlreadyKey));
+    }
+
+    /// A panel whose contents another process serves (a file panel, whatever
+    /// its identifier) shows no focused element of its own, and keys posted
+    /// to the app never reach it: it does not stand in for the target, nor
+    /// does a sheet whose focused element is proven in another window.
+    #[test]
+    fn a_sheet_without_its_own_focused_element_does_not_take_keys() {
+        for element_window in [None, Some(7), Some(30)] {
+            let focus = KeyFocus {
+                window: Some(21),
+                element_window,
+                sheet_of: Some(7),
+            };
+            let r = prime_exact_window_key(7, || focus, || true, || true);
+            assert!(r.is_err(), "{element_window:?}");
+        }
+    }
+
+    /// A focus reading past its deadline asks nothing more and knows
+    /// nothing, which routes keys nowhere.
+    #[test]
+    fn a_focus_reading_past_its_deadline_asks_nothing_and_routes_nowhere() {
+        let asked = Cell::new(0);
+        let focus = key_focus_of_pid_within(std::process::id() as libc::pid_t, &|_| {
+            asked.set(asked.get() + 1);
+            false
+        });
+        assert_eq!(
+            focus,
+            KeyFocus {
+                window: None,
+                element_window: None,
+                sheet_of: None,
+            }
+        );
+        // Once per application element, before its first request.
+        assert_eq!(asked.get(), 3);
+        assert!(!focus.routes_to(7));
     }
 
     /// A sheet on another window of the app is that window's, not the

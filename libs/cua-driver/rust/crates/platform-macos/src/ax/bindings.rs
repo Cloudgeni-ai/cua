@@ -551,15 +551,66 @@ pub unsafe fn focused_element_of_pid(pid: i32) -> Option<AXUIElementRef> {
 /// already focused exact window must not be re-activated, because doing so can
 /// make a focus-proxy renderer drop its current key target.
 pub fn focused_window_id_of_pid(pid: i32) -> Option<u32> {
+    focused_window_id_of_pid_within(pid, &|_| true)
+}
+
+/// How long one reading of an app's keyboard focus (its focused window, the
+/// window of its focused element and the sheet that window may be) may take
+/// in all. An app that answers takes milliseconds; one that has stopped
+/// answering would otherwise hold each of these requests for the full
+/// messaging timeout.
+pub(crate) const FOCUS_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Shortest messaging timeout given to a request made close to a
+/// [`RequestDeadline`]: zero would mean the ordinary timeout.
+const MIN_DEADLINE_TIMEOUT_SECONDS: f32 = 0.05;
+
+/// A deadline shared by a few accessibility requests.
+pub(crate) struct RequestDeadline(std::time::Instant);
+
+impl RequestDeadline {
+    pub(crate) fn after(budget: std::time::Duration) -> Self {
+        Self(std::time::Instant::now() + budget)
+    }
+
+    /// Before the deadline, bound `element`'s next request by what is left
+    /// and return `true`; after it, leave `element` unasked and return `false`.
+    ///
+    /// # Safety
+    ///
+    /// `element` must be a valid `AXUIElementRef` while the deadline has not
+    /// passed.
+    pub(crate) unsafe fn admit(&self, element: AXUIElementRef) -> bool {
+        let left = self.0.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        AXUIElementSetMessagingTimeout(
+            element,
+            left.as_secs_f32().max(MIN_DEADLINE_TIMEOUT_SECONDS),
+        );
+        true
+    }
+}
+
+/// [`focused_window_id_of_pid`] with `admit` asked before each element's
+/// requests (see [`RequestDeadline::admit`]); an element not admitted is not
+/// asked, and the answer is `None`.
+pub(crate) fn focused_window_id_of_pid_within(
+    pid: i32,
+    admit: &dyn Fn(AXUIElementRef) -> bool,
+) -> Option<u32> {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
             return None;
         }
-        let window = copy_element_attr(app, "AXFocusedWindow");
+        let window = admit(app)
+            .then(|| copy_element_attr(app, "AXFocusedWindow"))
+            .flatten();
         CFRelease(app as CFTypeRef);
         let window = window?;
-        let window_id = ax_get_window_id(window);
+        let window_id = admit(window).then(|| ax_get_window_id(window)).flatten();
         CFRelease(window as CFTypeRef);
         window_id
     }
@@ -600,18 +651,31 @@ pub fn raise_focused_window_of_pid(pid: i32) -> bool {
 /// element: a LibreOffice that has never been active names a focused window
 /// but has no focused element, and drops every key posted to it.
 pub fn focused_element_window_id_of_pid(pid: i32) -> Option<u32> {
+    focused_element_window_id_of_pid_within(pid, &|_| true)
+}
+
+/// [`focused_element_window_id_of_pid`] with `admit` asked before each
+/// element's requests, as in [`focused_window_id_of_pid_within`].
+pub(crate) fn focused_element_window_id_of_pid_within(
+    pid: i32,
+    admit: &dyn Fn(AXUIElementRef) -> bool,
+) -> Option<u32> {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
             return None;
         }
-        let element = copy_element_attr(app, "AXFocusedUIElement");
+        let element = admit(app)
+            .then(|| copy_element_attr(app, "AXFocusedUIElement"))
+            .flatten();
         CFRelease(app as CFTypeRef);
         let element = element?;
-        let window = copy_element_attr(element, "AXWindow");
+        let window = admit(element)
+            .then(|| copy_element_attr(element, "AXWindow"))
+            .flatten();
         CFRelease(element as CFTypeRef);
         let window = window?;
-        let window_id = ax_get_window_id(window);
+        let window_id = admit(window).then(|| ax_get_window_id(window)).flatten();
         CFRelease(window as CFTypeRef);
         window_id
     }
@@ -1066,6 +1130,18 @@ mod tests {
     use super::*;
     use crate::windows::WindowSpaceView;
     use core_foundation::{boolean::CFBoolean, number::CFNumber};
+
+    #[test]
+    fn a_request_deadline_admits_until_it_passes() {
+        // SAFETY: the application element is created and released here; the
+        // null element is never touched once the deadline has passed.
+        unsafe {
+            let app = AXUIElementCreateApplication(std::process::id() as i32);
+            assert!(RequestDeadline::after(std::time::Duration::from_secs(5)).admit(app));
+            CFRelease(app as CFTypeRef);
+            assert!(!RequestDeadline::after(std::time::Duration::ZERO).admit(std::ptr::null_mut()));
+        }
+    }
 
     #[test]
     fn no_window_id_is_asked_for_once_asking_stops() {

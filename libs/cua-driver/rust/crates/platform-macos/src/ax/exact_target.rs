@@ -401,17 +401,26 @@ unsafe fn owning_window_id(
 /// AppKit makes the sheet key while it is up, and key events posted to the
 /// app go to it. `None` when the focused window is not such a sheet or its
 /// parent window is not proven.
-pub fn focused_sheet_owner_of_pid(pid: i32) -> Option<u32> {
+///
+/// `admit` is asked before each element's requests (see
+/// [`super::bindings::RequestDeadline::admit`]); a reading cut short proves
+/// no parent window, so the answer is `None`.
+pub(crate) fn focused_sheet_owner_of_pid(
+    pid: i32,
+    admit: &dyn Fn(AXUIElementRef) -> bool,
+) -> Option<u32> {
     // SAFETY: every element created or copied here is released here.
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
             return None;
         }
-        let window = copy_element_attr(app, "AXFocusedWindow");
+        let window = admit(app)
+            .then(|| copy_element_attr(app, "AXFocusedWindow"))
+            .flatten();
         CFRelease(app as CFTypeRef);
         let window = window?;
-        let owner = key_sheet_owner(window);
+        let owner = key_sheet_owner(window, admit);
         CFRelease(window as CFTypeRef);
         owner
     }
@@ -426,31 +435,29 @@ fn sheet_takes_posted_keys(identifier: Option<&str>) -> bool {
     !matches!(identifier, Some("open-panel" | "save-panel"))
 }
 
-/// [`sheet_owner`] of a sheet that takes posted keys, so that keys addressed
-/// to its window may go to it.
+/// [`sheet_owner_within`] of a sheet that takes posted keys, so that keys addressed
+/// to its window may go to it. `admit` is asked before each element's
+/// requests, as in [`sheet_owner_within`].
 ///
 /// # Safety
 ///
 /// `window` must be a valid `AXUIElementRef` for the duration of the call.
-unsafe fn key_sheet_owner(window: AXUIElementRef) -> Option<u32> {
-    let owner = sheet_owner(window)?;
+unsafe fn key_sheet_owner(
+    window: AXUIElementRef,
+    admit: &dyn Fn(AXUIElementRef) -> bool,
+) -> Option<u32> {
+    let owner = sheet_owner_within(window, admit)?;
+    if !admit(window) {
+        return None;
+    }
     sheet_takes_posted_keys(copy_string_attr(window, "AXIdentifier").as_deref()).then_some(owner)
 }
 
 /// [`owning_window_id`] of a sheet, when it names a window other than the
-/// sheet's own.
-///
-/// # Safety
-///
-/// `window` must be a valid `AXUIElementRef` for the duration of the call.
-pub(crate) unsafe fn sheet_owner(window: AXUIElementRef) -> Option<u32> {
-    sheet_owner_within(window, &|_| true)
-}
-
-/// [`sheet_owner`] for a read with a deadline: `admit` is asked before the
-/// requests to each element on the way to the parent window, bounds them by
-/// what is left and returns `false` once the deadline has passed. A walk cut
-/// short proves no parent, so the sheet stands in for no other window.
+/// sheet's own. `admit` is asked before the requests to the sheet and to each
+/// element on the way to the parent window; with a deadline it bounds them
+/// by what is left and returns `false` once it has passed. A walk cut short
+/// proves no parent, so the sheet stands in for no other window.
 ///
 /// # Safety
 ///
@@ -459,7 +466,7 @@ pub(crate) unsafe fn sheet_owner_within(
     window: AXUIElementRef,
     admit: &dyn Fn(AXUIElementRef) -> bool,
 ) -> Option<u32> {
-    if copy_string_attr(window, "AXRole").as_deref() != Some("AXSheet") {
+    if !admit(window) || copy_string_attr(window, "AXRole").as_deref() != Some("AXSheet") {
         return None;
     }
     owning_window_id(window, admit).filter(|owner| Some(*owner) != ax_get_window_id(window))
@@ -650,11 +657,19 @@ pub fn gather_background_facts(
             // A sheet attached to the target holds key for it: keys posted to
             // the app go to the sheet, which is the target's to answer (an
             // Open or Save panel never takes them, so it stays a competitor).
-            let focused_window_id = copy_element_attr(app, "AXFocusedWindow").and_then(|window| {
-                let window_id = key_sheet_owner(window).or_else(|| ax_get_window_id(window));
-                CFRelease(window as CFTypeRef);
-                window_id
-            });
+            // These requests share one deadline, so an app that stopped
+            // answering cannot hold the decision for a messaging timeout each.
+            let focus = super::bindings::RequestDeadline::after(super::bindings::FOCUS_READ_BUDGET);
+            let admit = |element: AXUIElementRef| focus.admit(element);
+            let focused_window_id = admit(app)
+                .then(|| copy_element_attr(app, "AXFocusedWindow"))
+                .flatten()
+                .and_then(|window| {
+                    let window_id = key_sheet_owner(window, &admit)
+                        .or_else(|| admit(window).then(|| ax_get_window_id(window)).flatten());
+                    CFRelease(window as CFTypeRef);
+                    window_id
+                });
             CFRelease(app as CFTypeRef);
             (records, app_hidden, element, focused_window_id)
         }
