@@ -9,13 +9,15 @@
 
 /// The input a person makes: buttons, moves and drags of a mouse or
 /// trackpad, keys, modifier keys, scrolling, a tablet, and trackpad gestures.
-const PERSON_EVENT_TYPES: [u32; 22] = [
+/// Event types from 32 on have no timer of their own: the HID system state
+/// answers them with its any-event timer, which events posted to a process
+/// reset, so none of them is asked.
+const PERSON_EVENT_TYPES: [u32; 20] = [
     1, 2, 3, 4, 5, 6, 7, // mouse buttons, moves, drags
     10, 11, 12, // keys and modifiers
     22, 23, 24, // scroll wheel, tablet pointer and proximity
     25, 26, 27, // other mouse buttons and drags
-    29, 30, 31, 32, 34, // gestures: gesture, magnify, swipe, smart magnify, pressure
-    18, // rotate
+    18, 29, 30, 31, // trackpad gestures: rotate, gesture, magnify, swipe
 ];
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -69,5 +71,8 @@ mod tests {
         for kind in [1, 5, 10, 12, 22] {
             assert!(PERSON_EVENT_TYPES.contains(&kind), "{kind}");
         }
+        // A type the HID system answers with its any-event timer would count
+        // the keys sent to apps in the background.
+        assert!(PERSON_EVENT_TYPES.iter().all(|&kind| kind < 32));
     }
 }
