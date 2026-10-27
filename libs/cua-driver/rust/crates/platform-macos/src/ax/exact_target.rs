@@ -102,7 +102,7 @@ fn element_ancestry(
         _ if in_open_menu => ElementAncestry::OpenAppMenu,
         Some(owner_window_id) if adopted => ElementAncestry::AdoptedWindow { owner_window_id },
         Some(owner_window_id) => ElementAncestry::OutsideTargetWindow { owner_window_id },
-        None if in_app_menu_bar => ElementAncestry::ProvenDescendant,
+        None if in_app_menu_bar => ElementAncestry::AppMenuBar,
         None => ElementAncestry::Unproven,
     }
 }
@@ -735,10 +735,7 @@ mod tests {
     fn menu_bar_item_is_proven_only_through_the_app_menu_bar() {
         use super::element_ancestry;
         use cua_driver_core::background_input::ElementAncestry::*;
-        assert_eq!(
-            element_ancestry(None, false, true, false, 7),
-            ProvenDescendant
-        );
+        assert_eq!(element_ancestry(None, false, true, false, 7), AppMenuBar);
         assert_eq!(element_ancestry(None, false, false, false, 7), Unproven);
         assert_eq!(
             element_ancestry(Some(7), false, false, false, 7),
