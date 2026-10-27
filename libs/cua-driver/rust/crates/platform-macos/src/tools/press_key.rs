@@ -214,45 +214,80 @@ struct DefaultButtonFacts {
     app_active: bool,
     /// Menu windows of the app on screen (`None` when the list is unknown).
     menu_windows: Option<usize>,
-    /// The app's focused window.
-    focused_window: Option<u32>,
-    /// The window the focused window is a sheet of, when it is one.
+    /// The window the app's focused window is a sheet of, when it is one.
     sheet_of: Option<u32>,
     /// The focused element is a multi-line text area, which takes Return as
     /// a new line.
     focus_in_text_area: bool,
-    /// The focused window has a default button that is not disabled.
+    /// The focused sheet has a default button that is not disabled.
     button: bool,
 }
 
-/// Whether Return must press the focused window's default button through
-/// accessibility instead of being posted: a background app sends a key down
-/// to its focused window's first responder, but AppKit looks for key
-/// equivalents, the default button's Return among them, through
+/// Whether Return must press the default button of the sheet open on
+/// `target` through accessibility instead of being posted: a background app
+/// sends a key down to its focused window's first responder, but AppKit looks
+/// for key equivalents, the default button's Return among them, through
 /// `NSApp.keyWindow`, which is nil while the app is not active, so the posted
 /// key never reaches the button (measured: the key down arrives with the
 /// sheet as its window and `NSApp.keyWindow` nil). Escape needs nothing of
-/// the kind: the window's cancel operation finds its cancel button. Only when
-/// the focused window is `target` or a sheet attached to it, no menu of the
-/// app is open (keys go to the menu then), and the focus is not in a text
-/// area, which takes Return as a new line.
+/// the kind: the sheet's cancel operation finds its cancel button.
+///
+/// Only for a sheet attached to `target`, whose default button is the answer
+/// Return gives. An ordinary window keeps the posted key: there a field with
+/// an action, a combo box, a table or a search field handles Return itself,
+/// and its default button, if any, was never Return's to press in the
+/// background. Not while a menu of the app is open (keys go to the menu) or
+/// the focus is in a text area, which takes Return as a new line.
 fn return_presses_default_button(facts: DefaultButtonFacts, target: u32) -> bool {
     !facts.app_active
         && facts.menu_windows == Some(0)
-        && (facts.focused_window == Some(target) || facts.sheet_of == Some(target))
+        && facts.sheet_of == Some(target)
         && !facts.focus_in_text_area
         && facts.button
 }
 
-/// A default button pressed for Return.
+/// A sheet's default button pressed for Return.
 #[derive(Debug)]
 struct DefaultButtonPress {
     title: String,
-    /// The window holding the button left the app's focus (the sheet ended).
+    /// The accessibility press did not complete ("cannot complete"): the
+    /// app may have been busy, or the press may have ended the sheet first.
+    incomplete: bool,
+    /// The sheet left the app's focus (it ended).
     window_closed: bool,
 }
 
-/// Press the focused window's default button for Return when
+impl DefaultButtonPress {
+    /// The press is known to have happened: the sheet ended, or the app took
+    /// the press without an error.
+    fn pressed(&self) -> bool {
+        self.window_closed || !self.incomplete
+    }
+
+    /// The result text: what was pressed, or plainly that it may not have
+    /// been.
+    fn summary(&self, key: &str, pid: i32) -> String {
+        let button = if self.title.is_empty() {
+            "default button".to_owned()
+        } else {
+            format!("default button \"{}\"", self.title)
+        };
+        if self.pressed() {
+            format!(
+                "✅ Pressed {key} on pid {pid} by pressing the sheet's {button}: the app is in \
+                 the background, where the key alone does not reach it."
+            )
+        } else {
+            format!(
+                "{key} on pid {pid}: pressing the sheet's {button} through accessibility did not \
+                 complete and the sheet is still open, so it may not have been pressed. Read the \
+                 window before pressing again."
+            )
+        }
+    }
+}
+
+/// Press the default button of the sheet open on `target` for Return when
 /// [`return_presses_default_button`] says the posted key would not reach it.
 /// `None` when the key should be posted as usual, including when the button
 /// refused the press.
@@ -303,7 +338,6 @@ fn press_default_button(pid: i32, target: u32) -> Option<DefaultButtonPress> {
         let facts = DefaultButtonFacts {
             app_active: apps::frontmost_pid() == Some(pid),
             menu_windows: crate::windows::menu_window_ids(pid).map(|ids| ids.len()),
-            focused_window,
             sheet_of: crate::ax::exact_target::focused_sheet_owner_of_pid(pid, &admit),
             focus_in_text_area,
             button: pressable.is_some(),
@@ -321,9 +355,9 @@ fn press_default_button(pid: i32, target: u32) -> Option<DefaultButtonPress> {
         // "Cannot complete" also comes back when the press ended the sheet
         // before the app answered; the focus read below tells.
         let status = perform_action(pressable, "AXPress");
-        let pressed = status == kAXErrorSuccess || status == kAXErrorCannotComplete;
+        let incomplete = status == kAXErrorCannotComplete;
         CFRelease(pressable as _);
-        if !pressed {
+        if status != kAXErrorSuccess && !incomplete {
             return None;
         }
         // An action that ends the sheet takes it out of the app's focus a
@@ -345,6 +379,7 @@ fn press_default_button(pid: i32, target: u32) -> Option<DefaultButtonPress> {
         };
         Some(DefaultButtonPress {
             title,
+            incomplete,
             window_closed,
         })
     }
@@ -354,7 +389,7 @@ fn press_default_button(pid: i32, target: u32) -> Option<DefaultButtonPress> {
 enum KeyDelivery {
     /// Posted to the app; `true` when an AX read-back confirmed its effect.
     Posted(bool),
-    /// Pressed the focused window's default button for Return.
+    /// Pressed the default button of the sheet on the window for Return.
     DefaultButton(DefaultButtonPress),
 }
 
@@ -373,12 +408,18 @@ fn default_button_record(press: &DefaultButtonPress) -> ActionExecutionRecord {
     .evidence(if press.window_closed {
         ActionEvidence {
             kind: EvidenceKind::WindowChange,
-            detail: "the window holding the button left the app's focus after AXPress".into(),
+            detail: "the sheet left the app's focus after AXPress on its default button".into(),
+        }
+    } else if press.incomplete {
+        ActionEvidence {
+            kind: EvidenceKind::NativeApiResult,
+            detail: "AXPress on the sheet's default button did not complete; the sheet stayed open"
+                .into(),
         }
     } else {
         ActionEvidence {
             kind: EvidenceKind::NativeApiResult,
-            detail: "AXPress on the focused window's default button returned success".into(),
+            detail: "AXPress on the sheet's default button returned success".into(),
         }
     })
     .build()
@@ -710,9 +751,8 @@ impl Tool for PressKeyTool {
                     "effect": if press.window_closed { "confirmed" } else { "unverifiable" },
                 });
                 return ToolResult::text(format!(
-                    "✅ Pressed {display_key} on pid {pid} by pressing the window's default button \
-                     \"{}\": the app is in the background, where the key alone does not reach it.{}",
-                    press.title,
+                    "{}{}",
+                    press.summary(&display_key, pid),
                     changes.result_suffix()
                 ))
                 .with_structured(structured)
@@ -762,7 +802,6 @@ mod tests {
         DefaultButtonFacts {
             app_active: false,
             menu_windows: Some(0),
-            focused_window: Some(1729),
             sheet_of: Some(1721),
             focus_in_text_area: false,
             button: true,
@@ -783,17 +822,56 @@ mod tests {
 
     /// A background app never sees Return as its default button's key
     /// equivalent (measured: the key down reaches the sheet with
-    /// NSApp.keyWindow nil), so a sheet of the target, or the target itself,
-    /// has the button pressed.
+    /// NSApp.keyWindow nil), so a sheet attached to the target has its
+    /// default button pressed.
     #[test]
-    fn a_background_sheet_or_window_has_its_button_pressed() {
+    fn a_background_sheet_has_its_default_button_pressed() {
         assert!(return_presses_default_button(background_sheet(), 1721));
+    }
+
+    /// An ordinary window of a background app keeps the posted Return: a
+    /// field with an action, a combo box, a table or a search field handles
+    /// it there, and must not lose it to the window's default button.
+    #[test]
+    fn return_in_an_ordinary_window_is_posted_as_before() {
         let window = DefaultButtonFacts {
-            focused_window: Some(1721),
             sheet_of: None,
             ..background_sheet()
         };
-        assert!(return_presses_default_button(window, 1721));
+        assert!(!return_presses_default_button(window, 1721));
+    }
+
+    /// The result says what was pressed, leaves out a title the button does
+    /// not have, and does not claim a press that did not complete while the
+    /// sheet stayed open.
+    #[test]
+    fn the_result_says_whether_the_default_button_was_pressed() {
+        let press = |title: &str, incomplete, window_closed| DefaultButtonPress {
+            title: title.into(),
+            incomplete,
+            window_closed,
+        };
+        assert_eq!(
+            press("OK", false, true).summary("return", 7),
+            "✅ Pressed return on pid 7 by pressing the sheet's default button \"OK\": the app \
+             is in the background, where the key alone does not reach it."
+        );
+        assert_eq!(
+            press("", false, false).summary("return", 7),
+            "✅ Pressed return on pid 7 by pressing the sheet's default button: the app is in \
+             the background, where the key alone does not reach it."
+        );
+        assert!(press("OK", true, true).pressed());
+        let incomplete = press("OK", true, false);
+        assert!(!incomplete.pressed());
+        assert_eq!(
+            incomplete.summary("return", 7),
+            "return on pid 7: pressing the sheet's default button \"OK\" through accessibility \
+             did not complete and the sheet is still open, so it may not have been pressed. Read \
+             the window before pressing again."
+        );
+        let record = default_button_record(&incomplete);
+        assert_eq!(record.effect, ActionEffect::Unverifiable);
     }
 
     /// Where the posted key does what it would in the foreground, or the
@@ -815,11 +893,6 @@ mod tests {
             },
             DefaultButtonFacts {
                 sheet_of: Some(9),
-                ..background_sheet()
-            },
-            DefaultButtonFacts {
-                focused_window: None,
-                sheet_of: None,
                 ..background_sheet()
             },
             DefaultButtonFacts {
