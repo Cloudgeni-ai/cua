@@ -507,6 +507,7 @@ fn set_value_blocking(
 
     if role == "AXPopUpButton" {
         let element_title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
+        let subject = format!("AXPopUpButton [{element_index}] \"{element_title}\"");
         // Menu-item selection, not an AXValue write — no read-back to report.
         select_popup_option(
             element,
@@ -515,6 +516,7 @@ fn set_value_blocking(
             window_id,
             value,
             &element_title,
+            &subject,
         )
         .map(|detail| SetValueOutcome {
             detail,
@@ -660,6 +662,14 @@ fn set_value_blocking(
                     refusal: Some(Refusal::Rejected { restored }),
                 });
             }
+            // A native combo box shows the text as written, but its app acts
+            // on it (runs the box's action, takes it as the chosen item) only
+            // once it is confirmed, as Return in the box does.
+            let confirmed = confirms_combo_box(&role, web, verified, changed)
+                && unsafe { crate::ax::bindings::copy_action_names(element) }
+                    .iter()
+                    .any(|action| action == "AXConfirm")
+                && unsafe { perform_action(element, "AXConfirm") } == kAXErrorSuccess;
             let suffix = match (verified, changed) {
                 (Some(true), Some(false)) => " Value already matched; write was idempotent.",
                 (Some(true), _) => "",
@@ -678,9 +688,14 @@ fn set_value_blocking(
             };
             Ok(SetValueOutcome {
                 detail: format!(
-                    "✅ Set AXValue on [{element_index}] {role}{}.{suffix}{}",
+                    "✅ Set AXValue on [{element_index}] {role}{}.{suffix}{}{}",
                     if stepped {
                         " via AXIncrement/AXDecrement stepping"
+                    } else {
+                        ""
+                    },
+                    if confirmed {
+                        " Confirmed it with AXConfirm, as Return would."
                     } else {
                         ""
                     },
@@ -735,6 +750,12 @@ fn takes_text(role: &str) -> bool {
         role,
         "AXTextField" | "AXTextArea" | "AXComboBox" | "AXSearchField" | "AXSecureTextField"
     )
+}
+
+/// Whether a write is followed by `AXConfirm`: a native (not web) combo box
+/// whose new value the read-back shows.
+fn confirms_combo_box(role: &str, web: bool, verified: Option<bool>, changed: Option<bool>) -> bool {
+    role == "AXComboBox" && !web && verified == Some(true) && changed == Some(true)
 }
 
 /// Whether a write of `requested` left a control that holds a number or a
@@ -1513,6 +1534,104 @@ fn is_chromium_popup_owner(pid: i32) -> bool {
         || crate::browser::electron_js::ElectronJs::is_electron(pid)
 }
 
+/// How long after an option was pressed a Chromium `<select>` may take to
+/// open its menu again.
+const MENU_REOPEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Whether the popup's menu is open after one of its options was pressed.
+/// A Chromium `<select>` closes its menu on the choice and opens it again a
+/// moment later, so its popup is watched for a short while; any other
+/// popup's menu closes on the press, and is read once.
+fn menu_left_open(popup: AXUIElementRef, pid: i32) -> bool {
+    if !is_chromium_popup_owner(pid) {
+        return popup_menu_is_open(popup, pid);
+    }
+    let deadline = std::time::Instant::now() + MENU_REOPEN_WINDOW;
+    loop {
+        if popup_menu_is_open(popup, pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        crate::timing::sleep(POPUP_POLL_INTERVAL);
+    }
+}
+
+/// The pop-up button `element` is an option of, retained: an `AXMenuItem`
+/// that is the button's own child (a closed Chromium `<select>` lists the
+/// option it shows so) or an item of the `AXMenu` under it (its open menu).
+pub(super) fn popup_of_option(element: AXUIElementRef) -> Option<AXUIElementRef> {
+    if unsafe { copy_string_attr(element, "AXRole") }.as_deref() != Some("AXMenuItem") {
+        return None;
+    }
+    let mut current = unsafe { crate::ax::bindings::copy_element_attr(element, "AXParent") }?;
+    for _ in 0..2 {
+        match unsafe { copy_string_attr(current, "AXRole") }.as_deref() {
+            Some("AXPopUpButton") => return Some(current),
+            Some("AXMenu") => {
+                let parent = unsafe { crate::ax::bindings::copy_element_attr(current, "AXParent") };
+                unsafe { CFRelease(current as _) };
+                current = parent?;
+            }
+            _ => break,
+        }
+    }
+    unsafe { CFRelease(current as _) };
+    None
+}
+
+/// What a press on an option of a pop-up button does: it chooses that option
+/// on the button, as `set_value` with the option's text does. `None` when
+/// `item` is no pop-up button's option, or has no text to choose it by.
+///
+/// Pressing the item itself is not safe for a Chromium `<select>`: the press
+/// both chooses the option and toggles the menu, so an item of its open menu
+/// leaves the menu open again, and the one item a closed `<select>` lists
+/// (the option it shows) opens the menu, raising the browser window, and can
+/// take the browser down.
+pub(super) fn choose_popup_option_item(
+    item: AXUIElementRef,
+    item_index: usize,
+    pid: i32,
+    window_id: u32,
+) -> Option<ToolResult> {
+    let title = unsafe { copy_string_attr(item, "AXTitle") }.unwrap_or_default();
+    let wanted = if title.trim().is_empty() {
+        unsafe { copy_string_attr(item, "AXValue") }.unwrap_or_default()
+    } else {
+        title
+    };
+    if wanted.trim().is_empty() {
+        return None;
+    }
+    let popup = popup_of_option(item)?;
+    let popup_title = unsafe { copy_string_attr(popup, "AXTitle") }.unwrap_or_default();
+    let subject = format!("the AXPopUpButton \"{popup_title}\" of menu item [{item_index}]");
+    let chosen = select_popup_option(
+        popup,
+        item_index,
+        pid,
+        window_id,
+        &wanted,
+        &popup_title,
+        &subject,
+    );
+    let shown = unsafe { copy_string_attr(popup, "AXValue") };
+    unsafe { CFRelease(popup as _) };
+    Some(match chosen {
+        Ok(detail) => {
+            let confirmed = shown.as_deref().is_some_and(|s| already_selected(s, &wanted));
+            ToolResult::text(detail).with_structured(serde_json::json!({
+                "path": "ax",
+                "verified": confirmed,
+                "effect": if confirmed { "confirmed" } else { "unverifiable" },
+            }))
+        }
+        Err(error) => ToolResult::error(format!("click: {error}")),
+    })
+}
+
 /// Whether pressing `element` would open a Chromium or Electron `<select>`
 /// menu: an `AXPopUpButton` inside web content of a Chromium renderer. The
 /// browser's own toolbar popups have no web-area ancestor and do not match.
@@ -1577,20 +1696,20 @@ const TYPEAHEAD_SETTLE: std::time::Duration = std::time::Duration::from_millis(8
 ///
 /// Returns `None` when this route does not apply or did not land on `value`;
 /// the caller then falls back to opening the menu.
+///
+/// This holds while the browser is the front app too, with the popup in one
+/// of its other windows: keys reach the popup's window through the same
+/// in-app key scope, while opening the menu would order that window above
+/// the one the user is looking at and leave the menu open after the choice.
 fn select_chromium_popup_by_typeahead(
     popup: AXUIElementRef,
-    element_index: usize,
     pid: i32,
     window_id: u32,
     value: &str,
-    element_title: &str,
+    subject: &str,
 ) -> Option<String> {
     let wanted = value.trim();
-    if wanted.is_empty()
-        || crate::apps::frontmost_pid() == Some(pid)
-        || popup_menu_is_open(popup, pid)
-        || !is_chromium_popup_owner(pid)
-    {
+    if wanted.is_empty() || popup_menu_is_open(popup, pid) || !is_chromium_popup_owner(pid) {
         return None;
     }
     let selected = || unsafe { copy_string_attr(popup, "AXValue") }.unwrap_or_default();
@@ -1610,9 +1729,8 @@ fn select_chromium_popup_by_typeahead(
         let current = selected();
         if matches(&current) {
             return Some(format!(
-                "✅ Selected '{current}' in AXPopUpButton [{element_index}] \
-                 \"{element_title}\" by typing its label into the focused control \
-                 (the menu was not opened, so the window order did not change)."
+                "✅ Selected '{current}' in {subject} by typing its label into the focused \
+                 control (the menu was not opened, so the window order did not change)."
             ));
         }
         if std::time::Instant::now() >= deadline {
@@ -1635,6 +1753,7 @@ fn select_popup_option(
     window_id: u32,
     value: &str,
     element_title: &str,
+    subject: &str,
 ) -> anyhow::Result<String> {
     // Pressing the item of the option a Chromium <select> already shows
     // empties it, even in its open menu, so a value it already shows is left
@@ -1646,19 +1765,13 @@ fn select_popup_option(
             dismiss_popup_menu(element, pid);
         }
         return Ok(format!(
-            "✅ '{}' is already selected in AXPopUpButton [{element_index}] \
-             \"{element_title}\"; nothing was changed.",
+            "✅ '{}' is already selected in {subject}; nothing was changed.",
             current.trim()
         ));
     }
-    if let Some(detail) = select_chromium_popup_by_typeahead(
-        element,
-        element_index,
-        pid,
-        window_id,
-        value,
-        element_title,
-    ) {
+    if let Some(detail) =
+        select_chromium_popup_by_typeahead(element, pid, window_id, value, subject)
+    {
         return Ok(detail);
     }
     let mut options = popup_options(element, pid);
@@ -1772,10 +1885,9 @@ fn select_popup_option(
                 release_elements(&before);
             }
             anyhow::bail!(
-                "AXPopUpButton [{element_index}] \"{element_title}\" exposed no options even \
-                 after its menu was opened, so nothing was selected. Click the popup, then \
-                 choose the option with press_key (down, return) or a pixel click on the \
-                 item.{still_open}"
+                "{subject} exposed no options even after its menu was opened, so nothing was \
+                 selected. Click the popup, then choose the option with press_key (down, \
+                 return) or a pixel click on the item.{still_open}"
             )
         }
     }
@@ -1801,19 +1913,28 @@ fn select_popup_option(
                 };
                 let shown = unsafe { copy_string_attr(element, "AXValue") }.unwrap_or_default();
                 Err(anyhow::anyhow!(
-                    "AXPopUpButton [{element_index}] \"{element_title}\" shows '{}' after its \
-                     '{label}' menu item was pressed, so the selection did not take. Read the \
-                     window again before retrying.{still_open}",
+                    "{subject} shows '{}' after its '{label}' menu item was pressed, so the \
+                     selection did not take. Read the window again before retrying.{still_open}",
                     shown.trim()
                 ))
             } else if err == kAXErrorSuccess {
+                // Whatever the toolkit, no menu is left open: a Chromium
+                // <select> takes the press as its choice and then opens its
+                // menu again (pressing an option toggles the menu).
+                let left_open = menu_left_open(element, pid);
+                let still_open = if left_open {
+                    close_opened(&menus_before, &menu_windows_before)
+                } else {
+                    ""
+                };
                 Ok(format!(
-                    "✅ Selected '{label}' in AXPopUpButton [{element_index}] \
-                     \"{element_title}\" via AX menu item AXPress{}.",
-                    if opened_menu {
-                        " (the popup's menu was opened for the selection and closed again)"
-                    } else {
-                        ""
+                    "✅ Selected '{label}' in {subject} via AX menu item AXPress{}.{still_open}",
+                    match (opened_menu, still_open.is_empty()) {
+                        (true, true) => {
+                            " (the popup's menu was opened for the selection and closed again)"
+                        }
+                        (false, true) if left_open => " (its menu was closed again)",
+                        _ => "",
                     }
                 ))
             } else {
@@ -1835,8 +1956,7 @@ fn select_popup_option(
                 ""
             };
             Err(anyhow::anyhow!(
-                "No option matching '{value}' in AXPopUpButton [{element_index}] \
-                 \"{element_title}\". Available: [{}]{}",
+                "No option matching '{value}' in {subject}. Available: [{}]{}",
                 describe_available(&options),
                 after_sentence(still_open)
             ))
@@ -2106,10 +2226,10 @@ fn hex_digit(n: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_surface_trust, apply_verification_label, classify_write, file_name_needs_rename,
-        is_file_name_cell, is_get_info_name_field, left_empty, moved, not_applied_result,
-        outside_range, refusal_result, takes_text, write_not_applied, Refusal, SetValueOutcome,
-        GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
+        apply_surface_trust, apply_verification_label, classify_write, confirms_combo_box,
+        file_name_needs_rename, is_file_name_cell, is_get_info_name_field, left_empty, moved,
+        not_applied_result, outside_range, refusal_result, takes_text, write_not_applied, Refusal,
+        SetValueOutcome, GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
     };
 
     #[test]
@@ -2217,6 +2337,18 @@ mod tests {
         for role in ["AXSlider", "AXIncrementor", "AXStepper", "AXValueIndicator"] {
             assert!(!takes_text(role), "{role}");
         }
+    }
+
+    #[test]
+    fn a_native_combo_box_is_confirmed_once_it_shows_a_new_value() {
+        assert!(confirms_combo_box("AXComboBox", false, Some(true), Some(true)));
+        // Web content, an unchanged or unconfirmed value, or another role:
+        // nothing more is sent.
+        assert!(!confirms_combo_box("AXComboBox", true, Some(true), Some(true)));
+        assert!(!confirms_combo_box("AXComboBox", false, Some(true), Some(false)));
+        assert!(!confirms_combo_box("AXComboBox", false, Some(false), Some(true)));
+        assert!(!confirms_combo_box("AXComboBox", false, None, None));
+        assert!(!confirms_combo_box("AXTextField", false, Some(true), Some(true)));
     }
 
     #[test]

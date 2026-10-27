@@ -710,6 +710,43 @@ impl Tool for ClickTool {
                 action.clone()
             };
 
+            // A press on an option of a pop-up button chooses that option on
+            // the button, as set_value does, instead of pressing the item
+            // (see set_value::choose_popup_option_item).
+            if effective_action == "press" && button_str == "left" && count == 1 {
+                let option_guard = element_guard.clone();
+                let is_option = tokio::task::spawn_blocking(move || {
+                    let element = option_guard.as_ptr() as AXUIElementRef;
+                    super::set_value::popup_of_option(element)
+                        .map(|popup| unsafe { CFRelease(popup as _) })
+                        .is_some()
+                })
+                .await
+                .unwrap_or(false);
+                if is_option {
+                    let choose_guard = element_guard.clone();
+                    let chosen = focus_guard::with_focus_suppressed_now(
+                        Some(pid),
+                        "click.popup_option",
+                        || async move {
+                            tokio::task::spawn_blocking(move || {
+                                super::set_value::choose_popup_option_item(
+                                    choose_guard.as_ptr() as AXUIElementRef,
+                                    idx,
+                                    pid,
+                                    wid,
+                                )
+                            })
+                            .await
+                        },
+                    )
+                    .await;
+                    if let Ok(Some(result)) = chosen {
+                        return result;
+                    }
+                }
+            }
+
             // A background press or show-menu on a Chromium <select> would
             // open its menu and raise the browser window (CUA-1795): steer to
             // set_value before anything is sent.
@@ -1269,14 +1306,21 @@ impl Tool for ClickTool {
             if let Some(select_wid) = window_id.filter(|_| !delivery_mode.is_foreground()) {
                 let refusal = tokio::task::spawn_blocking(move || unsafe {
                     let element = element_at_screen_position(pid, screen_x, screen_y)?;
+                    // The point can land on the option a closed <select>
+                    // shows, which opens the menu as much as the select does.
+                    let select = super::set_value::popup_of_option(element).unwrap_or_else(|| {
+                        core_foundation::base::CFRetain(element as _);
+                        element
+                    });
                     let refusal = (crate::ax::exact_target::element_window_id(element)
                         == Some(select_wid)
-                        && super::set_value::is_chromium_web_select(pid, select_wid, element))
+                        && super::set_value::is_chromium_web_select(pid, select_wid, select))
                     .then(|| {
                         super::set_value::chromium_select_open_refusal(
-                            pid, select_wid, None, element,
+                            pid, select_wid, None, select,
                         )
                     });
+                    CFRelease(select as _);
                     CFRelease(element as _);
                     refusal
                 })
