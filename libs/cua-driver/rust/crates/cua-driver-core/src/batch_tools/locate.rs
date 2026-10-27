@@ -937,7 +937,12 @@ impl<'a> Locator<'a> {
         if let Some(found) = stand_in {
             return Ok(found);
         }
-        let (_, mut miss) = best_miss.expect("search_windows is never empty");
+        let (size, mut miss) = best_miss.expect("search_windows is never empty");
+        if size == 0 {
+            if let Some(closed) = self.closed_window(spec, &windows[0]).await {
+                return Err(closed);
+            }
+        }
         if windows.len() > 1 {
             miss.message = format!(
                 "{} (searched {} windows of the app)",
@@ -946,6 +951,28 @@ impl<'a> Locator<'a> {
             );
         }
         Err(miss)
+    }
+
+    /// For a window named exactly by pid and window id that read no
+    /// elements: a miss when it is closed or off screen, since no element
+    /// will appear in it however long a step waits. A window that is still
+    /// shown may just be loading, and is waited for.
+    async fn closed_window(&self, spec: &WindowSpec, window: &Window) -> Option<Miss> {
+        spec.exact()?;
+        match self.listed_windows(spec).await {
+            Ok(windows) if windows.first().is_some_and(|listed| listed.on_screen) => None,
+            Err(miss) if miss.code != "window_not_found" => None,
+            Ok(_) | Err(_) => Some(
+                Miss::new(
+                    "window_not_on_screen",
+                    format!(
+                        "window {} is closed or not on screen, so nothing in it can be found",
+                        window.window_id
+                    ),
+                )
+                .in_window(window),
+            ),
+        }
     }
 
     /// One pass of a check over the windows it names. A presence check
@@ -1029,7 +1056,12 @@ impl<'a> Locator<'a> {
                 fallback: None,
                 read: None,
             }),
-            Some((_, mut miss)) => {
+            Some((size, mut miss)) => {
+                if size == 0 {
+                    if let Some(closed) = self.closed_window(spec, &windows[0]).await {
+                        return Err(closed);
+                    }
+                }
                 if windows.len() > 1 {
                     miss.message = format!(
                         "{} (searched {} windows of the app)",

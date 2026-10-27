@@ -34,6 +34,9 @@ struct Ui {
     /// The "Unsaved changes" window, searched first, shows two buttons "OK",
     /// and the main window one.
     dialog_ok: bool,
+    /// Lists window 11, off screen, and window 12, shown but still empty.
+    /// Window 10 is never listed (it closed). All three read no elements.
+    empty_windows: bool,
     snapshot: u32,
     /// Element labels of the latest read, by element index.
     last_labels: Vec<(String, String)>,
@@ -44,6 +47,9 @@ struct Ui {
 
 impl Ui {
     fn elements(&mut self, window_id: u64) -> Vec<(&'static str, String, Option<String>)> {
+        if (10..=12).contains(&window_id) {
+            return Vec::new();
+        }
         if window_id == 9 {
             return vec![("AXButton", "Done".into(), None)];
         }
@@ -154,6 +160,18 @@ impl Tool for Fake {
                         "pid": 42, "window_id": 9, "app_name": "Demo", "title": "Bookmark added",
                         "z_index": 3, "is_on_screen": true,
                         "bounds": {"x": 500.0, "y": 0.0, "width": 200.0, "height": 100.0}
+                    }));
+                }
+                if ui.empty_windows {
+                    windows.push(json!({
+                        "pid": 42, "window_id": 11, "app_name": "Demo", "title": "Hidden",
+                        "z_index": 0, "is_on_screen": false,
+                        "bounds": {"x": 0.0, "y": 0.0, "width": 300.0, "height": 200.0}
+                    }));
+                    windows.push(json!({
+                        "pid": 42, "window_id": 12, "app_name": "Demo", "title": "Loading",
+                        "z_index": 0, "is_on_screen": true,
+                        "bounds": {"x": 0.0, "y": 0.0, "width": 300.0, "height": 200.0}
                     }));
                 }
                 ToolResult::text("windows").with_structured(json!({ "windows": windows }))
@@ -1006,4 +1024,63 @@ async fn lookups_read_the_menu_bar_menus_only_when_after_a_menu_item() {
             "{role}: {reads:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_step_in_a_closed_or_hidden_window_fails_at_once() {
+    // Window 10 closed and window 11 is off screen: neither will show an
+    // element however long the step waits.
+    for (window_id, verb) in [(10, "click"), (11, "click"), (10, "wait_for")] {
+        let harness = Harness::new();
+        harness.ui.lock().unwrap().empty_windows = true;
+        let started = std::time::Instant::now();
+        let result = harness
+            .run(json!({"steps": [
+                {verb: {"pid": 42, "window_id": window_id, "role": "menuitem", "name": "Minimize"},
+                 "timeout_ms": 5_000}
+            ]}))
+            .await;
+        let elapsed = started.elapsed();
+        assert_eq!(result.is_error, Some(true), "{window_id} {verb}");
+        let structured = result.structured_content.clone().unwrap();
+        assert_eq!(
+            structured["steps"][0]["code"],
+            "window_not_on_screen",
+            "{window_id} {verb}: {}",
+            text(&result)
+        );
+        assert!(
+            text(&result).contains(&format!(
+                "window {window_id} is closed or not on screen, so nothing in it can be found"
+            )),
+            "{}",
+            text(&result)
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_000),
+            "{window_id} {verb}: {elapsed:?}"
+        );
+        assert!(harness.calls("click").is_empty());
+    }
+
+    // Window 12 is shown but has not drawn its elements yet: still waited
+    // for.
+    let harness = Harness::new();
+    harness.ui.lock().unwrap().empty_windows = true;
+    let started = std::time::Instant::now();
+    let result = harness
+        .run(json!({"steps": [
+            {"click": {"pid": 42, "window_id": 12, "role": "menuitem", "name": "Minimize"},
+             "timeout_ms": 600}
+        ]}))
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    let structured = result.structured_content.clone().unwrap();
+    assert_eq!(
+        structured["steps"][0]["code"],
+        "not_found",
+        "{}",
+        text(&result)
+    );
+    assert!(started.elapsed() >= Duration::from_millis(500));
 }

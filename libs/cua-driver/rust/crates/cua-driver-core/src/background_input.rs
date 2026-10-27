@@ -57,6 +57,13 @@ pub enum ElementAncestry {
         /// The CGWindowID the element does belong to.
         owner_window_id: u32,
     },
+    /// The live element is in the application's menu bar (a menu bar item,
+    /// or an item of one of its menus), which hangs off the application, not
+    /// off any window. An accessibility action reaches it whatever became of
+    /// the requested window, so that window's state does not gate the action;
+    /// pointer and key input are held to the requested window like a
+    /// [`ElementAncestry::ProvenDescendant`].
+    AppMenuBar,
     /// The live element is in a menu the process has open outside every
     /// window: the list of a pop-up button (a web `<select>` in WebKit) or a
     /// context menu, which hang off the application, not off a window. It is
@@ -237,7 +244,13 @@ pub fn decide_background_input(
     facts: &BackgroundTargetFacts,
     action: BackgroundAction,
 ) -> BackgroundInputDecision {
+    // An item of the app's menu bar is the app's, not the window's: a press
+    // on it after an earlier action closed or hid the window still reaches
+    // it, as it would through any other window of the app.
+    let app_menu_action =
+        facts.element == ElementAncestry::AppMenuBar && action == BackgroundAction::AxSemantic;
     match &facts.window_server {
+        WindowServerOwnership::NotFound if app_menu_action => {}
         WindowServerOwnership::NotFound => {
             return refuse(
                 refusal_codes::WINDOW_NOT_FOUND,
@@ -278,7 +291,9 @@ pub fn decide_background_input(
     }
 
     match facts.element {
-        ElementAncestry::NotAddressed | ElementAncestry::ProvenDescendant => {}
+        ElementAncestry::NotAddressed
+        | ElementAncestry::ProvenDescendant
+        | ElementAncestry::AppMenuBar => {}
         ElementAncestry::AdoptedWindow { .. } if action == BackgroundAction::AxSemantic => {}
         ElementAncestry::AdoptedWindow { owner_window_id } => {
             return refuse(
@@ -333,7 +348,7 @@ pub fn decide_background_input(
         }
     }
 
-    if !facts.ax_window_present {
+    if !facts.ax_window_present && !app_menu_action {
         return refuse(
             refusal_codes::OFF_SPACE_OR_AX_UNRESOLVED,
             format!(
@@ -596,6 +611,80 @@ mod tests {
                 "{action:?}"
             );
         }
+    }
+
+    /// An item of the app's menu bar is the app's: once an earlier action
+    /// closed or hid the requested window (still listed but no longer among
+    /// the app's AX windows, or gone), an accessibility press on it still runs,
+    /// as it would through another window of the app. Pointer and key input
+    /// stay held to the window, and a locked screen still refuses.
+    #[test]
+    fn app_menu_bar_item_takes_an_accessibility_action_after_its_window_closed() {
+        for window_server in [
+            WindowServerOwnership::SamePid,
+            WindowServerOwnership::NotFound,
+        ] {
+            let facts = BackgroundTargetFacts {
+                window_server: window_server.clone(),
+                ax_window_present: false,
+                element: ElementAncestry::AppMenuBar,
+                ..matched_facts()
+            };
+            assert!(
+                decide_background_input(TARGET, &facts, BackgroundAction::AxSemantic).is_execute(),
+                "{window_server:?}"
+            );
+            for action in [
+                BackgroundAction::WindowPointer,
+                BackgroundAction::InsertText,
+                BackgroundAction::GenericKey,
+            ] {
+                assert!(
+                    !decide_background_input(TARGET, &facts, action).is_execute(),
+                    "{window_server:?} {action:?}"
+                );
+            }
+            let locked = BackgroundTargetFacts {
+                screen_locked: true,
+                ..facts
+            };
+            assert_eq!(
+                code_of(decide_background_input(
+                    TARGET,
+                    &locked,
+                    BackgroundAction::AxSemantic
+                )),
+                refusal_codes::SCREEN_LOCKED
+            );
+        }
+        // An element of the window itself gets no such pass.
+        let facts = BackgroundTargetFacts {
+            ax_window_present: false,
+            element: ElementAncestry::ProvenDescendant,
+            ..matched_facts()
+        };
+        assert_eq!(
+            code_of(decide_background_input(
+                TARGET,
+                &facts,
+                BackgroundAction::AxSemantic
+            )),
+            refusal_codes::OFF_SPACE_OR_AX_UNRESOLVED
+        );
+        // A window another process now owns still refuses.
+        let facts = BackgroundTargetFacts {
+            window_server: WindowServerOwnership::ForeignPid { owner_pid: 900 },
+            element: ElementAncestry::AppMenuBar,
+            ..matched_facts()
+        };
+        assert_eq!(
+            code_of(decide_background_input(
+                TARGET,
+                &facts,
+                BackgroundAction::AxSemantic
+            )),
+            refusal_codes::OWNER_PID_MISMATCH
+        );
     }
 
     /// Minimized/hidden targets retain exact semantic AX actions; raw keys and
