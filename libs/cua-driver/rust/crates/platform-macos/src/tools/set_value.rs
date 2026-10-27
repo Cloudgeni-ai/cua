@@ -1667,11 +1667,35 @@ pub(super) fn choose_popup_option_item(
 pub(super) fn is_chromium_web_select(pid: i32, window_id: u32, element: AXUIElementRef) -> bool {
     unsafe { copy_string_attr(element, "AXRole") }.as_deref() == Some("AXPopUpButton")
         && is_chromium_popup_owner(pid)
+        && lists_its_options(element)
         && super::type_text::target_in_web_area(
             pid,
             Some((element as usize, None)),
             Some(window_id),
         )
+}
+
+/// Whether a web pop-up button lists its options as accessibility children,
+/// as a native `<select>` does (the option it shows while closed, its menu
+/// while open). Chromium gives an ARIA menu button (`aria-haspopup`) the
+/// same role and pop-up attributes, but no such children: its menu is drawn
+/// in the page, so pressing it opens nothing that could raise the window.
+fn lists_its_options(element: AXUIElementRef) -> bool {
+    let children = unsafe { crate::ax::bindings::copy_children(element) };
+    let roles: Vec<Option<String>> = children
+        .iter()
+        .map(|child| unsafe { copy_string_attr(*child, "AXRole") })
+        .collect();
+    for child in children {
+        unsafe { CFRelease(child as _) };
+    }
+    roles_list_options(&roles)
+}
+
+fn roles_list_options(child_roles: &[Option<String>]) -> bool {
+    child_roles
+        .iter()
+        .any(|role| matches!(role.as_deref(), Some("AXMenuItem" | "AXMenu")))
 }
 
 /// Whether `window_id` is already the front window: its app is the active
@@ -2268,9 +2292,24 @@ mod tests {
     use super::{
         apply_surface_trust, apply_verification_label, classify_write, confirms_combo_box,
         file_name_needs_rename, is_file_name_cell, is_get_info_name_field, left_empty, moved,
-        not_applied_result, outside_range, popup_option_subject, refusal_result, takes_text,
-        write_not_applied, Refusal, SetValueOutcome, GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
+        not_applied_result, outside_range, popup_option_subject, refusal_result,
+        roles_list_options, takes_text, write_not_applied, Refusal, SetValueOutcome,
+        GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
     };
+
+    #[test]
+    fn only_a_pop_up_that_lists_its_options_is_a_native_select() {
+        let roles = |names: &[&str]| -> Vec<Option<String>> {
+            names.iter().map(|name| Some((*name).to_owned())).collect()
+        };
+        // A closed <select> lists the option it shows; an open one, its menu.
+        assert!(roles_list_options(&roles(&["AXMenuItem"])));
+        assert!(roles_list_options(&roles(&["AXMenu"])));
+        // An ARIA menu button (its menu drawn in the page) lists none.
+        assert!(!roles_list_options(&roles(&[])));
+        assert!(!roles_list_options(&roles(&["AXStaticText", "AXImage"])));
+        assert!(!roles_list_options(&[None]));
+    }
 
     #[test]
     fn a_number_control_left_empty_by_a_value_refused_it() {
