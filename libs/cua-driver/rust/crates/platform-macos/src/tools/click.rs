@@ -161,6 +161,44 @@ fn toggle_press_shows(role: &str, before: &str, now: &str) -> bool {
     now != before && (role != "AXRadioButton" || now == "1")
 }
 
+/// How long a press the app answered with an error is given to close the
+/// window it was sent to, and how often that is checked.
+const CLOSED_WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+const CLOSED_WINDOW_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Whether a press the app answered with `err` closed the window it was sent
+/// to: a dialog's button that closes its dialog can be answered with an error
+/// (its element went away with the window, or the app answered late) although
+/// it did what it does. The window was there when the press was sent: the
+/// background gate checks it just before. Errors that mean the request never
+/// reached the app (an illegal argument, accessibility turned off) are not
+/// counted, whatever the window does.
+fn press_closed_its_window(
+    err: crate::ax::bindings::AXError,
+    mut window_shown: impl FnMut() -> bool,
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+) -> bool {
+    /// `kAXErrorIllegalArgument`.
+    const ILLEGAL_ARGUMENT: crate::ax::bindings::AXError = -25201;
+    if matches!(
+        err,
+        ILLEGAL_ARGUMENT | crate::ax::bindings::kAXErrorAPIDisabled
+    ) {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !window_shown() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        crate::timing::sleep(poll);
+    }
+}
+
 /// Delivers a background pixel click as one AXPress on the hit-tested
 /// element. Returns false without pressing when the press would be hollow,
 /// so the caller sends the routed pixel click instead; otherwise it returns
@@ -1957,6 +1995,25 @@ fn perform_ax_click(
                 ));
             }
         }
+        // A dialog's button that closes its dialog: the closed window shows
+        // the press was taken, whatever the app answered.
+        if press_closed_its_window(
+            err,
+            || crate::windows::window_info_by_id(window_id).is_some_and(|w| w.is_on_screen),
+            CLOSED_WINDOW_TIMEOUT,
+            CLOSED_WINDOW_POLL,
+        ) {
+            return Ok((
+                format!(
+                    "✅ Performed {ax_action} on [{idx}] {role} \"{title}\"; its window \
+                     {window_id} closed, although the app returned AX error {err}."
+                ),
+                false,
+                false,
+                true,
+                false,
+            ));
+        }
         anyhow::bail!("AXUIElementPerformAction({ax_action}) returned {err}");
     }
 
@@ -2233,6 +2290,43 @@ mod tests {
         assert!(press_error_may_have_acted(-25206));
         for refused in [-25201, -25202, -25204, -25211] {
             assert!(!press_error_may_have_acted(refused), "{refused}");
+        }
+    }
+
+    /// A press answered with an error whose window then closed (a dialog
+    /// button that closes its dialog) was taken; one whose window stays, or
+    /// that never reached the app, was not.
+    #[test]
+    fn a_press_answered_with_an_error_that_closed_its_window_was_taken() {
+        let fast = std::time::Duration::from_millis(1);
+        let timeout = std::time::Duration::from_millis(50);
+        for err in [-25200, -25202, -25204, -25205, -25206] {
+            let mut reads = 0;
+            let closes_on_third_read = || {
+                reads += 1;
+                reads < 3
+            };
+            assert!(
+                press_closed_its_window(err, closes_on_third_read, timeout, fast),
+                "{err}"
+            );
+            assert!(
+                !press_closed_its_window(err, || true, timeout, fast),
+                "{err} window stays"
+            );
+        }
+        for refused in [-25201, -25211] {
+            let mut read = false;
+            assert!(!press_closed_its_window(
+                refused,
+                || {
+                    read = true;
+                    false
+                },
+                timeout,
+                fast
+            ));
+            assert!(!read, "{refused} does not wait for the window");
         }
     }
 
