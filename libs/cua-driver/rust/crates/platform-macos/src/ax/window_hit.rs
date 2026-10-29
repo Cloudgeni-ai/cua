@@ -162,7 +162,7 @@ mod tests {
         }
     }
 
-    fn hit<'a>(root: &'a Node, point: (f64, f64)) -> &'a str {
+    fn hit(root: &Node, point: (f64, f64)) -> &'static str {
         deepest_at(
             root,
             point,
