@@ -117,6 +117,10 @@ pub struct KeyWindowUnconfirmed {
     /// The app named no focused window (or did not answer in time), so
     /// where keys would go is unknown, rather than another of its windows.
     pub focus_unknown: bool,
+    /// The target is not the app's main window and could not be made main
+    /// (see [`main_window_step`]): menu key equivalents would act on the
+    /// main window.
+    pub not_main: bool,
     pub reason: String,
 }
 
@@ -151,6 +155,7 @@ pub fn prime_exact_window_key(
     let now = focus();
     Err(KeyWindowUnconfirmed {
         focus_unknown: now.window.is_none(),
+        not_main: false,
         reason: format!(
             "window {target} could not be confirmed as the app's key window (the app's focused \
              window is {:?}, its focused element is in window {:?}), so no keys were sent: they \
@@ -170,6 +175,167 @@ pub struct WindowKeyScope {
     /// The app's on-screen windows before priming, front to back.
     order_before: Vec<u32>,
     primed: KeyPrime,
+    /// Hands main back after key (fields drop after [`Drop::drop`] ran).
+    _main: Option<MainWindowScope>,
+}
+
+/// What a background key post does about the app's main window.
+///
+/// Key status alone moves where typed characters go, not where a menu key
+/// equivalent goes: AppKit sends cmd-key shortcuts through the menu bar to
+/// the app's main window (Chrome's cmd+L focuses the main window's address
+/// bar, whatever window is key). So a window that is not main is made main
+/// for the post, as a background press does. That brings it to the top of
+/// the app's own windows; the app stays behind the user's app, which keeps
+/// its key window. When the app is the user's front app, making another of
+/// its windows main would move the window the user is working in, so the
+/// keys are refused instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MainStep {
+    /// The target is main already, cannot be main (a panel, a sheet), or
+    /// the app names no main window: nothing to do.
+    Keep,
+    Make,
+    Refuse,
+}
+
+pub fn main_window_step(
+    target: u32,
+    main: Option<u32>,
+    target_can_be_main: bool,
+    app_in_front: bool,
+) -> MainStep {
+    match main {
+        Some(main) if main != target && target_can_be_main => {
+            if app_in_front {
+                MainStep::Refuse
+            } else {
+                MainStep::Make
+            }
+        }
+        _ => MainStep::Keep,
+    }
+}
+
+/// Makes `previous` the app's main window again when dropped.
+struct MainWindowScope {
+    pid: pid_t,
+    previous: u32,
+}
+
+impl Drop for MainWindowScope {
+    fn drop(&mut self) {
+        set_main_window(self.pid, self.previous);
+    }
+}
+
+/// `pid`'s `AXMainWindow`.
+fn main_window_of_pid(pid: pid_t) -> Option<u32> {
+    use crate::ax::bindings::{ax_get_window_id, copy_element_attr, AXUIElementCreateApplication};
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        let main = copy_element_attr(app, "AXMainWindow");
+        core_foundation::base::CFRelease(app as _);
+        let main = main?;
+        let id = ax_get_window_id(main);
+        core_foundation::base::CFRelease(main as _);
+        id
+    }
+}
+
+/// Run `f` on `pid`'s accessibility window `wid`.
+fn with_ax_window<T>(
+    pid: pid_t,
+    wid: u32,
+    f: impl FnOnce(crate::ax::bindings::AXUIElementRef) -> T,
+) -> Option<T> {
+    use crate::ax::bindings::{ax_get_window_id, copy_ax_windows, AXUIElementCreateApplication};
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        let mut found = None;
+        for window in copy_ax_windows(app) {
+            if found.is_none() && ax_get_window_id(window) == Some(wid) {
+                found = Some(window);
+            } else {
+                core_foundation::base::CFRelease(window as _);
+            }
+        }
+        core_foundation::base::CFRelease(app as _);
+        let window = found?;
+        let result = f(window);
+        core_foundation::base::CFRelease(window as _);
+        Some(result)
+    }
+}
+
+fn window_can_be_main(pid: pid_t, wid: u32) -> bool {
+    with_ax_window(pid, wid, |window| unsafe {
+        crate::ax::bindings::is_attribute_settable(window, "AXMain")
+    })
+    .unwrap_or(false)
+}
+
+fn set_main_window(pid: pid_t, wid: u32) -> bool {
+    with_ax_window(pid, wid, |window| unsafe {
+        crate::ax::bindings::set_bool_attr_true(window, "AXMain") == 0
+    })
+    .unwrap_or(false)
+}
+
+/// Make `target` the app's main window for a key post (see [`MainStep`]),
+/// confirmed by re-reading it; the returned guard hands main back.
+fn enter_main_window(
+    pid: pid_t,
+    target: u32,
+) -> Result<Option<MainWindowScope>, KeyWindowUnconfirmed> {
+    let main = main_window_of_pid(pid);
+    let step = main_window_step(
+        target,
+        main,
+        window_can_be_main(pid, target),
+        crate::apps::frontmost_pid() == Some(pid),
+    );
+    let refused = |reason: String| KeyWindowUnconfirmed {
+        focus_unknown: false,
+        not_main: true,
+        reason,
+    };
+    match (step, main) {
+        (MainStep::Make, Some(previous)) => {
+            let scope = MainWindowScope { pid, previous };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            let made = set_main_window(pid, target) && {
+                while main_window_of_pid(pid) != Some(target)
+                    && std::time::Instant::now() < deadline
+                {
+                    crate::timing::sleep(std::time::Duration::from_millis(30));
+                }
+                main_window_of_pid(pid) == Some(target)
+            };
+            if made {
+                Ok(Some(scope))
+            } else {
+                Err(refused(format!(
+                    "window {target} could not be made the app's main window (window \
+                     {previous} is), so no keys were sent: a shortcut would have acted on \
+                     the main window. Use delivery_mode:\"foreground\""
+                )))
+            }
+        }
+        (MainStep::Refuse, Some(main)) => Err(refused(format!(
+            "window {target} is not the app's main window (window {main} is), and the app \
+             is the user's front app: making it main would move the window the user is \
+             working in, so no keys were sent. Ask the user first, or act on its elements \
+             by element_token"
+        ))),
+        _ => Ok(None),
+    }
 }
 
 /// The window key goes back to. Normally the previous key window. LibreOffice
@@ -349,6 +515,7 @@ pub fn enter_exact_window_key(
     let before = key_focus_of_pid(pid);
     let previous = before.window;
     let order_before = app_window_order(pid);
+    let main = enter_main_window(pid, target_wid)?;
     let primed = prime_exact_window_key(
         target_wid,
         || key_focus_of_pid(pid),
@@ -373,6 +540,7 @@ pub fn enter_exact_window_key(
         previous,
         order_before,
         primed,
+        _main: main,
     })
 }
 
@@ -1846,6 +2014,24 @@ mod key_prime_tests {
         assert!(r.unwrap_err().focus_unknown);
         let r = prime_exact_window_key(7, || at(Some(9), Some(9)), || true, || true);
         assert!(!r.unwrap_err().focus_unknown);
+    }
+
+    /// A shortcut acts on the app's main window, so a window that is not
+    /// main is made main for the keys, unless the app is the user's front
+    /// app, where that would move the window they are working in.
+    #[test]
+    fn keys_to_a_window_that_is_not_main_make_it_main_or_are_refused_in_front() {
+        use super::{main_window_step, MainStep};
+        // Behind the user's app: made main for the post.
+        assert_eq!(main_window_step(7, Some(9), true, false), MainStep::Make);
+        // The user's front app: refused, nothing moved.
+        assert_eq!(main_window_step(7, Some(9), true, true), MainStep::Refuse);
+        // Main already, in front or not.
+        assert_eq!(main_window_step(7, Some(7), true, true), MainStep::Keep);
+        assert_eq!(main_window_step(7, Some(7), true, false), MainStep::Keep);
+        // A panel or sheet cannot be main; an app with no main window.
+        assert_eq!(main_window_step(7, Some(9), false, false), MainStep::Keep);
+        assert_eq!(main_window_step(7, None, true, true), MainStep::Keep);
     }
 
     /// A focus reading past its deadline asks nothing more and knows

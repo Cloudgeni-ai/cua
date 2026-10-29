@@ -490,14 +490,22 @@ pub(crate) const WINDOW_NOT_KEY: &str = "window_not_key";
 /// time), so where keys would go is unknown: none is sent.
 pub(crate) const KEY_FOCUS_UNKNOWN: &str = "key_focus_unknown";
 
+/// Refusal code when the addressed window is not the app's main window and
+/// could not be made main (or the app is the user's front app): a shortcut
+/// would act on the main window, so no key is sent.
+pub(crate) const WINDOW_NOT_MAIN: &str = "window_not_main";
+
 /// The refusal for a window that could not be confirmed as the app's key
 /// window: [`KEY_FOCUS_UNKNOWN`] when the app named no focused window,
-/// otherwise [`WINDOW_NOT_KEY`] (another of its windows has focus).
+/// [`WINDOW_NOT_MAIN`] when it could not be made the main window, otherwise
+/// [`WINDOW_NOT_KEY`] (another of its windows has focus).
 pub(crate) fn key_window_refusal(
     unconfirmed: crate::input::skylight::KeyWindowUnconfirmed,
 ) -> cua_driver_core::background_input::BackgroundRefusal {
     cua_driver_core::background_input::BackgroundRefusal {
-        code: if unconfirmed.focus_unknown {
+        code: if unconfirmed.not_main {
+            WINDOW_NOT_MAIN
+        } else if unconfirmed.focus_unknown {
             KEY_FOCUS_UNKNOWN
         } else {
             WINDOW_NOT_KEY
@@ -1257,12 +1265,14 @@ mod key_window_refusal_tests {
     /// window focused: its refusal has its own code.
     #[test]
     fn an_unknown_focus_has_its_own_code() {
-        for (focus_unknown, code) in [
-            (true, super::KEY_FOCUS_UNKNOWN),
-            (false, super::WINDOW_NOT_KEY),
+        for (focus_unknown, not_main, code) in [
+            (true, false, super::KEY_FOCUS_UNKNOWN),
+            (false, false, super::WINDOW_NOT_KEY),
+            (false, true, super::WINDOW_NOT_MAIN),
         ] {
             let refusal = super::key_window_refusal(KeyWindowUnconfirmed {
                 focus_unknown,
+                not_main,
                 reason: "r".into(),
             });
             assert_eq!(refusal.code, code);
