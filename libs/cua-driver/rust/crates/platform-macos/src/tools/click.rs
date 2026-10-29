@@ -1279,10 +1279,17 @@ impl Tool for ClickTool {
                     let check = covered_point_check(
                         &hit,
                         |&element| {
-                            crate::ax::exact_target::element_window_id(element) == Some(select_wid)
-                                && super::set_value::is_chromium_web_select(
-                                    pid, select_wid, element,
-                                )
+                            let select = super::set_value::chromium_web_select_at_or_above(
+                                pid, select_wid, element,
+                            )?;
+                            if crate::ax::exact_target::element_window_id(select)
+                                == Some(select_wid)
+                            {
+                                Some(select)
+                            } else {
+                                CFRelease(select as _);
+                                None
+                            }
                         },
                         |&element| {
                             super::set_value::is_chromium_web_content(pid, select_wid, element)
@@ -1291,10 +1298,12 @@ impl Tool for ClickTool {
                     let element = hit.into_element();
                     let refusal = match check {
                         CoveredPointCheck::Post => None,
-                        CoveredPointCheck::RefuseSelect => {
-                            Some(super::set_value::chromium_select_open_refusal(
-                                pid, select_wid, None, element,
-                            ))
+                        CoveredPointCheck::RefuseSelect(select) => {
+                            let refusal = super::set_value::chromium_select_open_refusal(
+                                pid, select_wid, None, select,
+                            );
+                            CFRelease(select as _);
+                            Some(refusal)
                         }
                         CoveredPointCheck::RefuseUnverified => Some(
                             super::set_value::chromium_point_unverified_refusal(pid, select_wid),
@@ -1678,34 +1687,35 @@ fn press_needs_key_window(action: &str, front_pid: Option<i32>, pid: i32, native
 /// What a background pixel click does after its window's element under the
 /// point was looked up.
 #[derive(Debug, PartialEq, Eq)]
-enum CoveredPointCheck {
+enum CoveredPointCheck<S> {
     Post,
-    /// It is a web `<select>`: the click would open its menu.
-    RefuseSelect,
+    /// The point is on this web `<select>`: the click would open its menu.
+    RefuseSelect(S),
     /// The lookup stopped inside a browser page before the point: a
     /// `<select>` there cannot be ruled out.
     RefuseUnverified,
 }
 
-/// A web `<select>` (or the inside of one, where the lookup stopped among
-/// its options) is refused. Where the lookup stopped elsewhere, the click is
+/// A web `<select>` at the point (`select_at`: the element or the select
+/// that holds it as an option, also where the lookup stopped among its
+/// options) is refused. Where the lookup stopped elsewhere, the click is
 /// refused only inside a browser page, where a `<select>` may be; native
 /// windows and the browser's toolbar keep their pixel clicks.
-fn covered_point_check<E>(
+fn covered_point_check<E, S>(
     hit: &crate::ax::window_hit::WindowHit<E>,
-    is_web_select: impl Fn(&E) -> bool,
+    select_at: impl Fn(&E) -> Option<S>,
     in_browser_page: impl Fn(&E) -> bool,
-) -> CoveredPointCheck {
+) -> CoveredPointCheck<S> {
     use crate::ax::window_hit::WindowHit;
+    let (WindowHit::Element(element) | WindowHit::Unknown(element)) = hit;
+    if let Some(select) = select_at(element) {
+        return CoveredPointCheck::RefuseSelect(select);
+    }
     match hit {
-        WindowHit::Element(element) | WindowHit::Unknown(element) if is_web_select(element) => {
-            CoveredPointCheck::RefuseSelect
-        }
-        WindowHit::Element(_) => CoveredPointCheck::Post,
         WindowHit::Unknown(element) if in_browser_page(element) => {
             CoveredPointCheck::RefuseUnverified
         }
-        WindowHit::Unknown(_) => CoveredPointCheck::Post,
+        _ => CoveredPointCheck::Post,
     }
 }
 
@@ -2225,12 +2235,20 @@ mod selection_fallback_tests {
 
     #[test]
     fn a_covered_page_point_that_could_not_be_read_is_refused() {
-        let check = |hit: WindowHit<&str>| {
-            covered_point_check(&hit, |&e| e == "select", |&e| e.starts_with("page"))
+        // A select's closed option lies over the select: it is the select.
+        let select_at = |&e: &&str| match e {
+            "select" | "select option" => Some("select"),
+            _ => None,
         };
+        let check =
+            |hit: WindowHit<&str>| covered_point_check(&hit, select_at, |&e| e.starts_with("page"));
         assert_eq!(
             check(WindowHit::Element("select")),
-            CoveredPointCheck::RefuseSelect
+            CoveredPointCheck::RefuseSelect("select")
+        );
+        assert_eq!(
+            check(WindowHit::Element("select option")),
+            CoveredPointCheck::RefuseSelect("select")
         );
         assert_eq!(
             check(WindowHit::Element("page button")),
@@ -2248,8 +2266,8 @@ mod selection_fallback_tests {
         );
         // Stopped among a select's own options: the select is under it.
         assert_eq!(
-            check(WindowHit::Unknown("select")),
-            CoveredPointCheck::RefuseSelect
+            check(WindowHit::Unknown("select option")),
+            CoveredPointCheck::RefuseSelect("select")
         );
     }
 

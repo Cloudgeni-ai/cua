@@ -1537,6 +1537,72 @@ pub(super) fn is_chromium_web_content(pid: i32, window_id: u32, element: AXUIEle
         )
 }
 
+/// How many levels above an element under a point its `<select>` may be. A
+/// closed Chromium `<select>` lists its options as its children (an
+/// `AXMenuItem`, or an `AXMenu` of them), framed over the control itself, so
+/// the element under a point of the control can be one of those.
+const SELECT_ABOVE_LEVELS: usize = 3;
+
+/// From `start` up through at most `levels` parents, the first node
+/// `is_select` accepts; the search ends at a node `is_boundary` accepts (the
+/// page or the window), which is not itself considered.
+pub(super) fn select_at_or_above<N>(
+    start: N,
+    levels: usize,
+    is_select: impl Fn(&N) -> bool,
+    is_boundary: impl Fn(&N) -> bool,
+    parent: impl Fn(&N) -> Option<N>,
+) -> Option<N> {
+    let mut current = start;
+    for level in 0..=levels {
+        if is_boundary(&current) {
+            return None;
+        }
+        if is_select(&current) {
+            return Some(current);
+        }
+        if level == levels {
+            break;
+        }
+        current = parent(&current)?;
+    }
+    None
+}
+
+/// A +1 element reference released when dropped.
+struct Held(AXUIElementRef);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.0 as _) };
+    }
+}
+
+/// The Chromium `<select>` that is `element` or holds it as one of its
+/// options (see [`SELECT_ABOVE_LEVELS`]), retained: the caller releases it.
+pub(super) fn chromium_web_select_at_or_above(
+    pid: i32,
+    window_id: u32,
+    element: AXUIElementRef,
+) -> Option<AXUIElementRef> {
+    let start = Held(unsafe { core_foundation::base::CFRetain(element as _) } as AXUIElementRef);
+    let select = select_at_or_above(
+        start,
+        SELECT_ABOVE_LEVELS,
+        |held| is_chromium_web_select(pid, window_id, held.0),
+        |held| {
+            matches!(
+                unsafe { copy_string_attr(held.0, "AXRole") }.as_deref(),
+                Some("AXWebArea" | "AXWindow")
+            )
+        },
+        |held| unsafe { crate::ax::bindings::copy_element_attr(held.0, "AXParent") }.map(Held),
+    )?;
+    let element = select.0;
+    std::mem::forget(select);
+    Some(element)
+}
+
 /// Refusal for a background press that would open a Chromium `<select>` menu
 /// (CUA-1795). Opening it orders the browser window above the user's window
 /// for at least a frame, which undoing afterwards cannot hide; `set_value`
@@ -2156,9 +2222,40 @@ mod tests {
     use super::{
         apply_surface_trust, apply_verification_label, classify_write, file_name_needs_rename,
         is_file_name_cell, is_get_info_name_field, left_empty, moved, not_applied_result,
-        outside_range, refusal_result, takes_text, write_not_applied, Refusal, SetValueOutcome,
-        GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
+        outside_range, refusal_result, select_at_or_above, takes_text, write_not_applied, Refusal,
+        SetValueOutcome, GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE, SELECT_ABOVE_LEVELS,
     };
+
+    /// Chrome's closed `<select>` lists its option as an `AXMenuItem` child
+    /// framed over the top of the control: the element under a point there
+    /// is the option, and the select is its parent.
+    #[test]
+    fn the_select_holding_an_option_under_the_point_is_found() {
+        // Each node's parent is the next one in the chain.
+        let chain = [
+            "AXMenuItem",
+            "AXPopUpButton",
+            "AXGroup",
+            "AXWebArea",
+            "AXWindow",
+        ];
+        let find = |start: usize, levels: usize| {
+            select_at_or_above(
+                start,
+                levels,
+                |&i| chain[i] == "AXPopUpButton",
+                |&i| matches!(chain[i], "AXWebArea" | "AXWindow"),
+                |&i| (i + 1 < chain.len()).then_some(i + 1),
+            )
+        };
+        assert_eq!(find(0, SELECT_ABOVE_LEVELS), Some(1));
+        assert_eq!(find(1, SELECT_ABOVE_LEVELS), Some(1));
+        // A control that is not in a select, and the page itself.
+        assert_eq!(find(2, SELECT_ABOVE_LEVELS), None);
+        assert_eq!(find(3, SELECT_ABOVE_LEVELS), None);
+        // The search is bounded.
+        assert_eq!(find(0, 0), None);
+    }
 
     #[test]
     fn a_number_control_left_empty_by_a_value_refused_it() {
