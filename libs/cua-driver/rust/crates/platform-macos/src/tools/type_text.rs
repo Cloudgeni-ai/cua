@@ -289,8 +289,9 @@ impl Tool for TypeTextTool {
         }
 
         // A Chromium browser's own text fields (the address bar) take an AX
-        // insert as display text only: Return, background or foreground, does
-        // not submit it, and background keystrokes never reach the browser.
+        // insert as display text only: Return then submits nothing. They do
+        // take keystrokes posted to the browser in the background, so those
+        // are typed instead (see type_text_in_key_window).
         let chromium_native_field = !delivery_mode.is_foreground()
             && !used_pixel_focus
             && is_chromium_identity(&apps::bundle_id_for_pid(pid).unwrap_or_default())
@@ -298,12 +299,6 @@ impl Tool for TypeTextTool {
                 classify_target_web_area(pid, element_ptr, window_id),
                 WebAreaClassification::NonWebContent
             );
-        if let Some(refusal) = chromium_native_field_submit_refusal(chromium_native_field, &text) {
-            return match window_id {
-                Some(wid) => super::background_refusal_result(pid, wid, &refusal),
-                None => ToolResult::error(refusal.reason.clone()),
-            };
-        }
 
         if let (Some((element, _)), Some(wid)) = (element_guard.as_ref(), window_id) {
             let center_guard = element.clone();
@@ -379,6 +374,7 @@ impl Tool for TypeTextTool {
                             keyboard_policy: blocking_policy,
                             explicit_target: element_ptr.is_some() || used_pixel_focus,
                             key_window_confirmed: false,
+                            browser_own_field: chromium_native_field,
                         },
                     )
                 })
@@ -484,11 +480,6 @@ impl Tool for TypeTextTool {
                       and re-call with delivery_mode:\"foreground\" if it didn't."
                             .to_string(),
                     )
-                };
-                let note = if chromium_native_field && path == PATH_AX {
-                    format!("{note}{CHROMIUM_NATIVE_FIELD_NOTE}")
-                } else {
-                    note
                 };
                 ToolResult::text(format!(
                     "{mark} {char_count} char(s){detail}.{note}{}",
@@ -764,31 +755,6 @@ fn electron_background_ax_refusal(
         reason: "The Electron AX target cannot establish a safe exact background text route on macOS because its ancestry is web content or could not be proven native; use the pixel-targeted type_text form (x,y) or delivery_mode:\"foreground\"."
             .to_owned(),
         advice: Some("px"),
-    })
-}
-
-const CHROMIUM_NATIVE_FIELD_NOTE: &str = " This is a Chromium browser's own field (address \
-     bar): it shows accessibility-inserted text but does not submit it on Return. To \
-     navigate, re-type the URL ending in \\n with delivery_mode:\"foreground\", or open it \
-     with launch_app {bundle_id, urls:[...]}.";
-
-/// Refuse a background AX insert that is meant to submit (it contains a line
-/// break) into a Chromium browser's native field. The insert would land as
-/// display text, the line break would not submit it, and the caller would see
-/// a success for a navigation that never happened (bench CDB-G04: nine
-/// address-bar attempts in one trial, none of which loaded the page).
-fn chromium_native_field_submit_refusal(
-    chromium_native_field: bool,
-    text: &str,
-) -> Option<BackgroundRefusal> {
-    if !chromium_native_field || !text.contains(['\n', '\r']) {
-        return None;
-    }
-    Some(BackgroundRefusal {
-        code: "browser_field_needs_keystrokes",
-        reason: "A Chromium browser's own field (address bar) does not submit accessibility-inserted text, and background keystrokes do not reach the browser, so nothing was typed. Re-send the same type_text with delivery_mode:\"foreground\" (the driver activates the browser, keeps the field focus, types and presses Return), or open a URL with launch_app {bundle_id, urls:[...]}."
-            .to_owned(),
-        advice: Some("foreground"),
     })
 }
 
@@ -1304,6 +1270,9 @@ struct KeyboardRoute {
     /// call. An app that is not active reports no focused element even then
     /// (LibreOffice), so a missing focus is not a reason to refuse.
     key_window_confirmed: bool,
+    /// The text goes to a Chromium browser's own field (the address bar) in
+    /// the background, which shows an AX insert but never acts on it.
+    browser_own_field: bool,
 }
 
 /// Best-effort-background ladder for `type_text`.
@@ -1370,6 +1339,7 @@ fn type_text_in_key_window(
         keyboard_policy,
         explicit_target,
         key_window_confirmed,
+        browser_own_field,
     } = route;
     // Original field value before any rung drives read-back verification only.
     // An unreadable value is not evidence that the field is empty — and for a
@@ -1612,6 +1582,45 @@ fn type_text_in_key_window(
         }
     }
 
+    // A Chromium browser's own field (the address bar) shows an AX insert
+    // but does not take it: a URL written that way stayed in the address bar
+    // and Return loaded nothing. Keystrokes posted to the browser in the
+    // background reach the field, and Return then submits what they typed.
+    if browser_own_field && !delivery_mode.is_foreground() {
+        if let Some((element, true, _)) = ax_target {
+            unsafe { CFRelease(element as _) };
+        }
+        if let BackgroundKeyboardPolicy::SemanticOnly(refusal) = keyboard_policy {
+            return Ok(TypeTextDelivery::Refused(refusal));
+        }
+        if let Some(refusal) = synthesis_preflight(
+            TextDeliveryRoute::UnicodeSynthesis,
+            text.chars().count(),
+            delay_ms,
+        ) {
+            return Ok(TypeTextDelivery::SynthesisRefused {
+                path: PATH_KEY_EVENTS,
+                refusal,
+                ax_attempt: AxAttempt::NotAttempted,
+            });
+        }
+        let (verified, delivered_chars) = cgevent_type_verified(
+            pid,
+            text,
+            delay_ms,
+            before.as_deref(),
+            element_ptr_and_idx,
+            /*settle_ms=*/ 0,
+            window_id,
+        )?;
+        return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+            detail: format!(" via CGEvent (browser's own field, {delay_ms}ms delay)"),
+            path: PATH_KEY_EVENTS,
+            verified,
+            delivered_chars,
+        }));
+    }
+
     let mut ax_attempt = AxAttempt::NotAttempted;
     if let Some((element, owns, idx_opt)) = ax_target {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
@@ -1851,17 +1860,59 @@ mod tests {
         }
     }
 
+    /// Text for a browser's own field (the address bar) is never written
+    /// through accessibility in the background: the field would show it and
+    /// Return would load nothing. With the window limited to semantic writes,
+    /// it is refused before anything is sent.
     #[test]
-    fn chromium_native_field_refuses_only_background_submits() {
-        let refusal = super::chromium_native_field_submit_refusal(true, "file:///tmp/report.log\n")
-            .expect("a submit into the address bar is refused");
-        assert_eq!(refusal.code, "browser_field_needs_keystrokes");
-        assert_eq!(refusal.advice, Some("foreground"));
-        assert!(refusal.reason.contains("delivery_mode:\"foreground\""));
-        assert!(super::chromium_native_field_submit_refusal(true, "a\rb").is_some());
-        // Plain text still inserts (with a note); other surfaces are untouched.
-        assert!(super::chromium_native_field_submit_refusal(true, "example.com").is_none());
-        assert!(super::chromium_native_field_submit_refusal(false, "example.com\n").is_none());
+    fn browser_own_field_text_never_takes_the_ax_insert() {
+        let refusal = BackgroundRefusal {
+            code: cua_driver_core::background_input::refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
+            reason: "test".into(),
+            advice: None,
+        };
+        let result = type_text_in_key_window(
+            -1,
+            "example.com",
+            None,
+            0,
+            /*is_terminal_target=*/ false,
+            KeyboardRoute {
+                delivery_mode: super::super::DeliveryMode::Background,
+                window_id: Some(7),
+                keyboard_policy: BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
+                explicit_target: true,
+                key_window_confirmed: false,
+                browser_own_field: true,
+            },
+        )
+        .expect("the refusal is a delivery outcome");
+        match result {
+            TypeTextDelivery::Refused(returned) => assert_eq!(returned, refusal),
+            _ => panic!("expected the semantic-only refusal, not an AX insert"),
+        }
+        let oversized = type_text_in_key_window(
+            -1,
+            &"x".repeat(6_500),
+            None,
+            0,
+            /*is_terminal_target=*/ false,
+            KeyboardRoute {
+                delivery_mode: super::super::DeliveryMode::Background,
+                window_id: Some(7),
+                keyboard_policy: BackgroundKeyboardPolicy::Allowed,
+                explicit_target: true,
+                key_window_confirmed: false,
+                browser_own_field: true,
+            },
+        )
+        .expect("preflight refusal must not attempt the invalid pid");
+        match oversized {
+            TypeTextDelivery::SynthesisRefused { ax_attempt, .. } => {
+                assert_eq!(ax_attempt, AxAttempt::NotAttempted)
+            }
+            _ => panic!("expected the keystroke budget refusal, with no AX attempt"),
+        }
     }
 
     #[test]
@@ -1910,6 +1961,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
                 explicit_target: false,
                 key_window_confirmed: false,
+                browser_own_field: false,
             },
         );
         match r {
@@ -1934,6 +1986,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                 explicit_target: false,
                 key_window_confirmed: false,
+                browser_own_field: false,
             },
         )
         .expect("the refusal is a delivery outcome");
@@ -1978,6 +2031,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                 explicit_target: false,
                 key_window_confirmed: false,
+                browser_own_field: false,
             },
         )
         .expect("preflight refusal must not attempt the invalid pid");
