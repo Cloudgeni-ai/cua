@@ -175,8 +175,6 @@ pub struct WindowKeyScope {
     /// The app's on-screen windows before priming, front to back.
     order_before: Vec<u32>,
     primed: KeyPrime,
-    /// Hands main back after key (fields drop after [`Drop::drop`] ran).
-    _main: Option<MainWindowScope>,
 }
 
 /// What a background key post does about the app's main window.
@@ -187,8 +185,12 @@ pub struct WindowKeyScope {
 /// bar, whatever window is key). So a window that is not main is made main
 /// for the post, as a background press does. That brings it to the top of
 /// the app's own windows; the app stays behind the user's app, which keeps
-/// its key window. When the app is the user's front app, making another of
-/// its windows main would move the window the user is working in, so the
+/// its key window. Main is not handed back: a batch's keys arrive as
+/// separate posts (cmd+L, then the text, then Return), and handing main back
+/// in between moved the browser's address bar focus to the other window, so
+/// the text was appended to the old address. The window stays main, as after
+/// a background press. When the app is the user's front app, making another
+/// of its windows main would move the window the user is working in, so the
 /// keys are refused instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MainStep {
@@ -216,26 +218,6 @@ pub fn main_window_step(
         _ => MainStep::Keep,
     }
 }
-
-/// Makes `previous` the app's main window again when dropped.
-struct MainWindowScope {
-    pid: pid_t,
-    previous: u32,
-}
-
-impl Drop for MainWindowScope {
-    fn drop(&mut self) {
-        // Posted keys wait in the app's event queue, while the main-window
-        // write is an accessibility request the app may answer first: hand
-        // main back only once the keys had time to be handled, or a shortcut
-        // still queued would act on the previous main window.
-        crate::timing::sleep(MAIN_HANDBACK_SETTLE);
-        set_main_window(self.pid, self.previous);
-    }
-}
-
-/// How long posted keys get to be handled before main is handed back.
-const MAIN_HANDBACK_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// `pid`'s `AXMainWindow`.
 fn main_window_of_pid(pid: pid_t) -> Option<u32> {
@@ -297,11 +279,8 @@ fn set_main_window(pid: pid_t, wid: u32) -> bool {
 }
 
 /// Make `target` the app's main window for a key post (see [`MainStep`]),
-/// confirmed by re-reading it; the returned guard hands main back.
-fn enter_main_window(
-    pid: pid_t,
-    target: u32,
-) -> Result<Option<MainWindowScope>, KeyWindowUnconfirmed> {
+/// confirmed by re-reading it.
+fn enter_main_window(pid: pid_t, target: u32) -> Result<(), KeyWindowUnconfirmed> {
     let main = main_window_of_pid(pid);
     let step = main_window_step(
         target,
@@ -316,7 +295,6 @@ fn enter_main_window(
     };
     match (step, main) {
         (MainStep::Make, Some(previous)) => {
-            let scope = MainWindowScope { pid, previous };
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
             let made = set_main_window(pid, target) && {
                 while main_window_of_pid(pid) != Some(target)
@@ -327,7 +305,7 @@ fn enter_main_window(
                 main_window_of_pid(pid) == Some(target)
             };
             if made {
-                Ok(Some(scope))
+                Ok(())
             } else {
                 Err(refused(format!(
                     "window {target} could not be made the app's main window (window \
@@ -342,7 +320,7 @@ fn enter_main_window(
              working in, so no keys were sent. Ask the user first, or act on its elements \
              by element_token"
         ))),
-        _ => Ok(None),
+        _ => Ok(()),
     }
 }
 
@@ -523,7 +501,7 @@ pub fn enter_exact_window_key(
     let before = key_focus_of_pid(pid);
     let previous = before.window;
     let order_before = app_window_order(pid);
-    let main = enter_main_window(pid, target_wid)?;
+    enter_main_window(pid, target_wid)?;
     let primed = prime_exact_window_key(
         target_wid,
         || key_focus_of_pid(pid),
@@ -548,7 +526,6 @@ pub fn enter_exact_window_key(
         previous,
         order_before,
         primed,
-        _main: main,
     })
 }
 
