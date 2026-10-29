@@ -225,9 +225,17 @@ struct MainWindowScope {
 
 impl Drop for MainWindowScope {
     fn drop(&mut self) {
+        // Posted keys wait in the app's event queue, while the main-window
+        // write is an accessibility request the app may answer first: hand
+        // main back only once the keys had time to be handled, or a shortcut
+        // still queued would act on the previous main window.
+        crate::timing::sleep(MAIN_HANDBACK_SETTLE);
         set_main_window(self.pid, self.previous);
     }
 }
+
+/// How long posted keys get to be handled before main is handed back.
+const MAIN_HANDBACK_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// `pid`'s `AXMainWindow`.
 fn main_window_of_pid(pid: pid_t) -> Option<u32> {
