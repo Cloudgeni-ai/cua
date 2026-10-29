@@ -42,8 +42,11 @@ impl Tool for Probe {
         } else if let Some(report) = args["window_report"].as_str() {
             ToolResult::text(format!("{} done\n\n{report}", self.def.name))
         } else if let Some(effect) = args["effect"].as_str() {
-            ToolResult::text(format!("{} done", self.def.name))
-                .with_structured(json!({"effect": effect}))
+            // A confirmed effect counts only with the read-back behind it.
+            ToolResult::text(format!("{} done", self.def.name)).with_structured(json!({
+                "effect": effect,
+                "evidence": [{"kind": "value_readback"}],
+            }))
         } else {
             ToolResult::text(format!("{} done", self.def.name))
         }
@@ -284,7 +287,8 @@ async fn each_step_reports_the_effect_its_tool_could_confirm() {
     let steps = result.structured_content.unwrap()["steps"].clone();
     assert_eq!(steps[0]["effect"], "confirmed");
     assert_eq!(steps[1]["effect"], "unverifiable");
-    assert_eq!(steps[2].get("effect"), None);
+    // A tool that claims no effect gets the one its result proves: none.
+    assert_eq!(steps[2]["effect"], "unverifiable");
 }
 
 #[tokio::test]
