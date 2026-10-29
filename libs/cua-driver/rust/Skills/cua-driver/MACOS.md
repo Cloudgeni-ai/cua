@@ -637,6 +637,17 @@ sent (`select_menu_would_raise_window`): choose the option with
 closed control and never opens the menu. Native popups and context menus
 still open and flash the window briefly.
 
+A pixel `click` is checked the same way against the element under the
+point in the target window, even where another window of the browser is
+over it there. Such a window is read from its accessibility tree, which
+has no drawing order: an element the page draws over a `<select>` that
+comes before it in the page is taken for the `<select>`, and the click is
+refused; click that element by `element_token` instead. Where the tree is
+too large to read down to the point inside a page, the click is refused
+as well (`point_unverified_in_covered_page`), since a `<select>` there
+cannot be ruled out. Native windows and the browser's toolbar are not
+affected.
+
 ### Apps that activate themselves
 
 Some apps activate themselves in answer to input, even in the background:

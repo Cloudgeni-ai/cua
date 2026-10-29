@@ -1526,6 +1526,17 @@ pub(super) fn is_chromium_web_select(pid: i32, window_id: u32, element: AXUIElem
         )
 }
 
+/// Whether `element` is web content of a Chromium renderer, where a
+/// `<select>` may be.
+pub(super) fn is_chromium_web_content(pid: i32, window_id: u32, element: AXUIElementRef) -> bool {
+    is_chromium_popup_owner(pid)
+        && super::type_text::target_in_web_area(
+            pid,
+            Some((element as usize, None)),
+            Some(window_id),
+        )
+}
+
 /// Refusal for a background press that would open a Chromium `<select>` menu
 /// (CUA-1795). Opening it orders the browser window above the user's window
 /// for at least a frame, which undoing afterwards cannot hide; `set_value`
@@ -1542,13 +1553,23 @@ pub(super) fn chromium_select_open_refusal(
         Some(index) => format!("[{index}] AXPopUpButton \"{title}\""),
         None => format!("the AXPopUpButton \"{title}\" at that point"),
     };
+    // At a point of a window behind another one, the element is read from
+    // the window's tree, which has no drawing order: something the page draws
+    // over the dropdown is not seen there.
+    let over_it = if element_index.is_none() {
+        " If the click was meant for something drawn over the dropdown, click \
+         that element by its element_token instead."
+    } else {
+        ""
+    };
     cua_driver_core::protocol::ToolResult::error(format!(
         "Not opened: {target} is a web dropdown (<select>). In the background, opening its \
          menu brings the browser window above the user's window, so nothing was sent. Its \
          current value is \"{current}\". Choose an option in one call with \
          set_value(element_token, \"<option text>\"): it types the option's text into the \
          closed control and the menu never opens. Open the menu with \
-         delivery_mode:\"foreground\" only if the user agreed to the browser coming forward."
+         delivery_mode:\"foreground\" only if the user agreed to the browser coming \
+         forward.{over_it}"
     ))
     .with_structured(serde_json::json!({
         "code": "select_menu_would_raise_window",
@@ -1559,6 +1580,33 @@ pub(super) fn chromium_select_open_refusal(
         "escalation": {
             "recommended": "set_value",
             "reason": "a background <select> is chosen with set_value; opening its menu would raise the browser window",
+        },
+    }))
+}
+
+/// Refusal for a background pixel click into a browser page of a window
+/// behind another window of the app, where what is under the point could
+/// not be read: it may be a `<select>`, whose menu would raise the window.
+pub(super) fn chromium_point_unverified_refusal(
+    pid: i32,
+    window_id: u32,
+) -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(
+        "Not clicked: that point is in a web page of a window behind another window of the \
+         browser, and the element under it could not be read, so nothing was sent. It may \
+         be a web dropdown (<select>), whose menu would bring the browser window above the \
+         user's window. Click the element by its element_token instead, or use \
+         delivery_mode:\"foreground\" only if the user agreed to the browser coming forward."
+            .to_string(),
+    )
+    .with_structured(serde_json::json!({
+        "code": "point_unverified_in_covered_page",
+        "effect": "refused",
+        "pid": pid,
+        "window_id": window_id,
+        "escalation": {
+            "recommended": "element_token",
+            "reason": "the element under a point of a covered browser window could not be read",
         },
     }))
 }

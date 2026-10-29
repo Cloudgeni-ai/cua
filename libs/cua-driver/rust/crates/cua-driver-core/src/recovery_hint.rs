@@ -535,6 +535,15 @@ static RULES: &[Rule] = &[
         },
     },
     Rule {
+        codes: &["point_unverified_in_covered_page"],
+        build: |_| {
+            RecoveryHint::new(format!(
+                "Click the element by element_token; what is under a point of a covered browser \
+                 page cannot be read. Click by pixel with delivery_mode:\"foreground\" {FOREGROUND_CONDITION}."
+            ))
+        },
+    },
+    Rule {
         codes: &["paste_target_is_browser_chrome"],
         build: |_| {
             RecoveryHint::new(

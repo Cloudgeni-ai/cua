@@ -1268,20 +1268,38 @@ impl Tool for ClickTool {
             // menu and raise the browser window (CUA-1795). The element is
             // the one under the point in this window, even where another
             // window of the app is over it there: the click is routed to this
-            // window all the same.
+            // window all the same. Where the walk of that window could not
+            // read down to the point inside a page, what is there is not
+            // known, so the click is refused rather than risk the menu.
             if let Some(select_wid) = window_id.filter(|_| !delivery_mode.is_foreground()) {
                 let refusal = tokio::task::spawn_blocking(move || unsafe {
-                    let element = crate::ax::window_hit::element_at_point_in_window(
+                    let hit = crate::ax::window_hit::element_at_point_in_window(
                         pid, select_wid, screen_x, screen_y,
                     )?;
-                    let refusal = (crate::ax::exact_target::element_window_id(element)
-                        == Some(select_wid)
-                        && super::set_value::is_chromium_web_select(pid, select_wid, element))
-                    .then(|| {
-                        super::set_value::chromium_select_open_refusal(
-                            pid, select_wid, None, element,
-                        )
-                    });
+                    let check = covered_point_check(
+                        &hit,
+                        |&element| {
+                            crate::ax::exact_target::element_window_id(element) == Some(select_wid)
+                                && super::set_value::is_chromium_web_select(
+                                    pid, select_wid, element,
+                                )
+                        },
+                        |&element| {
+                            super::set_value::is_chromium_web_content(pid, select_wid, element)
+                        },
+                    );
+                    let element = hit.into_element();
+                    let refusal = match check {
+                        CoveredPointCheck::Post => None,
+                        CoveredPointCheck::RefuseSelect => {
+                            Some(super::set_value::chromium_select_open_refusal(
+                                pid, select_wid, None, element,
+                            ))
+                        }
+                        CoveredPointCheck::RefuseUnverified => Some(
+                            super::set_value::chromium_point_unverified_refusal(pid, select_wid),
+                        ),
+                    };
                     CFRelease(element as _);
                     refusal
                 })
@@ -1655,6 +1673,40 @@ impl Tool for ClickTool {
 /// process and take no part in this.
 fn press_needs_key_window(action: &str, front_pid: Option<i32>, pid: i32, native: bool) -> bool {
     action == "AXPress" && native && front_pid != Some(pid)
+}
+
+/// What a background pixel click does after its window's element under the
+/// point was looked up.
+#[derive(Debug, PartialEq, Eq)]
+enum CoveredPointCheck {
+    Post,
+    /// It is a web `<select>`: the click would open its menu.
+    RefuseSelect,
+    /// The lookup stopped inside a browser page before the point: a
+    /// `<select>` there cannot be ruled out.
+    RefuseUnverified,
+}
+
+/// A web `<select>` (or the inside of one, where the lookup stopped among
+/// its options) is refused. Where the lookup stopped elsewhere, the click is
+/// refused only inside a browser page, where a `<select>` may be; native
+/// windows and the browser's toolbar keep their pixel clicks.
+fn covered_point_check<E>(
+    hit: &crate::ax::window_hit::WindowHit<E>,
+    is_web_select: impl Fn(&E) -> bool,
+    in_browser_page: impl Fn(&E) -> bool,
+) -> CoveredPointCheck {
+    use crate::ax::window_hit::WindowHit;
+    match hit {
+        WindowHit::Element(element) | WindowHit::Unknown(element) if is_web_select(element) => {
+            CoveredPointCheck::RefuseSelect
+        }
+        WindowHit::Element(_) => CoveredPointCheck::Post,
+        WindowHit::Unknown(element) if in_browser_page(element) => {
+            CoveredPointCheck::RefuseUnverified
+        }
+        WindowHit::Unknown(_) => CoveredPointCheck::Post,
+    }
 }
 
 /// Make the target window AppKit-key without raising it, activating the app
@@ -2167,7 +2219,39 @@ mod web_focus_settle_tests {
 
 #[cfg(test)]
 mod selection_fallback_tests {
+    use super::{covered_point_check, CoveredPointCheck};
     use super::{selection_pixel_target, selection_readback_confirms};
+    use crate::ax::window_hit::WindowHit;
+
+    #[test]
+    fn a_covered_page_point_that_could_not_be_read_is_refused() {
+        let check = |hit: WindowHit<&str>| {
+            covered_point_check(&hit, |&e| e == "select", |&e| e.starts_with("page"))
+        };
+        assert_eq!(
+            check(WindowHit::Element("select")),
+            CoveredPointCheck::RefuseSelect
+        );
+        assert_eq!(
+            check(WindowHit::Element("page button")),
+            CoveredPointCheck::Post
+        );
+        // The walk stopped inside the page: a select there is not ruled out.
+        assert_eq!(
+            check(WindowHit::Unknown("page list")),
+            CoveredPointCheck::RefuseUnverified
+        );
+        // Outside a page (a native window, the browser's toolbar) it posts.
+        assert_eq!(
+            check(WindowHit::Unknown("native list")),
+            CoveredPointCheck::Post
+        );
+        // Stopped among a select's own options: the select is under it.
+        assert_eq!(
+            check(WindowHit::Unknown("select")),
+            CoveredPointCheck::RefuseSelect
+        );
+    }
 
     #[test]
     fn selection_pixel_uses_container_center_in_both_coordinate_spaces() {
