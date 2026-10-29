@@ -710,16 +710,63 @@ impl Tool for ClickTool {
                 action.clone()
             };
 
+            // A press on an option of a pop-up button chooses that option on
+            // the button, as set_value does, instead of pressing the item
+            // (see set_value::choose_popup_option_item). One it cannot choose
+            // by name is not pressed in the background either.
+            if super::set_value::press_chooses_option(&effective_action, &button_str, count) {
+                let option_guard = element_guard.clone();
+                let is_option = tokio::task::spawn_blocking(move || {
+                    let element = option_guard.as_ptr() as AXUIElementRef;
+                    super::set_value::popup_of_option(element)
+                        .map(|popup| unsafe { CFRelease(popup as _) })
+                        .is_some()
+                })
+                .await
+                .unwrap_or(false);
+                if is_option {
+                    let choose_guard = element_guard.clone();
+                    let chosen = focus_guard::with_focus_suppressed_now(
+                        Some(pid),
+                        "click.popup_option",
+                        || async move {
+                            tokio::task::spawn_blocking(move || {
+                                super::set_value::choose_popup_option_item(
+                                    choose_guard.as_ptr() as AXUIElementRef,
+                                    idx,
+                                    pid,
+                                    wid,
+                                )
+                            })
+                            .await
+                        },
+                    )
+                    .await;
+                    match chosen {
+                        Ok(Some(result)) => return result,
+                        _ if !delivery_mode.is_foreground() => {
+                            return super::set_value::unnamed_option_press_refusal(pid, wid);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             // A background press or show-menu on a Chromium <select> would
             // open its menu and raise the browser window (CUA-1795): steer to
-            // set_value before anything is sent.
+            // set_value before anything is sent. A window already in front
+            // has nothing to raise.
             if !delivery_mode.is_foreground()
                 && matches!(effective_action.as_str(), "press" | "show_menu")
             {
                 let select_guard = element_guard.clone();
                 let refusal = tokio::task::spawn_blocking(move || {
                     let element = select_guard.as_ptr() as AXUIElementRef;
-                    super::set_value::is_chromium_web_select(pid, wid, element).then(|| {
+                    super::set_value::select_menu_open_refused(
+                        super::set_value::is_chromium_web_select(pid, wid, element),
+                        || super::set_value::select_window_in_front(wid),
+                    )
+                    .then(|| {
                         super::set_value::chromium_select_open_refusal(pid, wid, Some(idx), element)
                     })
                 })
@@ -1278,19 +1325,7 @@ impl Tool for ClickTool {
                     )?;
                     let check = covered_point_check(
                         &hit,
-                        |&element| {
-                            let select = super::set_value::chromium_web_select_at_or_above(
-                                pid, select_wid, element,
-                            )?;
-                            if crate::ax::exact_target::element_window_id(select)
-                                == Some(select_wid)
-                            {
-                                Some(select)
-                            } else {
-                                CFRelease(select as _);
-                                None
-                            }
-                        },
+                        |&element| select_open_refusal_at(pid, select_wid, element),
                         |&element| {
                             super::set_value::is_chromium_web_content(pid, select_wid, element)
                         },
@@ -1298,16 +1333,12 @@ impl Tool for ClickTool {
                     let element = hit.into_element();
                     let refusal = match check {
                         CoveredPointCheck::Post => None,
-                        CoveredPointCheck::RefuseSelect(select) => {
-                            let refusal = super::set_value::chromium_select_open_refusal(
-                                pid, select_wid, None, select,
-                            );
-                            CFRelease(select as _);
-                            Some(refusal)
+                        CoveredPointCheck::RefuseSelect(refusal) => Some(refusal),
+                        CoveredPointCheck::RefuseUnverified => {
+                            (!super::set_value::select_window_in_front(select_wid)).then(|| {
+                                super::set_value::chromium_point_unverified_refusal(pid, select_wid)
+                            })
                         }
-                        CoveredPointCheck::RefuseUnverified => Some(
-                            super::set_value::chromium_point_unverified_refusal(pid, select_wid),
-                        ),
                     };
                     CFRelease(element as _);
                     refusal
@@ -1341,7 +1372,7 @@ impl Tool for ClickTool {
                 let focus_only = action == "focus";
                 let ax_result = tokio::task::spawn_blocking(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
-                        return Ok::<bool, anyhow::Error>(false);
+                        return Ok::<Result<bool, ToolResult>, anyhow::Error>(Ok(false));
                     };
                     // The pid-scoped hit-test can resolve an element from a
                     // same-process sibling overlapping the requested point.
@@ -1350,7 +1381,16 @@ impl Tool for ClickTool {
                     // (already gated for this exact window).
                     if crate::ax::exact_target::element_window_id(element) != Some(hit_test_wid) {
                         CFRelease(element as _);
-                        return Ok(false);
+                        return Ok(Ok(false));
+                    }
+                    // The element pressed is checked again: a renderer can
+                    // answer the first hit-test of a point with a container
+                    // and this one with the <select> under it.
+                    if !focus_only {
+                        if let Some(refusal) = select_open_refusal_at(pid, hit_test_wid, element) {
+                            CFRelease(element as _);
+                            return Ok(Err(refusal));
+                        }
                     }
                     let delivered = if focus_only {
                         crate::input::ax_actions::focus_element(element as usize).is_ok()
@@ -1378,11 +1418,12 @@ impl Tool for ClickTool {
                         )
                     };
                     CFRelease(element as _);
-                    Ok(delivered)
+                    Ok(Ok(delivered))
                 })
                 .await;
                 match ax_result {
-                    Ok(Ok(true)) => {
+                    Ok(Ok(Err(refusal))) => return refusal,
+                    Ok(Ok(Ok(true))) => {
                         crate::cursor::overlay::send_command(
                             cursor_key.clone(),
                             cursor_overlay::OverlayCommand::ClickPulse {
@@ -1400,7 +1441,7 @@ impl Tool for ClickTool {
                             "effect": "unverifiable"
                         }));
                     }
-                    Ok(Ok(false)) if focus_only => {
+                    Ok(Ok(Ok(false))) if focus_only => {
                         return ToolResult::error(
                             "Background PX focus is unavailable at the requested point.".to_owned(),
                         )
@@ -1850,6 +1891,36 @@ unsafe fn ancestor_roles(element: AXUIElementRef) -> Vec<String> {
 enum AxClickDelivery {
     Foreground,
     Background { in_batch: bool },
+}
+
+/// The refusal for a background pixel press at `element` that would open a
+/// Chromium `<select>`'s menu (CUA-1795): the element is the select, or the
+/// option a closed select lists, which opens the menu as much. `None` for any
+/// other element, one outside `window_id`, or when `window_id` is already the
+/// front window, which the menu cannot raise.
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+unsafe fn select_open_refusal_at(
+    pid: i32,
+    window_id: u32,
+    element: AXUIElementRef,
+) -> Option<ToolResult> {
+    if crate::ax::exact_target::element_window_id(element) != Some(window_id) {
+        return None;
+    }
+    let option_of = super::set_value::popup_of_option(element);
+    let select = option_of.unwrap_or(element);
+    let refusal = super::set_value::select_menu_open_refused(
+        super::set_value::is_chromium_web_select(pid, window_id, select),
+        || super::set_value::select_window_in_front(window_id),
+    )
+    .then(|| super::set_value::chromium_select_open_refusal(pid, window_id, None, select));
+    if let Some(popup) = option_of {
+        CFRelease(popup as _);
+    }
+    refusal
 }
 
 fn perform_ax_click(

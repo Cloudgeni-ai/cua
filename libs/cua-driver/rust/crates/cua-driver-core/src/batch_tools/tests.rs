@@ -41,6 +41,12 @@ impl Tool for Probe {
             ToolResult::error(format!("{} refused: probe asked to fail", self.def.name))
         } else if let Some(report) = args["window_report"].as_str() {
             ToolResult::text(format!("{} done\n\n{report}", self.def.name))
+        } else if let Some(effect) = args["effect"].as_str() {
+            // A confirmed effect counts only with the read-back behind it.
+            ToolResult::text(format!("{} done", self.def.name)).with_structured(json!({
+                "effect": effect,
+                "evidence": [{"kind": "value_readback"}],
+            }))
         } else {
             ToolResult::text(format!("{} done", self.def.name))
         }
@@ -78,6 +84,7 @@ impl Harness {
                             "fail": {"type": "boolean"},
                             "fail_message": {"type": "string"},
                             "window_report": {"type": "string"},
+                            "effect": {"type": "string"},
                             "element_token": {"type": "string"},
                             "value": {"type": "string"},
                             "key": {"type": "string"},
@@ -264,6 +271,24 @@ async fn each_step_keeps_the_windows_its_action_reported_opening() {
         steps[1]["window_changes"],
         json!(["🪟 Action opened new window(s): App (\"Save\")."])
     );
+}
+
+#[tokio::test]
+async fn each_step_reports_the_effect_its_tool_could_confirm() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"pid": 42, "window_id": 7, "steps": [
+            {"tool": "type_text", "args": {"text": "a", "effect": "confirmed"}},
+            {"tool": "press_key", "args": {"key": "return", "effect": "unverifiable"}},
+            {"tool": "click", "args": {"element_token": "s1:1"}},
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let steps = result.structured_content.unwrap()["steps"].clone();
+    assert_eq!(steps[0]["effect"], "confirmed");
+    assert_eq!(steps[1]["effect"], "unverifiable");
+    // A tool that claims no effect gets the one its result proves: none.
+    assert_eq!(steps[2]["effect"], "unverifiable");
 }
 
 #[tokio::test]

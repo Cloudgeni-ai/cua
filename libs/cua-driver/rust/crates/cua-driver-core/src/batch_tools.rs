@@ -1264,6 +1264,18 @@ async fn run_step(
             }
             report["ok"] = json!(ok);
             report["message"] = json!(message);
+            // What the step's tool could confirm about its effect ("confirmed",
+            // "unverifiable", ...), so a caller can tell input that was only
+            // sent from input the app was seen to take.
+            if let Some(effect) = result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("effect"))
+                .and_then(Value::as_str)
+                .filter(|_| ok)
+            {
+                report["effect"] = json!(effect);
+            }
             // The step's message keeps only the first line of the tool's text.
             // The windows the action opened are reported further down; keep that
             // report, so a caller can tell which window a step left in front.
