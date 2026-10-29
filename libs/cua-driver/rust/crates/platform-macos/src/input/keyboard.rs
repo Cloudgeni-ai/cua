@@ -522,7 +522,12 @@ fn type_text_physical_pid(pid: i32, text: &str, inter_char_delay_ms: u64) -> any
         .collect::<anyhow::Result<Vec<_>>>()?;
     for events in event_groups {
         for event in events {
-            post_physical_pid(pid, event.key_code, event.key_down, physical_text_flags(&event))?;
+            post_physical_pid(
+                pid,
+                event.key_code,
+                event.key_down,
+                physical_text_flags(&event),
+            )?;
             key_gap_sleep();
         }
         let extra = std::time::Duration::from_millis(inter_char_delay_ms).saturating_sub(key_gap());
@@ -574,7 +579,12 @@ fn physical_chord(key: &str, modifiers: &[&str]) -> anyhow::Result<Vec<(u16, boo
 /// Post one physical transition to `pid`. A modifier key's transition is a
 /// flags-changed event, which the forwarding app turns into the modifier's
 /// own key press on the other device.
-fn post_physical_pid(pid: i32, key_code: u16, key_down: bool, flags: CGEventFlags) -> anyhow::Result<()> {
+fn post_physical_pid(
+    pid: i32,
+    key_code: u16,
+    key_down: bool,
+    flags: CGEventFlags,
+) -> anyhow::Result<()> {
     let event = create_bare_keyboard_event(key_code, key_down)?;
     event.set_flags(flags);
     post_keyboard_event(pid, &event);
@@ -1209,12 +1219,22 @@ mod tests {
         let none = CGEventFlags::CGEventFlagNull;
         assert_eq!(
             physical_chord("v", &["cmd"]).unwrap(),
-            vec![(55, true, cmd), (9, true, cmd), (9, false, cmd), (55, false, none)]
+            vec![
+                (55, true, cmd),
+                (9, true, cmd),
+                (9, false, cmd),
+                (55, false, none)
+            ]
         );
         let shift = CGEventFlags::CGEventFlagShift;
         assert_eq!(
             physical_chord("+", &[]).unwrap(),
-            vec![(56, true, shift), (24, true, shift), (24, false, shift), (56, false, none)]
+            vec![
+                (56, true, shift),
+                (24, true, shift),
+                (24, false, shift),
+                (56, false, none)
+            ]
         );
         assert_eq!(
             physical_chord("return", &[]).unwrap(),
@@ -1234,7 +1254,12 @@ mod tests {
         let shift = CGEventFlags::CGEventFlagShift;
         assert_eq!(
             flags,
-            vec![(56, shift), (12, shift), (12, shift), (56, CGEventFlags::CGEventFlagNull)]
+            vec![
+                (56, shift),
+                (12, shift),
+                (12, shift),
+                (56, CGEventFlags::CGEventFlagNull)
+            ]
         );
         assert!(physical_text_events('q')
             .unwrap()
