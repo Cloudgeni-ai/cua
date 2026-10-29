@@ -12,6 +12,7 @@ use core_graphics::{
 use foreign_types::ForeignType;
 
 const SCREEN_SHARING_BUNDLE_ID: &str = "com.apple.ScreenSharing";
+const SIMULATOR_BUNDLE_ID: &str = "com.apple.iphonesimulator";
 const SHIFT_KEY_CODE: u16 = 56;
 
 /// Default key down→up gap and inter-key pacing.
@@ -45,8 +46,31 @@ pub fn is_screen_sharing_pid(pid: i32) -> bool {
         .is_some_and(is_screen_sharing_bundle_id)
 }
 
+/// Apps that pass key presses on to another device as physical keys: Screen
+/// Sharing (to the remote Mac) and the iOS Simulator (to the simulated
+/// device's hardware keyboard). They forward each event's virtual key code
+/// and rebuild modifiers from modifier key transitions; the Unicode text a
+/// synthetic event carries and the modifier flags on its base key are
+/// dropped. So text sent the usual way (a Unicode payload on key code 0, the
+/// A key) arrives as "aaaa", and cmd+V as a plain "v" or nothing.
+fn forwards_key_codes_bundle_id(bundle_id: &str) -> bool {
+    is_screen_sharing_bundle_id(bundle_id) || bundle_id == SIMULATOR_BUNDLE_ID
+}
+
+/// Whether `pid` forwards physical key codes (see
+/// [`forwards_key_codes_bundle_id`]): keys posted to it must be the physical
+/// keys and modifier transitions that produce the text.
+pub fn forwards_key_codes(pid: i32) -> bool {
+    crate::apps::bundle_id_for_pid(pid)
+        .as_deref()
+        .is_some_and(forwards_key_codes_bundle_id)
+}
+
 /// Press and release a single key, delivered to `pid` without stealing focus.
 pub fn press_key(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
+    if forwards_key_codes(pid) {
+        return press_key_physical_pid(pid, key, modifiers);
+    }
     // Handle "+" / "plus" → Shift+= (US keyboard layout).
     if key == "+" || key.to_lowercase() == "plus" {
         let flags = modifier_flags(&["shift"]);
@@ -105,6 +129,9 @@ fn char_key_events(source: &CGEventSource, ch: char) -> anyhow::Result<(CGEvent,
 
 /// Type a string character-by-character to `pid`.
 pub fn type_text(pid: i32, text: &str) -> anyhow::Result<()> {
+    if forwards_key_codes(pid) {
+        return type_text_physical_pid(pid, text, 0);
+    }
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
 
@@ -121,6 +148,9 @@ pub fn type_text(pid: i32, text: &str) -> anyhow::Result<()> {
 /// Type a string character-by-character with an extra `inter_char_delay_ms`
 /// pause after each character (on top of the internal down/up key gap).
 pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
+    if forwards_key_codes(pid) {
+        return type_text_physical_pid(pid, text, inter_char_delay_ms);
+    }
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
 
@@ -480,6 +510,77 @@ pub fn press_key_bare_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()
     Ok(())
 }
 
+/// Type text to `pid` as physical US-keyboard transitions (an app that
+/// forwards key codes, see [`forwards_key_codes`]): each character's own key,
+/// with real Shift transitions around a shifted one. Every character is
+/// checked before the first is sent, so text with a character that has no
+/// key fails without typing part of it.
+fn type_text_physical_pid(pid: i32, text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
+    let event_groups = text
+        .chars()
+        .map(physical_text_events)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    for events in event_groups {
+        for event in events {
+            post_physical_pid(pid, event.key_code, event.key_down, physical_text_flags(&event))?;
+            key_gap_sleep();
+        }
+        let extra = std::time::Duration::from_millis(inter_char_delay_ms).saturating_sub(key_gap());
+        if !extra.is_zero() {
+            crate::timing::sleep(extra);
+        }
+    }
+    Ok(())
+}
+
+/// The flags a physical text transition carries to a process: Shift while it
+/// is held. A process-routed event does not change the session's modifier
+/// state, so the flags cannot be left to the default source to derive.
+fn physical_text_flags(event: &PhysicalTextEvent) -> CGEventFlags {
+    if event.shift {
+        CGEventFlags::CGEventFlagShift
+    } else {
+        CGEventFlags::CGEventFlagNull
+    }
+}
+
+/// Press a key chord to `pid` as physical transitions (an app that forwards
+/// key codes): modifier downs, base down and up, modifier ups in reverse.
+fn press_key_physical_pid(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
+    for (code, down, flags) in physical_chord(key, modifiers)? {
+        post_physical_pid(pid, code, down, flags)?;
+        key_gap_sleep();
+    }
+    Ok(())
+}
+
+/// The transitions of `key` with `modifiers` held, as [`bare_chord_transitions`]
+/// gives them. `+` is Shift and `=` on the US layout, as in [`press_key`].
+fn physical_chord(key: &str, modifiers: &[&str]) -> anyhow::Result<Vec<(u16, bool, CGEventFlags)>> {
+    let plus = key == "+" || key.eq_ignore_ascii_case("plus");
+    let key_code = key_name_to_code(if plus { "=" } else { key })?;
+    let mut modifier_keys = Vec::new();
+    for modifier in modifiers.iter().copied().chain(plus.then_some("shift")) {
+        let Some((modifier_code, flag)) = modifier_key_code_and_flag(modifier) else {
+            continue;
+        };
+        if !modifier_keys.iter().any(|&(code, _)| code == modifier_code) {
+            modifier_keys.push((modifier_code, flag));
+        }
+    }
+    Ok(bare_chord_transitions(key_code, &modifier_keys))
+}
+
+/// Post one physical transition to `pid`. A modifier key's transition is a
+/// flags-changed event, which the forwarding app turns into the modifier's
+/// own key press on the other device.
+fn post_physical_pid(pid: i32, key_code: u16, key_down: bool, flags: CGEventFlags) -> anyhow::Result<()> {
+    let event = create_bare_keyboard_event(key_code, key_down)?;
+    event.set_flags(flags);
+    post_keyboard_event(pid, &event);
+    Ok(())
+}
+
 /// The chord's transitions with the flags each one carries. A modifier's own
 /// down is the first event that holds its flag and its up is the first that has
 /// dropped it again, so the base key always sees the full chord.
@@ -540,7 +641,8 @@ enum PhysicalEventType {
 fn physical_text_events(ch: char) -> anyhow::Result<Vec<PhysicalTextEvent>> {
     let (key_code, shift) = physical_key_for_char(ch).ok_or_else(|| {
         anyhow::anyhow!(
-            "Screen Sharing physical text delivery does not support character U+{:04X}",
+            "this app passes keys on as physical keys, which type only the characters of a US \
+             keyboard, and U+{:04X} is not one of them, so nothing was typed",
             ch as u32
         )
     })?;
@@ -1087,5 +1189,56 @@ mod tests {
         assert!(is_screen_sharing_bundle_id("com.apple.ScreenSharing"));
         assert!(!is_screen_sharing_bundle_id("com.apple.screensharing"));
         assert!(!is_screen_sharing_bundle_id("com.microsoft.rdc.macos"));
+    }
+
+    /// The iOS Simulator passes keys on to the device by key code, as Screen
+    /// Sharing does: background text typed only "a" and cmd+V did nothing.
+    #[test]
+    fn the_simulator_and_screen_sharing_forward_key_codes() {
+        assert!(forwards_key_codes_bundle_id("com.apple.iphonesimulator"));
+        assert!(forwards_key_codes_bundle_id("com.apple.ScreenSharing"));
+        assert!(!forwards_key_codes_bundle_id("com.apple.TextEdit"));
+        assert!(!forwards_key_codes_bundle_id("com.google.Chrome"));
+    }
+
+    /// A chord to an app that forwards key codes is real modifier presses
+    /// around the key, each carrying the modifiers held at that point.
+    #[test]
+    fn a_forwarded_chord_presses_its_modifiers_as_keys() {
+        let cmd = CGEventFlags::CGEventFlagCommand;
+        let none = CGEventFlags::CGEventFlagNull;
+        assert_eq!(
+            physical_chord("v", &["cmd"]).unwrap(),
+            vec![(55, true, cmd), (9, true, cmd), (9, false, cmd), (55, false, none)]
+        );
+        let shift = CGEventFlags::CGEventFlagShift;
+        assert_eq!(
+            physical_chord("+", &[]).unwrap(),
+            vec![(56, true, shift), (24, true, shift), (24, false, shift), (56, false, none)]
+        );
+        assert_eq!(
+            physical_chord("return", &[]).unwrap(),
+            vec![(36, true, none), (36, false, none)]
+        );
+    }
+
+    /// Forwarded text is each character's own key; a shifted character
+    /// carries Shift on its key and is wrapped in Shift's own transitions.
+    #[test]
+    fn forwarded_text_carries_shift_only_while_it_is_held() {
+        let flags: Vec<_> = physical_text_events('Q')
+            .unwrap()
+            .iter()
+            .map(|event| (event.key_code, physical_text_flags(event)))
+            .collect();
+        let shift = CGEventFlags::CGEventFlagShift;
+        assert_eq!(
+            flags,
+            vec![(56, shift), (12, shift), (12, shift), (56, CGEventFlags::CGEventFlagNull)]
+        );
+        assert!(physical_text_events('q')
+            .unwrap()
+            .iter()
+            .all(|event| event.key_code == 12 && physical_text_flags(event).is_empty()));
     }
 }
