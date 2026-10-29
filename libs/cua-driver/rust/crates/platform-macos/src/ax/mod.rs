@@ -25,6 +25,7 @@ pub mod launch;
 pub mod reveal_scroll;
 pub mod snapshot;
 pub mod tree;
+pub mod window_hit;
 pub mod window_scope;
 
 pub use snapshot::Snapshots;

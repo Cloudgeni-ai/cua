@@ -1265,10 +1265,15 @@ impl Tool for ClickTool {
             // Animate the visual cursor to the click point and wait for it to
             // arrive — mirrors Swift's `AgentCursor.shared.animateAndWait(to:)`.
             // A background pixel click on a Chromium <select> would open its
-            // menu and raise the browser window (CUA-1795).
+            // menu and raise the browser window (CUA-1795). The element is
+            // the one under the point in this window, even where another
+            // window of the app is over it there: the click is routed to this
+            // window all the same.
             if let Some(select_wid) = window_id.filter(|_| !delivery_mode.is_foreground()) {
                 let refusal = tokio::task::spawn_blocking(move || unsafe {
-                    let element = element_at_screen_position(pid, screen_x, screen_y)?;
+                    let element = crate::ax::window_hit::element_at_point_in_window(
+                        pid, select_wid, screen_x, screen_y,
+                    )?;
                     let refusal = (crate::ax::exact_target::element_window_id(element)
                         == Some(select_wid)
                         && super::set_value::is_chromium_web_select(pid, select_wid, element))
