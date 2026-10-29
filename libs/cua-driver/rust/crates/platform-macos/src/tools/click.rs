@@ -712,8 +712,9 @@ impl Tool for ClickTool {
 
             // A press on an option of a pop-up button chooses that option on
             // the button, as set_value does, instead of pressing the item
-            // (see set_value::choose_popup_option_item).
-            if effective_action == "press" && button_str == "left" && count == 1 {
+            // (see set_value::choose_popup_option_item). One it cannot choose
+            // by name is not pressed in the background either.
+            if super::set_value::press_chooses_option(&effective_action, &button_str, count) {
                 let option_guard = element_guard.clone();
                 let is_option = tokio::task::spawn_blocking(move || {
                     let element = option_guard.as_ptr() as AXUIElementRef;
@@ -741,8 +742,12 @@ impl Tool for ClickTool {
                         },
                     )
                     .await;
-                    if let Ok(Some(result)) = chosen {
-                        return result;
+                    match chosen {
+                        Ok(Some(result)) => return result,
+                        _ if !delivery_mode.is_foreground() => {
+                            return super::set_value::unnamed_option_press_refusal(pid, wid);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -757,8 +762,10 @@ impl Tool for ClickTool {
                 let select_guard = element_guard.clone();
                 let refusal = tokio::task::spawn_blocking(move || {
                     let element = select_guard.as_ptr() as AXUIElementRef;
-                    (super::set_value::is_chromium_web_select(pid, wid, element)
-                        && !super::set_value::select_window_in_front(wid))
+                    super::set_value::select_menu_open_refused(
+                        super::set_value::is_chromium_web_select(pid, wid, element),
+                        || super::set_value::select_window_in_front(wid),
+                    )
                     .then(|| {
                         super::set_value::chromium_select_open_refusal(pid, wid, Some(idx), element)
                     })
@@ -1847,8 +1854,10 @@ unsafe fn select_open_refusal_at(
     }
     let option_of = super::set_value::popup_of_option(element);
     let select = option_of.unwrap_or(element);
-    let refusal = (super::set_value::is_chromium_web_select(pid, window_id, select)
-        && !super::set_value::select_window_in_front(window_id))
+    let refusal = super::set_value::select_menu_open_refused(
+        super::set_value::is_chromium_web_select(pid, window_id, select),
+        || super::set_value::select_window_in_front(window_id),
+    )
     .then(|| super::set_value::chromium_select_open_refusal(pid, window_id, None, select));
     if let Some(popup) = option_of {
         CFRelease(popup as _);

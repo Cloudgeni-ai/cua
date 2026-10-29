@@ -1709,6 +1709,49 @@ pub(super) fn select_window_in_front(window_id: u32) -> bool {
     )
 }
 
+/// Whether a background press that would open a web `<select>`'s menu is
+/// refused: it is, unless the select's window is already the front window,
+/// which the menu cannot raise.
+/// `window_in_front` is read only for a web select.
+pub(super) fn select_menu_open_refused(
+    web_select: bool,
+    window_in_front: impl FnOnce() -> bool,
+) -> bool {
+    web_select && !window_in_front()
+}
+
+/// Whether a press is one that chooses the option it lands on, when it lands
+/// on an option of a pop-up button (see `choose_popup_option_item`): a
+/// single plain left press. A show-menu or a right or double press is not.
+pub(super) fn press_chooses_option(action: &str, button: &str, count: usize) -> bool {
+    action == "press" && button == "left" && count == 1
+}
+
+/// Refusal for a background press on an option of a pop-up button that it
+/// could not choose by name (it has no title or value). Pressing the item
+/// itself is not safe (see `choose_popup_option_item`), so nothing is sent.
+pub(super) fn unnamed_option_press_refusal(
+    pid: i32,
+    window_id: u32,
+) -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(
+        "Not pressed: this is an option of a pop-up button with no text to choose it by, and \
+         pressing it in the background can open the menu and bring its window forward, so \
+         nothing was sent. Choose an option with set_value on the pop-up button and the \
+         option's text.",
+    )
+    .with_structured(serde_json::json!({
+        "code": "popup_option_without_text",
+        "effect": "refused",
+        "pid": pid,
+        "window_id": window_id,
+        "escalation": {
+            "recommended": "set_value",
+            "reason": "an option with no text cannot be chosen by name, and pressing it can open the menu",
+        },
+    }))
+}
+
 /// Refusal for a background press that would open a Chromium `<select>` menu
 /// (CUA-1795). Opening it orders the browser window above the user's window
 /// for at least a frame, which undoing afterwards cannot hide; `set_value`
@@ -2292,10 +2335,44 @@ mod tests {
     use super::{
         apply_surface_trust, apply_verification_label, classify_write, confirms_combo_box,
         file_name_needs_rename, is_file_name_cell, is_get_info_name_field, left_empty, moved,
-        not_applied_result, outside_range, popup_option_subject, refusal_result,
-        roles_list_options, takes_text, write_not_applied, Refusal, SetValueOutcome,
+        not_applied_result, outside_range, popup_option_subject, press_chooses_option,
+        refusal_result, roles_list_options, select_menu_open_refused, takes_text,
+        unnamed_option_press_refusal, write_not_applied, Refusal, SetValueOutcome,
         GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
     };
+
+    #[test]
+    fn a_select_whose_window_is_already_in_front_opens_its_menu() {
+        // Nothing to raise: the press goes through.
+        assert!(!select_menu_open_refused(true, || true));
+        // Behind the person's window, it is refused before anything is sent.
+        assert!(select_menu_open_refused(true, || false));
+        // Anything but a web select is not refused, and the window list is
+        // not read for it.
+        assert!(!select_menu_open_refused(false, || {
+            panic!("the window list is read only for a web select")
+        }));
+    }
+
+    #[test]
+    fn a_plain_press_on_an_option_chooses_it() {
+        assert!(press_chooses_option("press", "left", 1));
+        // A show-menu (a right press maps to one), a double press or another
+        // button presses the item as before.
+        assert!(!press_chooses_option("show_menu", "left", 1));
+        assert!(!press_chooses_option("press", "right", 1));
+        assert!(!press_chooses_option("press", "left", 2));
+    }
+
+    #[test]
+    fn an_option_with_no_text_is_refused_not_pressed() {
+        let refusal = unnamed_option_press_refusal(7, 9);
+        assert_eq!(refusal.is_error, Some(true));
+        let structured = refusal.structured_content.expect("structured refusal");
+        assert_eq!(structured["code"], "popup_option_without_text");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["escalation"]["recommended"], "set_value");
+    }
 
     #[test]
     fn only_a_pop_up_that_lists_its_options_is_a_native_select() {
