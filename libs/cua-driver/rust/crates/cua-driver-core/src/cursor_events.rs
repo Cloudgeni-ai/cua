@@ -22,6 +22,11 @@ pub enum CursorEventPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CursorEvent {
+    SetSessionIdentity {
+        session: String,
+        label: String,
+        avatar_png: Option<String>,
+    },
     SetSessionLabel {
         session: String,
         label: String,
@@ -188,7 +193,7 @@ pub fn end_tool(active: Option<(String, CursorAction)>) {
     });
 }
 
-fn emit(event: CursorEvent) {
+pub(crate) fn emit(event: CursorEvent) {
     let sink = sink_slot()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -4837,6 +4837,24 @@
             ],
             "type": "string"
           },
+          "cursor_identity": {
+            "additionalProperties": true,
+            "description": "Optional renderer-only identity. Ownership continues to use `session`.",
+            "properties": {
+              "avatar_png": {
+                "description": "Optional base64 PNG, at most 48 KiB encoded and 128 by 128 pixels.\nInvalid images fall back to the name. No URL or file is fetched.",
+                "type": "string"
+              },
+              "label": {
+                "description": "Friendly name shown on the cursor badge (at most 200 Unicode characters).",
+                "type": "string"
+              }
+            },
+            "required": [
+              "label"
+            ],
+            "type": "object"
+          },
           "cursor_motion": {
             "additionalProperties": false,
             "description": "Optional initial cursor motion (style, timing, effects and tuning). The host applies it\nbefore the cursor is first made visible. A later `set_agent_cursor_motion` call wins;\nthis wins over the saved default (`cursor.motion.*` in the driver config) and the\nbuilt-in `signature_arc`. Reduced motion always wins.",

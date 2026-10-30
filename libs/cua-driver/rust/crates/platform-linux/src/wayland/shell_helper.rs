@@ -600,6 +600,37 @@ pub fn set_session_label(label: &str) {
     let _ = gdbus_call("SetSessionLabel", &[label.to_owned()]);
 }
 
+/// Helper v11 keeps identity per private cursor key; older helpers retain the
+/// text-only compatibility path. The helper never receives an avatar URL.
+pub fn set_session_identity(key: &str, label: &str, avatar_png: &str, authoritative: bool) {
+    if shell_owner_with_min_version(Some(11)).is_some() {
+        let _ = gdbus_call(
+            "SetSessionIdentity",
+            &[
+                key.to_owned(),
+                label.to_owned(),
+                avatar_png.to_owned(),
+                authoritative.to_string(),
+            ],
+        );
+    } else {
+        use std::collections::BTreeMap;
+        use std::sync::{Mutex, OnceLock};
+        static LABELS: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+        let labels = LABELS.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let visible = labels.lock().ok().map(|mut labels| {
+            if authoritative {
+                if labels.len() >= 64 && !labels.contains_key(key) {
+                    labels.pop_first();
+                }
+                labels.insert(key.to_owned(), label.to_owned());
+            }
+            labels.get(key).cloned().unwrap_or_else(|| label.to_owned())
+        });
+        set_session_label(visible.as_deref().unwrap_or(label));
+    }
+}
+
 /// Hide the agent cursor.
 pub fn hide_cursor() {
     let _ = gdbus_call("HideCursor", &[]);
@@ -712,7 +743,7 @@ mod tests {
     #[test]
     fn bundled_helper_uses_host_owned_modifier_badge_chips() {
         assert!(EXTENSION_SOURCE.contains("GetVersion()"));
-        assert!(EXTENSION_SOURCE.contains("return 10;"));
+        assert!(EXTENSION_SOURCE.contains("return 11;"));
         assert!(EXTENSION_SOURCE.contains("SetCursorState"));
         assert!(EXTENSION_SOURCE.contains("SetCursorColor"));
         assert!(EXTENSION_SOURCE.contains("SetSessionLabel"));
@@ -737,7 +768,7 @@ mod tests {
         assert!(!EXTENSION_SOURCE.contains("function drawModifiers"));
         let metadata: serde_json::Value =
             serde_json::from_str(EXTENSION_METADATA).expect("valid bundled helper metadata");
-        assert_eq!(metadata["version"], 10);
+        assert_eq!(metadata["version"], 11);
 
         for action in [
             "idle", "observe", "click", "drag", "scroll", "text", "key", "navigate", "app",

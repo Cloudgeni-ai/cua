@@ -46,6 +46,7 @@ pub struct BadgeLabelLayout {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionBadgeLayout {
     pub rect: Rect,
+    pub avatar: Option<Rect>,
     pub corner_radius: f32,
     pub label: Option<BadgeLabelLayout>,
     pub delivery_chip: Option<BadgeChip>,
@@ -58,6 +59,7 @@ pub struct SessionBadgeLayout {
 
 #[derive(Debug, Clone, Copy)]
 pub struct SessionBadgeInput<'a> {
+    pub avatar: bool,
     pub label: Option<&'a str>,
     pub delivery: Option<DeliveryModifier>,
     pub target: Option<TargetModifier>,
@@ -207,7 +209,7 @@ fn cap_height(font: &fontdue::Font, font_size: f32) -> f32 {
     metrics.height as f32 + metrics.ymin as f32
 }
 
-fn rounded_rect(rect: Rect, radius: f32) -> Option<Path> {
+pub(crate) fn rounded_rect(rect: Rect, radius: f32) -> Option<Path> {
     const K: f32 = 0.552_284_8;
     let x = rect.x();
     let y = rect.y();
@@ -324,6 +326,11 @@ pub fn session_badge_layout(input: SessionBadgeInput<'_>) -> Option<SessionBadge
     let label_alpha = input.label_alpha.clamp(0.0, 1.0);
     let chip_alpha = input.chip_alpha.clamp(0.0, 1.0);
     let show_label = input.label.is_some() && label_alpha > 0.001;
+    let avatar_width = if show_label && input.avatar {
+        24.0 * scale
+    } else {
+        0.0
+    };
     let delivery = (chip_alpha > 0.001).then_some(input.delivery).flatten();
     let target = (chip_alpha > 0.001).then_some(input.target).flatten();
     let chip_count = usize::from(delivery.is_some()) + usize::from(target.is_some());
@@ -337,7 +344,8 @@ pub fn session_badge_layout(input: SessionBadgeInput<'_>) -> Option<SessionBadge
         1 => BADGE_CHIP_SIZE,
         _ => BADGE_CHIP_SIZE * 2.0 + BADGE_CHIP_GAP,
     } * scale;
-    let fixed_width = HORIZONTAL_PADDING * 2.0 * scale
+    let fixed_width = avatar_width
+        + HORIZONTAL_PADDING * 2.0 * scale
         + chip_width
         + if show_label && chip_count > 0 {
             BADGE_CHIP_GROUP_GAP * scale
@@ -388,8 +396,15 @@ pub fn session_badge_layout(input: SessionBadgeInput<'_>) -> Option<SessionBadge
     } else {
         0.0
     };
-    let content_width = text_width + group_gap + chip_width;
+    let content_width = avatar_width + text_width + group_gap + chip_width;
     let mut cursor_x = x + ((badge_width - content_width) * 0.5).max(HORIZONTAL_PADDING * scale);
+    let avatar = if avatar_width > 0.0 {
+        let rect = Rect::from_xywh(cursor_x, y + 4.0 * scale, 20.0 * scale, 20.0 * scale);
+        cursor_x += avatar_width;
+        rect
+    } else {
+        None
+    };
     // Vertically, names centre the font's cap height so every name shares
     // one baseline. Labels without lowercase (key combos such as ⌘A, whose
     // symbols reach below the baseline) centre their own ink instead. Both
@@ -439,6 +454,7 @@ pub fn session_badge_layout(input: SessionBadgeInput<'_>) -> Option<SessionBadge
 
     Some(SessionBadgeLayout {
         rect,
+        avatar,
         corner_radius,
         label,
         delivery_chip,
@@ -455,6 +471,7 @@ pub fn paint_session_badge(
     pixmap: &mut Pixmap,
     layout: &SessionBadgeLayout,
     session_fill: [u8; 4],
+    avatar: Option<&Pixmap>,
     alpha_scale: f32,
 ) {
     let Some(font) = font() else {
@@ -550,6 +567,23 @@ pub fn paint_session_badge(
         None,
     );
 
+    if let (Some(rect), Some(avatar)) = (layout.avatar, avatar) {
+        pixmap.draw_pixmap(
+            0,
+            0,
+            avatar.as_ref(),
+            &PixmapPaint {
+                opacity: alpha_scale * layout.label_alpha,
+                ..Default::default()
+            },
+            Transform::from_scale(
+                rect.width() / avatar.width() as f32,
+                rect.height() / avatar.height() as f32,
+            )
+            .post_translate(rect.x(), rect.y()),
+            None,
+        );
+    }
     if let Some(label) = &layout.label {
         let label_opacity = (alpha_scale * layout.label_alpha).clamp(0.0, 1.0);
         let text = text_layout(font, &label.text, FONT_SIZE * scale);
@@ -613,6 +647,7 @@ mod tests {
             let mut purple = Pixmap::new(width, height).unwrap();
             let mut hidden = Pixmap::new(width, height).unwrap();
             let layout = session_badge_layout(SessionBadgeInput {
+                avatar: false,
                 label: Some("Research run"),
                 delivery: Some(DeliveryModifier::Foreground),
                 target: Some(TargetModifier::Browser),
@@ -623,9 +658,9 @@ mod tests {
                 clip: Some((width as f32, height as f32)),
             })
             .unwrap();
-            paint_session_badge(&mut blue, &layout, [94, 192, 232, 255], 1.0);
-            paint_session_badge(&mut purple, &layout, [178, 132, 255, 255], 1.0);
-            paint_session_badge(&mut hidden, &layout, [94, 192, 232, 255], 0.0);
+            paint_session_badge(&mut blue, &layout, [94, 192, 232, 255], None, 1.0);
+            paint_session_badge(&mut purple, &layout, [178, 132, 255, 255], None, 1.0);
+            paint_session_badge(&mut hidden, &layout, [94, 192, 232, 255], None, 0.0);
             assert!(
                 blue.data().chunks_exact(4).any(|pixel| pixel[3] > 0),
                 "badge paints at {scale}x"
@@ -639,6 +674,7 @@ mod tests {
             // Without chips, only the pill paints, so the session colour must
             // tint the pill itself rather than just the chips.
             let pill_only = session_badge_layout(SessionBadgeInput {
+                avatar: false,
                 label: Some("Research run"),
                 delivery: None,
                 target: None,
@@ -651,8 +687,14 @@ mod tests {
             .unwrap();
             let mut pill_blue = Pixmap::new(width, height).unwrap();
             let mut pill_purple = Pixmap::new(width, height).unwrap();
-            paint_session_badge(&mut pill_blue, &pill_only, [94, 192, 232, 255], 1.0);
-            paint_session_badge(&mut pill_purple, &pill_only, [178, 132, 255, 255], 1.0);
+            paint_session_badge(&mut pill_blue, &pill_only, [94, 192, 232, 255], None, 1.0);
+            paint_session_badge(
+                &mut pill_purple,
+                &pill_only,
+                [178, 132, 255, 255],
+                None,
+                1.0,
+            );
             assert_ne!(pill_blue.data(), pill_purple.data(), "pill {scale}x");
         }
     }
@@ -660,6 +702,7 @@ mod tests {
     #[test]
     fn modifier_only_badge_is_compact_and_keeps_delivery_before_target() {
         let layout = session_badge_layout(SessionBadgeInput {
+            avatar: false,
             label: None,
             delivery: Some(DeliveryModifier::Background),
             target: Some(TargetModifier::Pixel),
@@ -682,6 +725,7 @@ mod tests {
     #[test]
     fn label_starts_at_the_leading_padding_with_no_reserved_marker() {
         let layout = session_badge_layout(SessionBadgeInput {
+            avatar: false,
             label: Some("Research run"),
             delivery: None,
             target: None,
@@ -737,6 +781,7 @@ mod tests {
         for scale in [1.0f32, 2.0, 3.0] {
             for &(text, foreground, caps) in cases {
                 let layout = session_badge_layout(SessionBadgeInput {
+                    avatar: false,
                     label: Some(text),
                     delivery: foreground.then_some(DeliveryModifier::Foreground),
                     target: None,
@@ -780,6 +825,7 @@ mod tests {
         for scale in [1.0f32, 2.0] {
             let origin_y = |text: &str| {
                 session_badge_layout(SessionBadgeInput {
+                    avatar: false,
                     label: Some(text),
                     delivery: None,
                     target: None,
@@ -812,6 +858,7 @@ mod tests {
     #[test]
     fn long_label_stays_inside_the_bounded_badge() {
         let layout = session_badge_layout(SessionBadgeInput {
+            avatar: false,
             label: Some("A very long public session label"),
             delivery: Some(DeliveryModifier::Foreground),
             target: Some(TargetModifier::Desktop),

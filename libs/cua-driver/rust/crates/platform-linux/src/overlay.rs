@@ -308,6 +308,14 @@ pub fn init(cfg: CursorConfig) {
         |event: cua_driver_core::cursor_events::CursorEvent| {
             use cua_driver_core::cursor_events::{CursorEvent, CursorEventPhase};
             let (session, cmd) = match event {
+                CursorEvent::SetSessionIdentity {
+                    session,
+                    label,
+                    avatar_png,
+                } => (
+                    session,
+                    OverlayCommand::SetSessionIdentity { label, avatar_png },
+                ),
                 CursorEvent::SetSessionLabel { session, label } => {
                     (session, OverlayCommand::SetSessionLabel(label))
                 }
@@ -548,15 +556,33 @@ fn dispatch_shell_helper_command(key: &str, cmd: &OverlayCommand, semantic: bool
         OverlayCommand::EndAction(action) if semantic => {
             crate::wayland::shell_helper::set_cursor_state(action.as_str(), "", "", false);
         }
-        OverlayCommand::SetSessionLabel(label) if semantic => {
-            // The helper has no hover reveal and draws one cursor, so the
-            // minimal badge never shows the name there.
+        OverlayCommand::SetSessionIdentity { label, avatar_png } if semantic => {
             let shown = cursor_overlay::badge_mode::active() == cursor_overlay::BadgeMode::Verbose;
-            crate::wayland::shell_helper::set_session_label(
+            crate::wayland::shell_helper::set_session_identity(
+                key,
                 cursor_overlay::sanitize_session_label(label)
                     .filter(|_| shown)
                     .as_deref()
                     .unwrap_or(""),
+                avatar_png
+                    .as_deref()
+                    .filter(|png| cursor_overlay::avatar::decode_avatar(png).is_some())
+                    .unwrap_or(""),
+                true,
+            );
+        }
+        OverlayCommand::SetSessionLabel(label) if semantic => {
+            // The helper has no hover reveal and draws one cursor, so the
+            // minimal badge never shows the name there.
+            let shown = cursor_overlay::badge_mode::active() == cursor_overlay::BadgeMode::Verbose;
+            crate::wayland::shell_helper::set_session_identity(
+                key,
+                cursor_overlay::sanitize_session_label(label)
+                    .filter(|_| shown)
+                    .as_deref()
+                    .unwrap_or(""),
+                "",
+                false,
             );
         }
         OverlayCommand::SetEnabled(false) => crate::wayland::shell_helper::hide_cursor(),
