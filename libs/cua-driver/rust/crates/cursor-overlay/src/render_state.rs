@@ -511,7 +511,7 @@ impl RenderStateCore {
         let acting = self.visual.resolved_action != CursorAction::Idle;
         match self.badge_mode() {
             BadgeMode::Verbose => {
-                (self.session_label.is_some()
+                ((self.display_label.is_some() || self.session_label.is_some())
                     && self.session_badge_secs < SESSION_BADGE_HOLD_SECS + SESSION_BADGE_FADE_SECS)
                     || self.badge_modifier_fade_secs.is_some()
                     || acting
@@ -528,7 +528,10 @@ impl RenderStateCore {
     /// Where the minimal badge's session name is heading: shown at rest while
     /// another agent cursor is on screen, hidden otherwise.
     fn minimal_name_target(&self) -> f32 {
-        if self.session_label.is_some() && self.peer_cursors_visible && !self.is_moving() {
+        if (self.display_label.is_some() || self.session_label.is_some())
+            && self.peer_cursors_visible
+            && !self.is_moving()
+        {
             1.0
         } else {
             0.0
@@ -725,7 +728,7 @@ impl RenderStateCore {
                 self.badge_modifier_fade_secs = Some(next);
             }
         }
-        if self.session_label.is_some() {
+        if self.display_label.is_some() || self.session_label.is_some() {
             self.session_badge_secs = (self.session_badge_secs + dt)
                 .min(SESSION_BADGE_HOLD_SECS + SESSION_BADGE_FADE_SECS);
         }
@@ -1670,6 +1673,27 @@ mod session_badge_and_action_tests {
             false,
         );
         assert_eq!(core.session_badge_secs, 0.5);
+    }
+
+    #[test]
+    fn identity_without_a_routing_label_uses_the_same_badge_clock_and_minimal_presence() {
+        let mut core = verbose_core();
+        core.apply_command_base(
+            OverlayCommand::SetSessionIdentity {
+                label: "Research agent".into(),
+                avatar_png: None,
+            },
+            false,
+            false,
+        );
+        assert!(core.session_label.is_none());
+        core.visible = true;
+        core.pos = (100.0, 100.0);
+        assert!(core.session_badge_needs_frame_tick());
+        core.tick_motion(0.25);
+        assert!(core.session_badge_secs > 0.0);
+        core.peer_cursors_visible = true;
+        assert_eq!(core.minimal_name_target(), 1.0);
     }
 
     /// The earlier badge, kept as `cursor.badges = verbose`.

@@ -77,6 +77,9 @@ platform-linux = { path = "../platform-linux" }
 
 [features]
 default = []
+# Embedders package the private worker without creating a Windows console.
+# Ordinary CLI distributions retain their console subsystem.
+windowless-worker = []
 # Local review builds may replace the production extension trust root with an
 # explicitly supplied Ed25519 public key. The build script rejects release
 # profiles and missing/invalid overrides; ordinary artifacts never enable it.

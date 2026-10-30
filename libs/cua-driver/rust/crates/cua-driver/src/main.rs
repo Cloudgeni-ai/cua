@@ -1,4 +1,8 @@
 #![recursion_limit = "256"]
+#![cfg_attr(
+    all(windows, feature = "windowless-worker"),
+    windows_subsystem = "windows"
+)]
 
 //! cua-driver-rs — cross-platform background computer-use automation daemon.
 //!

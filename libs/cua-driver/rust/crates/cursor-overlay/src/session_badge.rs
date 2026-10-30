@@ -574,6 +574,7 @@ pub fn paint_session_badge(
             avatar.as_ref(),
             &PixmapPaint {
                 opacity: alpha_scale * layout.label_alpha,
+                quality: tiny_skia::FilterQuality::Bicubic,
                 ..Default::default()
             },
             Transform::from_scale(
