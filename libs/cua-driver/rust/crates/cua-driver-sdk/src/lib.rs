@@ -2253,6 +2253,7 @@ mod tests {
         let public = format!("host-listing-{}", uuid::Uuid::new_v4());
         driver
             .start_session(StartSessionInput {
+                cursor_identity: None,
                 session: Some(public.clone()),
                 capture_scope: None,
                 cursor_theme: None,
@@ -3089,6 +3090,7 @@ mod tests {
         let driver = CuaDriver::connect(Some(socket)).unwrap();
         let output = driver
             .start_session(StartSessionInput {
+                cursor_identity: None,
                 session: Some("run-2".into()),
                 capture_scope: Some(cua_driver_contract::CaptureScope::Auto),
                 cursor_theme: None,

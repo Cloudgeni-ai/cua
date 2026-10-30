@@ -12,6 +12,7 @@
 //! - `SurfaceFit` — keeps each platform's overlay surface fitted to the live
 //!   display geometry, so screen-coordinate cursors stay on the pointer
 
+pub mod avatar;
 pub mod badge_glyphs;
 pub mod badge_mode;
 pub mod bezier;
@@ -405,6 +406,11 @@ pub enum OverlayCommand {
     },
     /// Set the sanitized public label shown beneath this cursor.
     SetSessionLabel(String),
+    /// Friendly display metadata; never changes the cursor's private key.
+    SetSessionIdentity {
+        label: String,
+        avatar_png: Option<String>,
+    },
     /// Keys of a combo the agent is pressing (such as `["cmd", "c"]`). The
     /// minimal badge shows it briefly; other badge modes ignore it.
     ShowKeyCombo(Vec<String>),

@@ -1385,6 +1385,56 @@ const FfiConverterTypeClipboardWriteOutput = (() => {
     return new FFIConverter();
 })();
 
+export type CursorDisplayIdentity = {
+    /**
+     * Friendly name shown on the cursor badge (at most 200 Unicode characters).
+     */
+    label: string,
+    /**
+     * Optional base64 PNG, at most 48 KiB encoded and 128 by 128 pixels.
+     * Invalid images fall back to the name. No URL or file is fetched.
+     */
+    avatarPng?: string
+}
+
+/**
+ * Generated factory for {@link CursorDisplayIdentity} record objects.
+ */
+export const CursorDisplayIdentity = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<CursorDisplayIdentity, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<CursorDisplayIdentity>,
+    });
+})();
+
+const FfiConverterTypeCursorDisplayIdentity = (() => {
+    type TypeName = CursorDisplayIdentity;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                label: FfiConverterString.read(from),
+                avatarPng: FfiConverterOptionalString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterString.write(value.label, into);
+            FfiConverterOptionalString.write(value.avatarPng, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterString.allocationSize(value.label) +
+             FfiConverterOptionalString.allocationSize(value.avatarPng);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 /**
  * One cursor effect: `on`, `off`, or `default` (the style's own setting).
  */
@@ -5781,6 +5831,10 @@ const FfiConverterTypeSnapshotImage = (() => {
 
 export type StartSessionInput = {
     /**
+     * Optional renderer-only identity. Ownership continues to use `session`.
+     */
+    cursorIdentity?: CursorDisplayIdentity,
+    /**
      * Optional stable public label for this run (e.g. "research-run-1").
      * When omitted, the authenticated transport lease's implicit session is
      * created or returned.
@@ -5826,6 +5880,7 @@ const FfiConverterTypeStartSessionInput = (() => {
     class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
         read(from: RustBuffer): TypeName {
             return {
+                cursorIdentity: FfiConverterOptionalTypeCursorDisplayIdentity.read(from),
                 session: FfiConverterOptionalString.read(from),
                 captureScope: FfiConverterOptionalTypeCaptureScope.read(from),
                 cursorTheme: FfiConverterOptionalTypeCursorThemeSelection.read(from),
@@ -5833,13 +5888,15 @@ const FfiConverterTypeStartSessionInput = (() => {
             };
         }
         write(value: TypeName, into: RustBuffer): void {
+            FfiConverterOptionalTypeCursorDisplayIdentity.write(value.cursorIdentity, into);
             FfiConverterOptionalString.write(value.session, into);
             FfiConverterOptionalTypeCaptureScope.write(value.captureScope, into);
             FfiConverterOptionalTypeCursorThemeSelection.write(value.cursorTheme, into);
             FfiConverterOptionalTypeCursorMotionSelection.write(value.cursorMotion, into);
         }
         allocationSize(value: TypeName): number {
-            return FfiConverterOptionalString.allocationSize(value.session) +
+            return FfiConverterOptionalTypeCursorDisplayIdentity.allocationSize(value.cursorIdentity) +
+             FfiConverterOptionalString.allocationSize(value.session) +
              FfiConverterOptionalTypeCaptureScope.allocationSize(value.captureScope) +
              FfiConverterOptionalTypeCursorThemeSelection.allocationSize(value.cursorTheme) +
              FfiConverterOptionalTypeCursorMotionSelection.allocationSize(value.cursorMotion);
@@ -6728,6 +6785,9 @@ const FfiConverterOptionalTypeScrollBy = new FfiConverterOptional(FfiConverterTy
 // FfiConverter for EscalationReason | undefined
 const FfiConverterOptionalTypeEscalationReason = new FfiConverterOptional(FfiConverterTypeEscalationReason);
 
+// FfiConverter for CursorDisplayIdentity | undefined
+const FfiConverterOptionalTypeCursorDisplayIdentity = new FfiConverterOptional(FfiConverterTypeCursorDisplayIdentity);
+
 // FfiConverter for CaptureScope | undefined
 const FfiConverterOptionalTypeCaptureScope = new FfiConverterOptional(FfiConverterTypeCaptureScope);
 
@@ -6816,6 +6876,7 @@ export default Object.freeze({
     FfiConverterTypeClipboardWriteInput,
     FfiConverterTypeClipboardWriteOutput,
     FfiConverterTypeCursorAction,
+    FfiConverterTypeCursorDisplayIdentity,
     FfiConverterTypeCursorEffectSetting,
     FfiConverterTypeCursorMotionEffects,
     FfiConverterTypeCursorMotionEffectsOutput,

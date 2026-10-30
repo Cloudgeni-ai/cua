@@ -107,6 +107,11 @@ any copy serve every client:
 | 8       | The semantic `SetCursorState` contract; shipped by Cua Driver 0.34 |
 | 9       | `CaptureWindow(id,pid)`                                            |
 | 10      | `CaptureWindowPreview(id,pid,max_dimension)`                       |
+| 11 | Renderer-only per-cursor display name and inline PNG avatar (`SetSessionIdentity`). |
+
+The v11 name/avatar badge uses the same inline PNG as the native renderers.
+Older helpers remain text-only; they do not support per-cursor identity or
+hover-to-reveal. Layer-shell and X11 renderers use the shared native badge.
 
 Cua Driver 0.34 and earlier bundle v8 or older, and their installers overwrite
 an installed helper unconditionally. Running one of those installers after an app

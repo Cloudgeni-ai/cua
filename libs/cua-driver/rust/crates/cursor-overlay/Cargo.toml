@@ -9,6 +9,7 @@ default = []
 theme-authoring = []
 
 [dependencies]
+base64 = "0.22"
 cua-driver-contract = { path = "../cua-driver-contract" }
 # Motion math (paths, timing, effects geometry), shared with @trycua/cursor-motion.
 cua-cursor-motion = { path = "../cua-cursor-motion", features = ["serde"] }

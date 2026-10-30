@@ -22,6 +22,14 @@ The typed slice covers the cross-platform session lifecycle tools:
 - `list_sessions`
 - `end_session`
 
+`start_session.cursor_identity` optionally supplies a renderer-only `label`
+(up to 200 characters) and `avatar_png` (base64 PNG, up to 48 KiB encoded).
+It does not change session ownership, routing, history, or cursor colour.
+The shared desktop renderer shows the avatar beside the friendly label and
+keeps its existing fade and hover behavior. Invalid images fall back to the
+label. GNOME helper v11 supports the image; older helpers show text only, and
+the helper retains its existing single-cursor, no-hover limitation.
+
 Ordinary calls do not need `start_session`. The runtime creates one implicit
 session for the authenticated transport lease and reuses it until transport
 close, explicit end, or five minutes of inactivity. `escalate_session` and

@@ -188,6 +188,7 @@ async fn embedded_host_serves_sdk_and_mcp_with_one_contract() {
 
     let sdk_session = sdk
         .start_session(StartSessionInput {
+            cursor_identity: None,
             session: Some("embedded-sdk-window".into()),
             capture_scope: Some(CaptureScope::Window),
             cursor_theme: None,

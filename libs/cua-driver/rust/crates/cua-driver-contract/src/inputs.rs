@@ -343,6 +343,9 @@ impl ScrollBy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 pub struct StartSessionInput {
+    /// Optional renderer-only identity. Ownership continues to use `session`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_identity: Option<CursorDisplayIdentity>,
     /// Optional stable public label for this run (e.g. "research-run-1").
     /// When omitted, the authenticated transport lease's implicit session is
     /// created or returned.
@@ -368,6 +371,16 @@ pub struct StartSessionInput {
 
 impl ToolInput for StartSessionInput {
     const TOOL_NAME: &'static str = "start_session";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+pub struct CursorDisplayIdentity {
+    /// Friendly name shown on the cursor badge (at most 200 Unicode characters).
+    pub label: String,
+    /// Optional base64 PNG, at most 48 KiB encoded and 128 by 128 pixels.
+    /// Invalid images fall back to the name. No URL or file is fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_png: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]

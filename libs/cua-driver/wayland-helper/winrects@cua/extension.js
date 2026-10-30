@@ -23,6 +23,7 @@ const IFACE = `<node><interface name="org.cua.WinRects">
 <method name="SetCursorColor"><arg type="s" direction="in" name="fill_color"/></method>
 <method name="SetCursorState"><arg type="s" direction="in" name="action"/><arg type="s" direction="in" name="delivery"/><arg type="s" direction="in" name="target"/><arg type="b" direction="in" name="active"/></method>
 <method name="SetSessionLabel"><arg type="s" direction="in" name="label"/></method>
+<method name="SetSessionIdentity"><arg type="s" direction="in" name="key"/><arg type="s" direction="in" name="label"/><arg type="s" direction="in" name="avatar"/><arg type="b" direction="in" name="authoritative"/></method>
 <method name="HideCursor"></method>
 </interface></node>`;
 
@@ -735,6 +736,8 @@ export default class WinRectsExtension extends Extension {
       y_align: Clutter.ActorAlign.CENTER,
       style: 'font-size: 11px; font-weight: 600; color: white;',
     });
+    this._identities = new Map();
+    this._badgeAvatar = new St.Icon({ icon_size: 20, visible: false, y_align: Clutter.ActorAlign.CENTER });
     this._deliveryChip = new St.DrawingArea({
       width: BADGE_CHIP_SIZE,
       height: BADGE_CHIP_SIZE,
@@ -761,6 +764,7 @@ export default class WinRectsExtension extends Extension {
       can_focus: false,
       style: badgeStyle(this._fillColor),
     });
+    this._badge.add_child(this._badgeAvatar);
     this._badge.add_child(this._badgeLabel);
     this._badge.add_child(this._deliveryChip);
     this._badge.add_child(this._targetChip);
@@ -806,6 +810,10 @@ export default class WinRectsExtension extends Extension {
         }
       }
       if (this._badgeLabel) {
+        if (this._badgeAvatar) {
+          this._badgeAvatar.opacity = Math.round(255 * labelAlpha);
+          this._badgeAvatar.visible = labelAlpha > 0.001 && this._hasAvatar;
+        }
         this._badgeLabel.opacity = Math.round(255 * labelAlpha);
         if (labelAlpha <= 0.001 && this._badgeLabel.visible) {
           this._badgeLabel.hide();
@@ -861,7 +869,7 @@ export default class WinRectsExtension extends Extension {
     }
   }
   GetVersion() {
-    return 10;
+    return 11;
   }
   GetRects() {
     const actors = global.get_window_actors();
@@ -1087,6 +1095,27 @@ export default class WinRectsExtension extends Extension {
       this._positionBadge(this._cursorX, this._cursorY, 0);
       this._revealBadge();
     }
+  }
+  SetSessionIdentity(key, label, avatar, authoritative) {
+    if (!this._badgeAvatar || !this._identities || key.length > 512 || label.length > 400 || avatar.length > 49152) return;
+    // A routing-label event does not replace a previously supplied identity.
+    if (authoritative) {
+      this._identities.set(key, { label, avatar });
+    }
+    const identity = this._identities.get(key) ?? { label, avatar: '' };
+    if (this._identityKey === key && this._identityLabel === identity.label && this._identityAvatar === identity.avatar) return;
+    this._identityKey = key;
+    this._identityLabel = identity.label;
+    this._identityAvatar = identity.avatar;
+    this._hasAvatar = false;
+    try {
+      if (identity.avatar) {
+        this._badgeAvatar.gicon = new Gio.BytesIcon({ bytes: GLib.Bytes.new(GLib.base64_decode(identity.avatar)) });
+        this._hasAvatar = true;
+      }
+    } catch (_error) { /* name-only fallback */ }
+    this.SetSessionLabel(identity.label);
+    if (this._identities.size > 64) this._identities.delete(this._identities.keys().next().value);
   }
   _positionBadge(x, y, duration) {
     if (!this._badge) return;

@@ -2505,6 +2505,42 @@ class _UniffiFfiConverterTypeClipboardWriteOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.privacy_sensitive, buf)
         _UniffiFfiConverterBoolean.write(value.content_redacted_from_telemetry, buf)
 
+@dataclass
+class CursorDisplayIdentity:
+    def __init__(self, *, label:str, avatar_png:typing.Optional[str]):
+        self.label = label
+        self.avatar_png = avatar_png
+
+
+
+
+    def __str__(self):
+        return "CursorDisplayIdentity(label={}, avatar_png={})".format(self.label, self.avatar_png)
+    def __eq__(self, other):
+        if self.label != other.label:
+            return False
+        if self.avatar_png != other.avatar_png:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeCursorDisplayIdentity(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return CursorDisplayIdentity(
+            label=_UniffiFfiConverterString.read(buf),
+            avatar_png=_UniffiFfiConverterOptionalString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.label)
+        _UniffiFfiConverterOptionalString.check_lower(value.avatar_png)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterString.write(value.label, buf)
+        _UniffiFfiConverterOptionalString.write(value.avatar_png, buf)
+
 
 
 
@@ -7444,6 +7480,31 @@ class _UniffiFfiConverterTypeSnapshotImage(_UniffiConverterRustBuffer):
         _UniffiFfiConverterString.write(value.mime_type, buf)
         _UniffiFfiConverterString.write(value.data_base64, buf)
 
+class _UniffiFfiConverterOptionalTypeCursorDisplayIdentity(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeCursorDisplayIdentity.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeCursorDisplayIdentity.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeCursorDisplayIdentity.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 class _UniffiFfiConverterOptionalTypeCaptureScope(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -7521,7 +7582,8 @@ class _UniffiFfiConverterOptionalTypeCursorMotionSelection(_UniffiConverterRustB
 
 @dataclass
 class StartSessionInput:
-    def __init__(self, *, session:typing.Optional[str], capture_scope:typing.Optional[CaptureScope], cursor_theme:typing.Optional[CursorThemeSelection], cursor_motion:typing.Optional[CursorMotionSelection]):
+    def __init__(self, *, cursor_identity:typing.Optional[CursorDisplayIdentity], session:typing.Optional[str], capture_scope:typing.Optional[CaptureScope], cursor_theme:typing.Optional[CursorThemeSelection], cursor_motion:typing.Optional[CursorMotionSelection]):
+        self.cursor_identity = cursor_identity
         self.session = session
         self.capture_scope = capture_scope
         self.cursor_theme = cursor_theme
@@ -7531,8 +7593,10 @@ class StartSessionInput:
 
 
     def __str__(self):
-        return "StartSessionInput(session={}, capture_scope={}, cursor_theme={}, cursor_motion={})".format(self.session, self.capture_scope, self.cursor_theme, self.cursor_motion)
+        return "StartSessionInput(cursor_identity={}, session={}, capture_scope={}, cursor_theme={}, cursor_motion={})".format(self.cursor_identity, self.session, self.capture_scope, self.cursor_theme, self.cursor_motion)
     def __eq__(self, other):
+        if self.cursor_identity != other.cursor_identity:
+            return False
         if self.session != other.session:
             return False
         if self.capture_scope != other.capture_scope:
@@ -7547,6 +7611,7 @@ class _UniffiFfiConverterTypeStartSessionInput(_UniffiConverterRustBuffer):
     @staticmethod
     def read(buf):
         return StartSessionInput(
+            cursor_identity=_UniffiFfiConverterOptionalTypeCursorDisplayIdentity.read(buf),
             session=_UniffiFfiConverterOptionalString.read(buf),
             capture_scope=_UniffiFfiConverterOptionalTypeCaptureScope.read(buf),
             cursor_theme=_UniffiFfiConverterOptionalTypeCursorThemeSelection.read(buf),
@@ -7555,6 +7620,7 @@ class _UniffiFfiConverterTypeStartSessionInput(_UniffiConverterRustBuffer):
 
     @staticmethod
     def check_lower(value):
+        _UniffiFfiConverterOptionalTypeCursorDisplayIdentity.check_lower(value.cursor_identity)
         _UniffiFfiConverterOptionalString.check_lower(value.session)
         _UniffiFfiConverterOptionalTypeCaptureScope.check_lower(value.capture_scope)
         _UniffiFfiConverterOptionalTypeCursorThemeSelection.check_lower(value.cursor_theme)
@@ -7562,6 +7628,7 @@ class _UniffiFfiConverterTypeStartSessionInput(_UniffiConverterRustBuffer):
 
     @staticmethod
     def write(value, buf):
+        _UniffiFfiConverterOptionalTypeCursorDisplayIdentity.write(value.cursor_identity, buf)
         _UniffiFfiConverterOptionalString.write(value.session, buf)
         _UniffiFfiConverterOptionalTypeCaptureScope.write(value.capture_scope, buf)
         _UniffiFfiConverterOptionalTypeCursorThemeSelection.write(value.cursor_theme, buf)
@@ -8722,6 +8789,7 @@ __all__ = [
     "ClipboardReadOutput",
     "ClipboardWriteInput",
     "ClipboardWriteOutput",
+    "CursorDisplayIdentity",
     "CursorMotionEffects",
     "CursorMotionEffectsOutput",
     "CursorMotionOutput",

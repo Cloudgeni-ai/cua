@@ -121,6 +121,12 @@ async fn invoke(
             target.as_str(),
             active.parse::<bool>().map_err(|_| Failure::Reply)?
         )),
+        ("SetSessionIdentity", [key, label, avatar, authoritative]) => send!((
+            key.as_str(),
+            label.as_str(),
+            avatar.as_str(),
+            authoritative.parse::<bool>().map_err(|_| Failure::Reply)?
+        )),
         _ => return Err(Failure::Reply),
     };
     let body = reply.body();

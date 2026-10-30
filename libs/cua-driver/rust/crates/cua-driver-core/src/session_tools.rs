@@ -186,6 +186,16 @@ impl Tool for StartSessionTool {
             Err(result) => return result,
         };
         let requested = input.capture_scope;
+        if input.cursor_identity.as_ref().is_some_and(|identity| {
+            identity.label.chars().count() > 200
+                || identity
+                    .avatar_png
+                    .as_ref()
+                    .is_some_and(|png| png.len() > 48 * 1024)
+        }) {
+            return ToolResult::error("cursor identity exceeds its display bounds")
+                .with_structured(json!({ "code": "invalid_cursor_identity" }));
+        }
         let legacy_capture = requested.is_some();
         let public_label = public_label_of(&args);
         let owner = owner_transport_of(&args, &id);
@@ -254,6 +264,13 @@ impl Tool for StartSessionTool {
         // succeeded, so a failed declaration cannot revive render state.
         if revived {
             crate::session::fire_session_revive_for_owner(&id, &owner);
+        }
+        if let Some(identity) = input.cursor_identity {
+            crate::cursor_events::emit(crate::cursor_events::CursorEvent::SetSessionIdentity {
+                session: id.clone(),
+                label: identity.label,
+                avatar_png: identity.avatar_png,
+            });
         }
         let structured = serde_json::to_value(cua_driver_contract::StartSessionOutput {
             state: scope.output(&response_session_label(&args, &id)),
@@ -586,6 +603,27 @@ mod tests {
         assert_eq!(session_id_of(&json!({})), None);
         assert_eq!(session_id_of(&json!({ "session": "" })), None);
         assert_eq!(session_id_of(&json!({ "session": "default" })), None);
+    }
+
+    #[tokio::test]
+    async fn display_identity_is_bounded_and_never_replaces_session_ownership() {
+        let id = format!("session-tool-identity-{}", uuid::Uuid::new_v4());
+        let result = StartSessionTool
+            .invoke(json!({
+                "session": id,
+                "cursor_identity": {"label": "Research agent", "avatar_png": "invalid-image"}
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(result.structured_content.as_ref().unwrap()["session"], id);
+        EndSessionTool.invoke(json!({"session": id})).await;
+        let invalid = StartSessionTool
+            .invoke(json!({
+                "session": "identity-too-large",
+                "cursor_identity": {"label": "x".repeat(201)}
+            }))
+            .await;
+        assert_eq!(result_code(&invalid), Some("invalid_cursor_identity"));
     }
 
     #[tokio::test]

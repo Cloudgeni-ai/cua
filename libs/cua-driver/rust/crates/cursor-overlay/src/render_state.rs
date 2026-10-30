@@ -169,6 +169,10 @@ pub struct RenderStateCore {
     pub pinned_wid: Option<u64>,
     /// Sanitized caller-facing label painted below the cursor.
     pub session_label: Option<String>,
+    /// Caller-supplied identity wins over the opaque routing label.
+    pub display_label: Option<String>,
+    pub avatar_png: Option<String>,
+    pub avatar: Option<tiny_skia::Pixmap>,
     /// Elapsed time since the session label was revealed with the cursor.
     pub session_badge_secs: f64,
     /// Whether the user's hardware pointer is currently over this synthetic
@@ -243,6 +247,9 @@ impl RenderStateCore {
             pinned_wid: None,
             pinned_target_off_workspace: false,
             session_label: None,
+            display_label: None,
+            avatar_png: None,
+            avatar: None,
             session_badge_secs: SESSION_BADGE_HOLD_SECS + SESSION_BADGE_FADE_SECS,
             session_badge_hovered: false,
             badge_modifiers: None,
@@ -427,7 +434,7 @@ impl RenderStateCore {
     }
 
     fn reveal_session_badge(&mut self) {
-        if self.session_label.is_some() {
+        if self.display_label.is_some() || self.session_label.is_some() {
             self.session_badge_secs = 0.0;
         }
     }
@@ -440,7 +447,7 @@ impl RenderStateCore {
 
     /// Opacity of the session name.
     pub fn session_badge_alpha(&self) -> f32 {
-        if self.session_label.is_none() {
+        if self.display_label.is_none() && self.session_label.is_none() {
             return 0.0;
         }
         match self.badge_mode() {
@@ -504,7 +511,7 @@ impl RenderStateCore {
         let acting = self.visual.resolved_action != CursorAction::Idle;
         match self.badge_mode() {
             BadgeMode::Verbose => {
-                (self.session_label.is_some()
+                ((self.display_label.is_some() || self.session_label.is_some())
                     && self.session_badge_secs < SESSION_BADGE_HOLD_SECS + SESSION_BADGE_FADE_SECS)
                     || self.badge_modifier_fade_secs.is_some()
                     || acting
@@ -521,7 +528,10 @@ impl RenderStateCore {
     /// Where the minimal badge's session name is heading: shown at rest while
     /// another agent cursor is on screen, hidden otherwise.
     fn minimal_name_target(&self) -> f32 {
-        if self.session_label.is_some() && self.peer_cursors_visible && !self.is_moving() {
+        if (self.display_label.is_some() || self.session_label.is_some())
+            && self.peer_cursors_visible
+            && !self.is_moving()
+        {
             1.0
         } else {
             0.0
@@ -537,6 +547,7 @@ impl RenderStateCore {
         clip: Option<(f32, f32)>,
     ) -> SessionBadgeInput<'_> {
         let mut input = SessionBadgeInput {
+            avatar: false,
             label: None,
             delivery: None,
             target: None,
@@ -550,7 +561,11 @@ impl RenderStateCore {
             BadgeMode::Off => {}
             BadgeMode::Verbose => {
                 let (delivery, target) = self.badge_modifiers.unwrap_or((None, None));
-                input.label = self.session_label.as_deref();
+                input.label = self
+                    .display_label
+                    .as_deref()
+                    .or(self.session_label.as_deref());
+                input.avatar = self.avatar.is_some();
                 input.delivery = delivery;
                 input.target = target;
                 input.label_alpha = self.session_badge_alpha();
@@ -571,7 +586,11 @@ impl RenderStateCore {
                         input.chip_alpha = chip_alpha;
                     }
                     None => {
-                        input.label = self.session_label.as_deref();
+                        input.label = self
+                            .display_label
+                            .as_deref()
+                            .or(self.session_label.as_deref());
+                        input.avatar = self.avatar.is_some();
                         input.label_alpha = self.session_badge_alpha();
                     }
                 }
@@ -585,7 +604,9 @@ impl RenderStateCore {
     /// from [`Self::session_badge_needs_frame_tick`]: a faded badge needs hover
     /// hit-testing, not continuous 60 fps repainting.
     pub fn session_badge_needs_hover_poll(&self) -> bool {
-        self.badge_mode() != BadgeMode::Off && self.session_label.is_some() && self.is_revealed()
+        self.badge_mode() != BadgeMode::Off
+            && (self.display_label.is_some() || self.session_label.is_some())
+            && self.is_revealed()
     }
 
     /// Update hover state from a platform-native hardware pointer sample.
@@ -707,7 +728,7 @@ impl RenderStateCore {
                 self.badge_modifier_fade_secs = Some(next);
             }
         }
-        if self.session_label.is_some() {
+        if self.display_label.is_some() || self.session_label.is_some() {
             self.session_badge_secs = (self.session_badge_secs + dt)
                 .min(SESSION_BADGE_HOLD_SECS + SESSION_BADGE_FADE_SECS);
         }
@@ -1004,11 +1025,25 @@ impl RenderStateCore {
                 }
                 true
             }
+            OverlayCommand::SetSessionIdentity { label, avatar_png } => {
+                let label =
+                    Some(crate::sanitize_session_label(&label).unwrap_or_else(|| "Agent".into()));
+                let avatar_png = avatar_png.filter(|png| png.len() <= 48 * 1024);
+                if label != self.display_label || avatar_png != self.avatar_png {
+                    self.display_label = label;
+                    self.avatar = avatar_png.as_deref().and_then(crate::avatar::decode_avatar);
+                    self.avatar_png = avatar_png;
+                    self.session_badge_secs = 0.0;
+                }
+                true
+            }
             OverlayCommand::SetSessionLabel(label) => {
                 let session_label = crate::sanitize_session_label(&label);
                 if session_label != self.session_label {
                     self.session_label = session_label;
-                    self.session_badge_secs = 0.0;
+                    if self.display_label.is_none() {
+                        self.session_badge_secs = 0.0;
+                    }
                 }
                 true
             }
@@ -1370,6 +1405,7 @@ pub fn paint_cursor(
             pm,
             &layout,
             crate::session_fill_rgba(&core.cfg.cursor_id),
+            core.avatar.as_ref(),
             alpha_scale,
         );
     }
@@ -1585,6 +1621,80 @@ mod glide_duration_tests {
 mod session_badge_and_action_tests {
     use super::*;
     use crate::{CursorConfig, DeliveryModifier, TargetModifier};
+
+    #[test]
+    fn friendly_identity_survives_routing_labels_and_repeated_metadata() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let image = image::RgbaImage::from_pixel(32, 32, image::Rgba([50, 120, 200, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let png = STANDARD.encode(bytes.into_inner());
+        let identity = OverlayCommand::SetSessionIdentity {
+            label: "Research agent".into(),
+            avatar_png: Some(png),
+        };
+        let mut core = verbose_core();
+        core.apply_command_base(identity.clone(), false, false);
+        core.session_badge_secs = 0.75;
+        core.apply_command_base(identity, false, false);
+        core.apply_command_base(
+            OverlayCommand::SetSessionLabel("opaque-routing-key".into()),
+            false,
+            false,
+        );
+        assert_eq!(core.session_badge_secs, 0.75);
+        let input = core.session_badge_input((100.0, 100.0), 2.0, Some((400.0, 400.0)));
+        assert_eq!(input.label, Some("Research agent"));
+        assert!(input.avatar);
+        let layout = crate::session_badge_layout(input).unwrap();
+        assert!(layout.avatar.is_some());
+        assert_eq!(core.cfg.cursor_id, CursorConfig::default().cursor_id);
+
+        core.apply_command_base(
+            OverlayCommand::SetSessionIdentity {
+                label: "Updated name".into(),
+                avatar_png: Some("invalid".into()),
+            },
+            false,
+            false,
+        );
+        assert!(core.avatar.is_none());
+        assert_eq!(
+            core.session_badge_input((100.0, 100.0), 1.0, None).label,
+            Some("Updated name")
+        );
+        core.session_badge_secs = 0.5;
+        core.apply_command_base(
+            OverlayCommand::SetSessionIdentity {
+                label: "Updated name".into(),
+                avatar_png: Some("invalid".into()),
+            },
+            false,
+            false,
+        );
+        assert_eq!(core.session_badge_secs, 0.5);
+    }
+
+    #[test]
+    fn identity_without_a_routing_label_uses_the_same_badge_clock_and_minimal_presence() {
+        let mut core = verbose_core();
+        core.apply_command_base(
+            OverlayCommand::SetSessionIdentity {
+                label: "Research agent".into(),
+                avatar_png: None,
+            },
+            false,
+            false,
+        );
+        assert!(core.session_label.is_none());
+        core.visible = true;
+        core.pos = (100.0, 100.0);
+        assert!(core.session_badge_needs_frame_tick());
+        core.tick_motion(0.25);
+        assert!(core.session_badge_secs > 0.0);
+        core.peer_cursors_visible = true;
+        assert_eq!(core.minimal_name_target(), 1.0);
+    }
 
     /// The earlier badge, kept as `cursor.badges = verbose`.
     fn verbose_core() -> RenderStateCore {
