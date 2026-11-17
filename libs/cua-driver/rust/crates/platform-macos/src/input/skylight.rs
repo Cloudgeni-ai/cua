@@ -1433,6 +1433,10 @@ pub fn make_exact_window_key(target_pid: libc::pid_t, target_wid: u32) -> bool {
     let Some(post) = post_event_record_to_fn() else {
         return false;
     };
+    // A sheet attached to the target holds its focus: making the parent key
+    // at the WindowServer instead would leave AppKit's key window (the sheet)
+    // without the real key events that follow.
+    let target_wid = crate::ax::exact_target::key_window_for(target_pid, target_wid);
     let mut target_psn = [0u8; 8];
     if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
         return false;
