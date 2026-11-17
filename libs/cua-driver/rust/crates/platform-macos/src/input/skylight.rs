@@ -1603,10 +1603,14 @@ const ACTIVATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// A `false` return is not fatal: the caller proceeds with delivery regardless,
 /// because a target that never reports focus is exactly the case the pre-existing
 /// best-effort contract already covered.
+///
+/// A sheet attached to the target counts as the target holding focus (see
+/// [`crate::ax::exact_target::focus_holder_window`]): AppKit keeps the sheet
+/// key while it is up, so a real key event reaches it as it would a person's.
 fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
     let deadline = std::time::Instant::now() + ACTIVATION_WAIT_TIMEOUT;
     loop {
-        if crate::ax::bindings::focused_window_id_of_pid(pid) == Some(window_id) {
+        if crate::ax::exact_target::focus_holder_window(pid) == Some(window_id) {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -1623,8 +1627,11 @@ fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
 /// is proven.
 fn focus_failure_hint(pid: libc::pid_t, target_wid: u32) -> String {
     let target = crate::windows::window_info_by_id(target_wid);
-    let focused =
-        crate::ax::bindings::focused_window_id_of_pid(pid).filter(|focused| *focused != target_wid);
+    // A sheet of the target is the target's own focus, never another window.
+    let focused = crate::ax::bindings::focused_window_id_of_pid(pid).filter(|focused| {
+        *focused != target_wid
+            && crate::ax::exact_target::focus_holder_window(pid) != Some(target_wid)
+    });
     focus_failure_hint_from(
         target.as_ref().map(|window| {
             window.is_on_screen && window.bounds.width >= 2.0 && window.bounds.height >= 2.0
@@ -1685,7 +1692,7 @@ pub fn with_foreground_hid_activation(
         anyhow::bail!("could not resolve target window for foreground HID delivery");
     }
 
-    let focused_window_id = crate::ax::bindings::focused_window_id_of_pid(target_pid);
+    let focused_window_id = crate::ax::exact_target::focus_holder_window(target_pid);
     if preserves_exact_existing_focus(prev_ok, prev_psn, target_psn, focused_window_id, target_wid)
     {
         // Re-activating an already key exact window can clear Chromium's

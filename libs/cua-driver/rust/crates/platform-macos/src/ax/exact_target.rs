@@ -451,6 +451,43 @@ pub(crate) fn focused_sheet_owner_of_pid(
     }
 }
 
+/// The window that holds `pid`'s focus: its focused window, or, when that is
+/// a sheet, the window the sheet is attached to (see [`owning_window_id`]).
+/// A sheet is modal to its window and AppKit keeps it key while it is up, so
+/// a window showing a sheet still has the app's focus: real key events go
+/// to the sheet and menu commands act on that window's document. Callers
+/// that ask whether an exact window has focus use this; a sibling window,
+/// or a sheet whose parent is not proven, never stands for another window.
+///
+/// `None` when the app names no focused window or its reading was cut short.
+/// All of its requests share one [`super::bindings::FOCUS_READ_BUDGET`].
+pub(crate) fn focus_holder_window(pid: i32) -> Option<u32> {
+    let deadline = super::bindings::RequestDeadline::after(super::bindings::FOCUS_READ_BUDGET);
+    focus_holder_window_of_pid(pid, &|element| unsafe { deadline.admit(element) })
+}
+
+/// [`focus_holder_window`] with `admit` asked before each element's requests.
+pub(crate) fn focus_holder_window_of_pid(
+    pid: i32,
+    admit: &dyn Fn(AXUIElementRef) -> bool,
+) -> Option<u32> {
+    // SAFETY: every element created or copied here is released here.
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        let window = admit(app)
+            .then(|| copy_element_attr(app, "AXFocusedWindow"))
+            .flatten();
+        CFRelease(app as CFTypeRef);
+        let window = window?;
+        let holder = admit(window).then(|| owning_window_id(window, admit)).flatten();
+        CFRelease(window as CFTypeRef);
+        holder
+    }
+}
+
 /// Whether a sheet with this `AXIdentifier` acts on keys posted to its app.
 /// An Open or Save panel (`open-panel`, `save-panel`) does not: its file
 /// browser is served by another process, and keys posted to the app while it

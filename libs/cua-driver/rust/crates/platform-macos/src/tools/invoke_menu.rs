@@ -506,7 +506,7 @@ fn focus_exact_window(pid: i32, window_id: u32) -> Result<(), String> {
         if exact_window_is_ready(
             live_frontmost_pid(pid, window_id),
             pid,
-            crate::ax::bindings::focused_window_id_of_pid(pid),
+            crate::ax::exact_target::focus_holder_window(pid),
             window_id,
         ) {
             let since = stable_since.get_or_insert(now);
@@ -589,6 +589,9 @@ const ENABLE_POLL: Duration = Duration::from_millis(40);
 
 /// AppKit resolves document menus against its key/main window, not the ID
 /// supplied by a caller. Unknown or sibling context must fail before lookup.
+/// `focused` is the window holding the app's focus, with a sheet standing for
+/// the window it is attached to: while a sheet is up it is key and its window
+/// stays main, and the menu acts on that window's document.
 fn require_menu_window(
     requested: u32,
     focused: Option<u32>,
@@ -606,16 +609,20 @@ fn require_menu_window(
 }
 
 unsafe fn require_live_menu_window(
+    pid: i32,
     app: AXUIElementRef,
     requested: u32,
 ) -> Result<(), BackgroundPressError> {
-    let read = |name| {
-        let window = copy_element_attr(app, name)?;
+    let main = copy_element_attr(app, "AXMainWindow").and_then(|window| {
         let id = ax_get_window_id(window);
         CFRelease(window as CFTypeRef);
         id
-    };
-    require_menu_window(requested, read("AXFocusedWindow"), read("AXMainWindow"))
+    });
+    require_menu_window(
+        requested,
+        crate::ax::exact_target::focus_holder_window(pid),
+        main,
+    )
 }
 
 fn unbound_menu_window(
@@ -654,7 +661,7 @@ unsafe fn invoke_path_in_background(
         ));
     }
     set_messaging_timeout(app);
-    if let Err(error) = require_live_menu_window(app, window_id) {
+    if let Err(error) = require_live_menu_window(pid, app, window_id) {
         CFRelease(app as CFTypeRef);
         return Err(error);
     }
@@ -706,7 +713,7 @@ unsafe fn invoke_path_in_background(
             ));
         }
         set_messaging_timeout(app);
-        let bound = require_live_menu_window(app, window_id);
+        let bound = require_live_menu_window(pid, app, window_id);
         CFRelease(app as CFTypeRef);
         bound?;
         let error = perform_action(target, action);
