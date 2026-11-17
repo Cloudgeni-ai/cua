@@ -437,15 +437,35 @@ pub(crate) fn focused_sheet_owner_of_pid(
 /// `None` when the app names no focused window or its reading was cut short.
 /// All of its requests share one [`super::bindings::FOCUS_READ_BUDGET`].
 pub(crate) fn focus_holder_window(pid: i32) -> Option<u32> {
-    let deadline = super::bindings::RequestDeadline::after(super::bindings::FOCUS_READ_BUDGET);
-    focus_holder_window_of_pid(pid, &|element| unsafe { deadline.admit(element) })
+    focus_holder(pid).map(|focus| focus.holder)
 }
 
-/// [`focus_holder_window`] with `admit` asked before each element's requests.
-pub(crate) fn focus_holder_window_of_pid(
-    pid: i32,
-    admit: &dyn Fn(AXUIElementRef) -> bool,
-) -> Option<u32> {
+/// The window to make key so that `target` holds focus: the sheet attached
+/// to `target` when one has the app's focus, else `target` itself. Making the
+/// parent window key at the WindowServer while its sheet is up sends real key
+/// events to a window AppKit no longer lets take them.
+pub(crate) fn key_window_for(pid: i32, target: u32) -> u32 {
+    match focus_holder(pid) {
+        Some(focus) if focus.holder == target => focus.focused,
+        _ => target,
+    }
+}
+
+/// The app's focused window and the window holding focus with it (itself,
+/// or the window a focused sheet is attached to).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FocusHolder {
+    pub focused: u32,
+    pub holder: u32,
+}
+
+fn focus_holder(pid: i32) -> Option<FocusHolder> {
+    let deadline = super::bindings::RequestDeadline::after(super::bindings::FOCUS_READ_BUDGET);
+    focus_holder_of_pid(pid, &|element| unsafe { deadline.admit(element) })
+}
+
+/// [`focus_holder`] with `admit` asked before each element's requests.
+fn focus_holder_of_pid(pid: i32, admit: &dyn Fn(AXUIElementRef) -> bool) -> Option<FocusHolder> {
     // SAFETY: every element created or copied here is released here.
     unsafe {
         let app = AXUIElementCreateApplication(pid);
@@ -457,9 +477,13 @@ pub(crate) fn focus_holder_window_of_pid(
             .flatten();
         CFRelease(app as CFTypeRef);
         let window = window?;
-        let holder = admit(window).then(|| owning_window_id(window, admit)).flatten();
+        let focused = admit(window).then(|| ax_get_window_id(window)).flatten();
+        let holder = focused.and_then(|_| owning_window_id(window, admit));
         CFRelease(window as CFTypeRef);
-        holder
+        Some(FocusHolder {
+            focused: focused?,
+            holder: holder?,
+        })
     }
 }
 
