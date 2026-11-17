@@ -1592,6 +1592,10 @@ const ACTIVATION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_m
 /// app pays roughly one tick, long enough not to spin on the WindowServer.
 const ACTIVATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// How long foreground key delivery lets an activation land before sending
+/// keys to a sheet, whose focus is already reported before the app is front.
+const SHEET_ACTIVATION_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// Block until `target_wid` is the application's focused AX window, or the
 /// timeout expires. Returns whether that state was observed.
 ///
@@ -1711,6 +1715,9 @@ pub fn with_foreground_hid_activation(
         anyhow::bail!("WindowServer rejected foreground HID activation");
     }
 
+    // With a sheet up the app reports the target as holding focus before the
+    // activation lands, so the focus wait below has nothing to wait for.
+    let sheet_up = crate::ax::exact_target::key_window_for(target_pid, target_wid) != target_wid;
     make_exact_window_key(target_pid, target_wid);
     // A slow app (LibreOffice) can take longer than one wait to install its
     // key window: ask once more before giving up.
@@ -1726,6 +1733,9 @@ pub fn with_foreground_hid_activation(
             "exact target window did not become focused for foreground HID delivery{}",
             focus_failure_hint(target_pid, target_wid)
         );
+    }
+    if sheet_up {
+        crate::timing::sleep(SHEET_ACTIVATION_SETTLE);
     }
 
     let result = action();
