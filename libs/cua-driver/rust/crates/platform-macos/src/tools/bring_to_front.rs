@@ -69,6 +69,9 @@ struct ExactWindowObservation {
     workspace_frontmost_pid: Option<i32>,
     front_process_matches_target: Option<bool>,
     focused_window_id: Option<u32>,
+    /// The window holding focus: the focused window, or the window a focused
+    /// sheet is attached to.
+    focus_holder_window_id: Option<u32>,
     frontmost_ordinary_window_id: Option<u32>,
     process_front_window_on_display: Option<u32>,
     target_visible_ordinary: bool,
@@ -88,11 +91,17 @@ impl ExactWindowObservation {
     }
 
     fn exact_window_focused(self, window_id: u32) -> bool {
-        self.focused_window_id == Some(window_id)
+        self.focus_holder_window_id == Some(window_id)
     }
 
     fn exact_window_front_in_process_on_display(self, window_id: u32) -> bool {
-        self.target_visible_ordinary && self.process_front_window_on_display == Some(window_id)
+        // A focused sheet attached to the target sits above it and stands
+        // for it.
+        let front = self.process_front_window_on_display;
+        let front_is_targets_sheet = front.is_some()
+            && front == self.focused_window_id
+            && self.focus_holder_window_id == Some(window_id);
+        self.target_visible_ordinary && (front == Some(window_id) || front_is_targets_sheet)
     }
 
     fn exact_window_frontmost_ordinary(self, window_id: u32) -> bool {
@@ -203,10 +212,15 @@ fn observe_exact_window(pid: i32, window_id: u32) -> ExactWindowObservation {
         pid,
         window_id,
     );
+    let focused_window_id = crate::ax::bindings::focused_window_id_of_pid(pid);
+    let focus_holder_window_id = crate::ax::exact_target::focus_holder(pid)
+        .map(|focus| focus.holder)
+        .or(focused_window_id);
     ExactWindowObservation {
         workspace_frontmost_pid: crate::apps::frontmost_pid(),
         front_process_matches_target: crate::input::skylight::front_process_matches(pid, window_id),
-        focused_window_id: crate::ax::bindings::focused_window_id_of_pid(pid),
+        focused_window_id,
+        focus_holder_window_id,
         frontmost_ordinary_window_id,
         process_front_window_on_display,
         target_visible_ordinary,
@@ -551,6 +565,7 @@ mod tests {
             workspace_frontmost_pid,
             front_process_matches_target,
             focused_window_id,
+            focus_holder_window_id: focused_window_id,
             frontmost_ordinary_window_id,
             process_front_window_on_display: frontmost_ordinary_window_id,
             target_visible_ordinary,
@@ -566,6 +581,7 @@ mod tests {
             workspace_frontmost_pid: Some(42),
             front_process_matches_target: Some(true),
             focused_window_id,
+            focus_holder_window_id: focused_window_id,
             frontmost_ordinary_window_id: global_front_window_id,
             process_front_window_on_display,
             target_visible_ordinary: true,
@@ -642,6 +658,29 @@ mod tests {
                 7,
                 contested_observation(Some(7), Some(8), Some(8))
             ),
+            ExactOutcome::Partial
+        );
+    }
+
+    #[test]
+    fn a_focused_sheet_attached_to_the_target_counts_as_the_target() {
+        // Sheet 70 is attached to window 7: it has the app's focus and sits
+        // in front of 7.
+        let sheet_up = ExactWindowObservation {
+            focus_holder_window_id: Some(7),
+            ..contested_observation(Some(70), Some(70), Some(70))
+        };
+        assert_eq!(
+            classify_exact_outcome(true, 42, 7, sheet_up),
+            ExactOutcome::Activated
+        );
+        // A sheet on a sibling window does not.
+        let siblings_sheet = ExactWindowObservation {
+            focus_holder_window_id: Some(8),
+            ..contested_observation(Some(80), Some(80), Some(80))
+        };
+        assert_eq!(
+            classify_exact_outcome(true, 42, 7, siblings_sheet),
             ExactOutcome::Partial
         );
     }
