@@ -459,7 +459,7 @@ pub(crate) struct FocusHolder {
     pub holder: u32,
 }
 
-fn focus_holder(pid: i32) -> Option<FocusHolder> {
+pub(crate) fn focus_holder(pid: i32) -> Option<FocusHolder> {
     let deadline = super::bindings::RequestDeadline::after(super::bindings::FOCUS_READ_BUDGET);
     focus_holder_of_pid(pid, &|element| unsafe { deadline.admit(element) })
 }
