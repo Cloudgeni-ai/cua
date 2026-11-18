@@ -741,7 +741,19 @@ fn set_value_blocking(
 /// An element's AXValue as text: a CFString as-is, a CFNumber (a native
 /// slider's or stepper's value) as its number, so a numeric write reads back.
 fn read_value(element: AXUIElementRef) -> Option<String> {
-    unsafe { copy_stringish_attr(element, "AXValue") }.map(|value| value.state_value)
+    let value = unsafe { copy_stringish_attr(element, "AXValue") }?.state_value;
+    // A number that is not finite (a slider that reads NaN) says nothing
+    // about where the control is: it is unreadable, not a value that two
+    // reads can compare equal or unequal. Text that reads "NaN" is text.
+    if not_a_finite_number(&value) && unsafe { copy_string_attr(element, "AXValue") }.is_none() {
+        return None;
+    }
+    Some(value)
+}
+
+/// Whether a value read as a number is NaN or infinite.
+fn not_a_finite_number(value: &str) -> bool {
+    value.trim().parse::<f64>().is_ok_and(|n| !n.is_finite())
 }
 
 /// Roles whose AXValue is text, written as a CFString whatever it reads like.
@@ -987,8 +999,8 @@ const STEP_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
 fn step_to_value(element: AXUIElementRef, target: f64) -> bool {
     // Can't target precisely without feedback — bail if AXValue is unreadable.
     let mut current = match unsafe { copy_number_attr(element, "AXValue") } {
-        Some(v) => v,
-        None => return false,
+        Some(v) if v.is_finite() => v,
+        _ => return false,
     };
 
     // Half of the last observed step. Start near-zero so we never declare the
@@ -1015,9 +1027,12 @@ fn step_to_value(element: AXUIElementRef, target: f64) -> bool {
         // action, so give each step a short while to show.
         let deadline = std::time::Instant::now() + STEP_SETTLE;
         let next = loop {
+            // A value that stops reading as a finite number cannot be steered
+            // by: NaN never equals the last value, so it would look like a
+            // step every time and run the control to its end.
             let next = match unsafe { copy_number_attr(element, "AXValue") } {
-                Some(v) => v,
-                None => return false,
+                Some(v) if v.is_finite() => v,
+                _ => return false,
             };
             if next != current || std::time::Instant::now() >= deadline {
                 break next;
@@ -2434,6 +2449,16 @@ mod tests {
         assert!(!roles_list_options(&roles(&[])));
         assert!(!roles_list_options(&roles(&["AXStaticText", "AXImage"])));
         assert!(!roles_list_options(&[None]));
+    }
+
+    #[test]
+    fn a_number_that_is_not_finite_is_no_reading() {
+        for value in ["NaN", "nan", " inf", "-inf", "infinity"] {
+            assert!(not_a_finite_number(value), "{value}");
+        }
+        for value in ["0", "0.5", "100", "-3", "", "50 %", "Off"] {
+            assert!(!not_a_finite_number(value), "{value}");
+        }
     }
 
     #[test]

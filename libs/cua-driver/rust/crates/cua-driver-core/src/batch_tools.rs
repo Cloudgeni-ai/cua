@@ -959,8 +959,16 @@ async fn run_step(
         if !window.is_empty() {
             *context = window.clone();
         }
+        // A desktop-scoped step (a drag or click in get_desktop_state
+        // coordinates, keys to the frontmost app) names no window on purpose:
+        // the window earlier steps used would turn it into a window-scoped
+        // one at the wrong coordinates.
         let window_spec = if window.is_empty() {
-            context.clone()
+            if desktop_scoped(&args) {
+                WindowSpec::default()
+            } else {
+                context.clone()
+            }
         } else {
             window
         };
@@ -1443,6 +1451,11 @@ fn failure(
 fn with_phase(mut report: Value, phase: Phase) -> Value {
     report["phase"] = json!(phase.as_str());
     report
+}
+
+/// Whether a step's own arguments ask for desktop scope.
+fn desktop_scoped(args: &Value) -> bool {
+    args.get("scope").and_then(Value::as_str) == Some("desktop")
 }
 
 /// A step with a window by name, or one that relies on an inherited window

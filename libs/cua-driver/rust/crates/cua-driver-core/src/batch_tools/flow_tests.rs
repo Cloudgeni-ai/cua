@@ -559,6 +559,27 @@ async fn later_steps_inherit_the_window() {
 }
 
 #[tokio::test]
+async fn a_desktop_scoped_step_does_not_inherit_the_window() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"pid": 42, "window_id": 7, "steps": [
+            {"click": {"app": "Demo", "role": "textfield", "name": "Email"}},
+            {"drag": {"scope": "desktop", "from_x": 10, "from_y": 20, "to_x": 30, "to_y": 20}},
+            {"press_key": {"key": "tab"}}
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let dragged = &harness.calls("drag")[0];
+    assert_eq!(dragged["scope"], "desktop");
+    assert!(dragged.get("pid").is_none(), "{dragged}");
+    assert!(dragged.get("window_id").is_none(), "{dragged}");
+    // A later window step still gets the window the batch used.
+    let pressed = &harness.calls("press_key")[0];
+    assert_eq!(pressed["pid"], 42);
+    assert_eq!(pressed["window_id"], 7);
+}
+
+#[tokio::test]
 async fn a_popup_on_top_does_not_hide_the_main_window() {
     let harness = Harness::new();
     harness.ui.lock().unwrap().bubble_open = true;
