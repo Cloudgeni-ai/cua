@@ -2397,10 +2397,10 @@ fn hex_digit(n: u8) -> char {
 mod tests {
     use super::{
         apply_surface_trust, apply_verification_label, classify_write, confirms_combo_box,
-        file_name_needs_rename, is_file_name_cell, is_get_info_name_field, left_empty, moved, not_a_finite_number,
-        not_applied_result, outside_range, popup_option_subject, press_chooses_option,
-        refusal_result, roles_list_options, select_menu_open_refused, takes_text,
-        unnamed_option_press_refusal, write_not_applied, Refusal, SetValueOutcome,
+        file_name_needs_rename, is_file_name_cell, is_get_info_name_field, left_empty, moved,
+        not_a_finite_number, not_applied_result, outside_range, popup_option_subject,
+        press_chooses_option, refusal_result, roles_list_options, select_menu_open_refused,
+        takes_text, unnamed_option_press_refusal, write_not_applied, Refusal, SetValueOutcome,
         GET_INFO_RENAME_ROUTE, LIST_RENAME_ROUTE,
     };
 
