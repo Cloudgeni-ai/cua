@@ -32,6 +32,9 @@ const MAX_ADOPTION_DEPTH: usize = 6;
 /// adopted window.
 const MAX_ADOPTION_NODES: usize = 400;
 
+/// WindowServer layer of pop-up menus (`kCGPopUpMenuWindowLevel`).
+const POP_UP_MENU_WINDOW_LAYER: i32 = 101;
+
 /// Resolve the CGWindowID of the top-level AX window that owns `element`.
 ///
 /// Prefers the element's `AXWindow` attribute and falls back to a bounded
@@ -311,6 +314,28 @@ fn menu_over_window(menu: [f64; 4], window: [f64; 4]) -> bool {
         && mx + mw > wx
         && my < wy + wh
         && my + mh > wy
+}
+
+/// Whether a menu the app has open outside its windows, with screen frame
+/// `menu`, is the target window's (frame `window`, `None` when the target is
+/// not on screen). `others` are the frames of the app's other on-screen
+/// windows.
+///
+/// A menu open over the target is its. One open over none of the app's
+/// windows is the target's too: nothing else claims it. A context menu shown
+/// through accessibility (`AXShowMenu`) can open away from its element, at the
+/// pointer (seen with Home, a Catalyst app), so while the person works in
+/// another app the menu of a background window opens over that other app.
+/// A menu a person opens is always over the window they clicked, so a menu
+/// over another window of the app stays that window's.
+fn open_menu_is_the_windows(menu: [f64; 4], window: Option<[f64; 4]>, others: &[[f64; 4]]) -> bool {
+    let Some(window) = window else {
+        return false;
+    };
+    menu_over_window(menu, window)
+        || (menu[2] > 0.0
+            && menu[3] > 0.0
+            && !others.iter().any(|other| menu_over_window(menu, *other)))
 }
 
 /// Whether `element` sits under the application's own `AXMenuBar`: a bounded
@@ -619,6 +644,21 @@ pub fn gather_background_facts(
             let bounds = &window.bounds;
             [bounds.x, bounds.y, bounds.width, bounds.height]
         });
+    // The app's other windows a person can open a menu over. An open menu is
+    // itself a window of the app, at the pop-up menu level, so it is left out.
+    let other_window_frames: Vec<[f64; 4]> = windows
+        .iter()
+        .filter(|window| {
+            window.pid == pid
+                && window.window_id != window_id
+                && window.is_on_screen
+                && window.layer < POP_UP_MENU_WINDOW_LAYER
+        })
+        .map(|window| {
+            let bounds = &window.bounds;
+            [bounds.x, bounds.y, bounds.width, bounds.height]
+        })
+        .collect();
     // SAFETY: the application element is created and released here; window
     // elements are released inside ax_window_records; the caller guarantees
     // element_ptr stays retained.
@@ -647,10 +687,11 @@ pub fn gather_background_facts(
                 let in_menu_bar = window.is_none() && element_in_app_menu_bar(app, element);
                 // So does an item of a menu the app has open outside its
                 // windows (a web <select>'s list in WebKit, a context menu),
-                // when it is open over this window rather than another.
+                // when it is open over this window or over none of the app's
+                // windows, rather than over another.
                 let in_open_menu = window != Some(window_id)
                     && element_in_open_app_menu(element).is_some_and(|menu| {
-                        window_frame.is_some_and(|frame| menu_over_window(menu, frame))
+                        open_menu_is_the_windows(menu, window_frame, &other_window_frames)
                     });
                 element_ancestry(window, adopted, in_menu_bar, in_open_menu, window_id)
             });
@@ -783,6 +824,50 @@ mod tests {
         assert!(!menu_over_window(
             [-447.0, 1117.0, 86.0, 142.0],
             [0.0, 0.0, 0.0, 0.0]
+        ));
+    }
+
+    /// A context menu opened through accessibility can open at the pointer:
+    /// Home's, for a background window, opened over the app the person was
+    /// using. Over none of the app's windows, it is the target's; over
+    /// another of the app's windows, it stays that window's.
+    #[test]
+    fn an_open_menu_over_none_of_the_apps_windows_is_the_targets() {
+        use super::{menu_over_window, open_menu_is_the_windows};
+        let scenes = [2045.0, 210.0, 515.0, 1050.0];
+        let scene_editor = [2045.0, 473.0, 515.0, 524.0];
+        let at_pointer_over_another_app = [1180.0, 640.0, 160.0, 34.0];
+        // The overlap alone refused it.
+        assert!(!menu_over_window(at_pointer_over_another_app, scenes));
+        assert!(open_menu_is_the_windows(
+            at_pointer_over_another_app,
+            Some(scenes),
+            &[scene_editor]
+        ));
+        // Over the target, it is the target's even where it also covers
+        // another window.
+        let over_both = [2200.0, 600.0, 160.0, 34.0];
+        assert!(open_menu_is_the_windows(
+            over_both,
+            Some(scenes),
+            &[scene_editor]
+        ));
+        // Over another window of the app only, it is that window's.
+        let left = [0.0, 0.0, 500.0, 500.0];
+        let right = [600.0, 0.0, 500.0, 500.0];
+        let over_right = [700.0, 100.0, 150.0, 60.0];
+        assert!(!open_menu_is_the_windows(over_right, Some(left), &[right]));
+        assert!(open_menu_is_the_windows(over_right, Some(right), &[left]));
+        // A target that is not on screen, or a menu without a size.
+        assert!(!open_menu_is_the_windows(
+            at_pointer_over_another_app,
+            None,
+            &[]
+        ));
+        assert!(!open_menu_is_the_windows(
+            [1180.0, 640.0, 0.0, 0.0],
+            Some(scenes),
+            &[]
         ));
     }
 
