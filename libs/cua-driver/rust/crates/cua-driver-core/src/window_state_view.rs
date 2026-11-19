@@ -583,6 +583,12 @@ fn retain_elements(
                 .and_then(Value::as_u64)
                 .is_some_and(|i| keep.contains(&i))
         });
+        // The count says how many rows this response returns, so it follows
+        // the trimmed array (the typed output checks they agree).
+        let returned = elements.len();
+        if obj.contains_key("returned_element_count") {
+            obj.insert("returned_element_count".into(), json!(returned));
+        }
     }
 }
 
@@ -1434,6 +1440,31 @@ mod tests {
         assert!(s.get("tree_markdown").is_none());
         assert_eq!(s["elements"].as_array().unwrap().len(), 2);
         assert!(!text_of(&content).contains("AXButton"));
+    }
+
+    #[test]
+    fn elements_diff_counts_only_the_rows_it_returns() {
+        let window = 7005;
+        let (mut c1, mut s1) = payload("s000000c1", OLD);
+        apply(
+            &opts(json!({"tree_format": "elements"})),
+            &ctx(window),
+            &mut c1,
+            &mut s1,
+        );
+        let edited = OLD.replace("\"a\"", "\"ab\"");
+        let (mut c2, mut s2) = payload("s000000c2", &edited);
+        s2["returned_element_count"] = json!(2);
+        apply(
+            &opts(json!({"tree_format": "elements", "since": "latest"})),
+            &ctx(window),
+            &mut c2,
+            &mut s2,
+        );
+        assert_eq!(s2["since_status"], "diff");
+        let returned = s2["elements"].as_array().unwrap().len();
+        assert_eq!(returned, 1);
+        assert_eq!(s2["returned_element_count"], json!(returned));
     }
 
     #[test]
