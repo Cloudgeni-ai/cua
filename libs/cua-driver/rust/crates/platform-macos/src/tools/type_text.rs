@@ -1371,7 +1371,8 @@ fn type_text_in_key_window(
     if delivery_mode.is_foreground() {
         let screen_sharing_target = crate::input::keyboard::is_screen_sharing_pid(pid);
         if let Some(refusal) = synthesis_preflight(
-            if screen_sharing_target {
+            // Every app that forwards key codes is typed as physical keys.
+            if crate::input::keyboard::forwards_key_codes(pid) {
                 TextDeliveryRoute::PhysicalSynthesis
             } else {
                 TextDeliveryRoute::UnicodeSynthesis

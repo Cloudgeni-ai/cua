@@ -13,6 +13,7 @@ use foreign_types::ForeignType;
 
 const SCREEN_SHARING_BUNDLE_ID: &str = "com.apple.ScreenSharing";
 const SIMULATOR_BUNDLE_ID: &str = "com.apple.iphonesimulator";
+const IPHONE_MIRRORING_BUNDLE_ID: &str = "com.apple.ScreenContinuity";
 const SHIFT_KEY_CODE: u16 = 56;
 
 /// Default key down→up gap and inter-key pacing.
@@ -47,14 +48,17 @@ pub fn is_screen_sharing_pid(pid: i32) -> bool {
 }
 
 /// Apps that pass key presses on to another device as physical keys: Screen
-/// Sharing (to the remote Mac) and the iOS Simulator (to the simulated
-/// device's hardware keyboard). They forward each event's virtual key code
+/// Sharing (to the remote Mac), the iOS Simulator (to the simulated device's
+/// hardware keyboard) and iPhone Mirroring (to the paired iPhone). They
+/// forward each event's virtual key code
 /// and rebuild modifiers from modifier key transitions; the Unicode text a
 /// synthetic event carries and the modifier flags on its base key are
 /// dropped. So text sent the usual way (a Unicode payload on key code 0, the
 /// A key) arrives as "aaaa", and cmd+V as a plain "v" or nothing.
 fn forwards_key_codes_bundle_id(bundle_id: &str) -> bool {
-    is_screen_sharing_bundle_id(bundle_id) || bundle_id == SIMULATOR_BUNDLE_ID
+    is_screen_sharing_bundle_id(bundle_id)
+        || bundle_id == SIMULATOR_BUNDLE_ID
+        || bundle_id == IPHONE_MIRRORING_BUNDLE_ID
 }
 
 /// Whether `pid` forwards physical key codes (see
@@ -1209,6 +1213,14 @@ mod tests {
         assert!(forwards_key_codes_bundle_id("com.apple.ScreenSharing"));
         assert!(!forwards_key_codes_bundle_id("com.apple.TextEdit"));
         assert!(!forwards_key_codes_bundle_id("com.google.Chrome"));
+    }
+
+    /// iPhone Mirroring forwards key codes to the phone the same way: typed
+    /// text into the phone's Spotlight arrived as "aaaa", while the same
+    /// letters sent as their own key codes arrived intact.
+    #[test]
+    fn iphone_mirroring_forwards_key_codes() {
+        assert!(forwards_key_codes_bundle_id("com.apple.ScreenContinuity"));
     }
 
     /// A chord to an app that forwards key codes is real modifier presses
