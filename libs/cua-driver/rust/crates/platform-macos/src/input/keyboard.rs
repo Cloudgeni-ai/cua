@@ -14,6 +14,7 @@ use foreign_types::ForeignType;
 const SCREEN_SHARING_BUNDLE_ID: &str = "com.apple.ScreenSharing";
 const SIMULATOR_BUNDLE_ID: &str = "com.apple.iphonesimulator";
 const IPHONE_MIRRORING_BUNDLE_ID: &str = "com.apple.ScreenContinuity";
+const UTM_BUNDLE_ID: &str = "com.utmapp.UTM";
 const SHIFT_KEY_CODE: u16 = 56;
 
 /// Default key down→up gap and inter-key pacing.
@@ -49,8 +50,8 @@ pub fn is_screen_sharing_pid(pid: i32) -> bool {
 
 /// Apps that pass key presses on to another device as physical keys: Screen
 /// Sharing (to the remote Mac), the iOS Simulator (to the simulated device's
-/// hardware keyboard) and iPhone Mirroring (to the paired iPhone). They
-/// forward each event's virtual key code
+/// hardware keyboard), iPhone Mirroring (to the paired iPhone) and UTM (to the
+/// virtual machine's keyboard). They forward each event's virtual key code
 /// and rebuild modifiers from modifier key transitions; the Unicode text a
 /// synthetic event carries and the modifier flags on its base key are
 /// dropped. So text sent the usual way (a Unicode payload on key code 0, the
@@ -59,6 +60,7 @@ fn forwards_key_codes_bundle_id(bundle_id: &str) -> bool {
     is_screen_sharing_bundle_id(bundle_id)
         || bundle_id == SIMULATOR_BUNDLE_ID
         || bundle_id == IPHONE_MIRRORING_BUNDLE_ID
+        || bundle_id == UTM_BUNDLE_ID
 }
 
 /// Whether `pid` forwards physical key codes (see
@@ -1221,6 +1223,14 @@ mod tests {
     #[test]
     fn iphone_mirroring_forwards_key_codes() {
         assert!(forwards_key_codes_bundle_id("com.apple.ScreenContinuity"));
+    }
+
+    /// UTM turns each key event's key code into a key of the virtual
+    /// machine's keyboard: text typed into a Windows guest arrived as "aaaa",
+    /// while the same letters sent as their own keys arrived intact.
+    #[test]
+    fn utm_forwards_key_codes() {
+        assert!(forwards_key_codes_bundle_id("com.utmapp.UTM"));
     }
 
     /// A chord to an app that forwards key codes is real modifier presses
