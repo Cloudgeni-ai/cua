@@ -2310,6 +2310,79 @@ fn generic_editor_coordinates(fixture: &mut BrowserFixture) -> (f64, f64) {
     (x, y)
 }
 
+/// A new tab's address bar in a browser behind the user's app takes a typed
+/// address and Return loads it, without taking focus from the user's app. A
+/// Chromium window in the background reports no focused element until it is
+/// the key window, and the address used to go in through accessibility: the
+/// bar showed it, Return loaded nothing, and every step reported success.
+#[cfg(target_os = "macos")]
+fn run_new_tab_address_bar(spec: &BrowserSpec) {
+    let scenario = format!("macos-{}-new-tab-address-bar", spec.name);
+    let case = CaseSpec::delivered(
+        scenario.clone(),
+        spec.name.clone(),
+        "standalone-chromium-native-chrome",
+        "new_tab_type_address_return",
+        Targeting::NotApplicable,
+        Delivery::Background,
+        Scope::Window,
+        DriverRoute::MacosCgEventPid,
+        vec![
+            OracleKind::FixtureState,
+            OracleKind::Focus,
+            OracleKind::ZOrder,
+            OracleKind::NoLeakedInput,
+        ],
+    );
+    execute_case(case, |evidence| {
+        let mut fixture = launch_browser(spec, &scenario);
+        *evidence = recording_evidence(fixture.driver.recording_dir());
+        let destination = BrowserFixtureServer::start(&standalone_fixture_html());
+        let target = serde_json::json!({
+            "pid": fixture.pid as i64,
+            "window_id": fixture.window_id,
+        });
+        let with = |extra: serde_json::Value| {
+            let mut args = target.clone();
+            args.as_object_mut()
+                .expect("target args")
+                .extend(extra.as_object().expect("extra args").clone());
+            args
+        };
+        // Setup: the new tab, its address bar waiting for an address. Chrome
+        // activates itself when cmd+T opens a tab, so it is opened before
+        // the user's app is put in front.
+        let opened = fixture
+            .driver
+            .call("hotkey", with(serde_json::json!({ "keys": ["cmd", "t"] })));
+        assert!(!opened.is_error(), "cmd+T: {}", opened.raw);
+        thread::sleep(Duration::from_secs(2));
+
+        // The browser sits behind another app, as it does while the user
+        // works: then the address bar reports no focus.
+        run_with_background_oracles(&mut fixture, |fixture| {
+            let typed = fixture.driver.call(
+                "type_text",
+                with(serde_json::json!({ "text": destination.page_url() })),
+            );
+            assert!(!typed.is_error(), "type the address: {}", typed.raw);
+            assert_eq!(
+                typed.action_route(),
+                Some("synthetic_events"),
+                "the address bar takes keystrokes, not an accessibility insert: {}",
+                typed.raw
+            );
+            let submitted = fixture
+                .driver
+                .call("press_key", with(serde_json::json!({ "key": "return" })));
+            assert!(!submitted.is_error(), "Return: {}", submitted.raw);
+
+            wait_for_observed(&destination, "WEB_HARNESS_MARKER_v1");
+            Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
+        })
+    });
+}
+
 #[cfg(target_os = "macos")]
 fn run_generic_type_text_completion(spec: &BrowserSpec) {
     let scenario = format!(
@@ -4651,7 +4724,7 @@ fn run_capture_bound_pixel_click_background_refusal(spec: &BrowserSpec) {
                 "{}",
                 refused.raw
             );
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_secs(2));
             wait_for_text(&fixture.server, "lbl-counter", "counter=0");
             click_args = Some(args);
             Observation::refused(
@@ -5172,6 +5245,11 @@ standalone_browser_test!(standalone_browser_type_replace, run_type_replace);
 standalone_browser_test!(
     standalone_browser_native_omnibox_select_all,
     run_native_omnibox_select_all
+);
+#[cfg(target_os = "macos")]
+standalone_browser_test!(
+    standalone_browser_new_tab_address_bar,
+    run_new_tab_address_bar
 );
 #[cfg(target_os = "macos")]
 standalone_browser_test!(

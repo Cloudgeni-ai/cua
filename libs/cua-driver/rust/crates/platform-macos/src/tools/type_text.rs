@@ -291,14 +291,11 @@ impl Tool for TypeTextTool {
         // A Chromium browser's own text fields (the address bar) take an AX
         // insert as display text only: Return then submits nothing. They do
         // take keystrokes posted to the browser in the background, so those
-        // are typed instead (see type_text_in_key_window).
-        let chromium_native_field = !delivery_mode.is_foreground()
+        // are typed instead (see type_text_blocking, which decides whether
+        // the text goes to such a field once the window is key).
+        let chromium_background = !delivery_mode.is_foreground()
             && !used_pixel_focus
-            && is_chromium_identity(&apps::bundle_id_for_pid(pid).unwrap_or_default())
-            && matches!(
-                classify_target_web_area(pid, element_ptr, window_id),
-                WebAreaClassification::NonWebContent
-            );
+            && is_chromium_identity(&apps::bundle_id_for_pid(pid).unwrap_or_default());
 
         if let (Some((element, _)), Some(wid)) = (element_guard.as_ref(), window_id) {
             let center_guard = element.clone();
@@ -374,7 +371,8 @@ impl Tool for TypeTextTool {
                             keyboard_policy: blocking_policy,
                             explicit_target: element_ptr.is_some() || used_pixel_focus,
                             key_window_confirmed: false,
-                            browser_own_field: chromium_native_field,
+                            chromium_background,
+                            browser_own_field: false,
                         },
                     )
                 })
@@ -1270,6 +1268,10 @@ struct KeyboardRoute {
     /// call. An app that is not active reports no focused element even then
     /// (LibreOffice), so a missing focus is not a reason to refuse.
     key_window_confirmed: bool,
+    /// The text goes to a Chromium browser in the background, not to a field
+    /// a pixel click focused. Whether it goes to the browser's own field is
+    /// decided once the window is key (`browser_own_field`).
+    chromium_background: bool,
     /// The text goes to a Chromium browser's own field (the address bar) in
     /// the background, which shows an AX insert but never acts on it.
     browser_own_field: bool,
@@ -1311,8 +1313,21 @@ fn type_text_blocking(
     } else {
         None
     };
+    // Whether the text goes to the browser's own field is read only now. A
+    // Chromium window in the background reports no focused element until it
+    // is the key window: right after cmd+T the new tab's address bar had no
+    // focus to classify, so it was not taken for the browser's own field, and
+    // the key window then took an accessibility insert there that it showed
+    // but never submitted on Return.
+    let browser_own_field = route.browser_own_field
+        || (route.chromium_background
+            && matches!(
+                classify_target_web_area(pid, element_ptr_and_idx, route.window_id),
+                WebAreaClassification::NonWebContent
+            ));
     let route = KeyboardRoute {
         key_window_confirmed: _scope.is_some(),
+        browser_own_field,
         ..route
     };
     type_text_in_key_window(
@@ -1339,6 +1354,7 @@ fn type_text_in_key_window(
         keyboard_policy,
         explicit_target,
         key_window_confirmed,
+        chromium_background: _,
         browser_own_field,
     } = route;
     // Original field value before any rung drives read-back verification only.
@@ -1884,6 +1900,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
                 explicit_target: true,
                 key_window_confirmed: false,
+                chromium_background: false,
                 browser_own_field: true,
             },
         )
@@ -1904,6 +1921,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                 explicit_target: true,
                 key_window_confirmed: false,
+                chromium_background: false,
                 browser_own_field: true,
             },
         )
@@ -1962,6 +1980,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
                 explicit_target: false,
                 key_window_confirmed: false,
+                chromium_background: false,
                 browser_own_field: false,
             },
         );
@@ -1987,6 +2006,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                 explicit_target: false,
                 key_window_confirmed: false,
+                chromium_background: false,
                 browser_own_field: false,
             },
         )
@@ -2032,6 +2052,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                 explicit_target: false,
                 key_window_confirmed: false,
+                chromium_background: false,
                 browser_own_field: false,
             },
         )
