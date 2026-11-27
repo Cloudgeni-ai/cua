@@ -586,6 +586,49 @@ pub(crate) async fn focus_by_pixel(
                 .await?;
         }
     }
+    // An app that shows another device's screen (the iOS Simulator, Screen
+    // Sharing, iPhone Mirroring, UTM) leaves that device's fields out of its
+    // accessibility tree. Its own focused element is the device view, which
+    // covers every point, and focusing an element of it moves nothing on the
+    // device: the keys then went to whichever device field had the focus, or
+    // the focus step failed and nothing was typed. Only a click at the point
+    // moves the device's focus, so the point is clicked.
+    if pixel_focus_route(crate::input::keyboard::forwards_key_codes(pid))
+        == PixelFocusRoute::DeviceClick
+    {
+        let mut click_args = serde_json::json!({
+            "pid": pid, "x": x, "y": y,
+            "delivery_mode": if foreground { "foreground" } else { "background" },
+            "action": "press",
+        });
+        if let Some(wid) = window_id {
+            click_args["window_id"] = serde_json::json!(wid);
+        }
+        if let Some(ref s) = session {
+            click_args["session"] = serde_json::json!(s);
+        }
+        if let Some(ref s) = session_id {
+            click_args["_session_id"] = serde_json::json!(s);
+        }
+        if from_zoom {
+            click_args["from_zoom"] = serde_json::json!(true);
+        }
+        let click_tool = click::ClickTool::new(state.clone());
+        let click = click_tool.invoke(click_args);
+        let focus = if let Some(lease) = mutation_lease {
+            crate::background_mutation::with_held_lease(lease.pid, click).await
+        } else {
+            click.await
+        };
+        if focus.is_error == Some(true) {
+            return Err(cua_driver_core::protocol::ToolResult::error(format!(
+                "focus pixel-click at ({x:.0},{y:.0}) failed."
+            )));
+        }
+        // The device takes the tap a moment after the click is posted.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        return Ok(());
+    }
     // The requested field may already hold keyboard focus, for example after
     // a pixel hotkey Cmd+A. Any focus action is then redundant, and the real
     // click fallback would be destructive: Chromium's omnibox hit-tests to an
@@ -724,6 +767,40 @@ async fn focused_element_holds_point(
 /// reporting a zero-sized focused element escalates rather than false-confirms.
 fn point_within_rect([rx, ry, rw, rh]: [f64; 4], x: f64, y: f64) -> bool {
     rw > 0.0 && rh > 0.0 && x >= rx && x < rx + rw && y >= ry && y < ry + rh
+}
+
+/// How [`focus_by_pixel`] moves the keyboard focus to a point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PixelFocusRoute {
+    /// Focus the element under the point through accessibility, with the
+    /// foreground real-click fallback.
+    Accessibility,
+    /// Click the point: the app shows another device's screen, whose fields
+    /// accessibility cannot focus.
+    DeviceClick,
+}
+
+fn pixel_focus_route(forwards_key_codes: bool) -> PixelFocusRoute {
+    if forwards_key_codes {
+        PixelFocusRoute::DeviceClick
+    } else {
+        PixelFocusRoute::Accessibility
+    }
+}
+
+#[cfg(test)]
+mod pixel_focus_route_tests {
+    use super::{pixel_focus_route, PixelFocusRoute};
+
+    /// A Simulator sign-in sheet: pixel typing into its password field went
+    /// through an accessibility focus of the device view, which moved nothing
+    /// on the device, so the text went to the email field (or the focus step
+    /// failed). An app that forwards keys to a device clicks the point.
+    #[test]
+    fn a_device_screen_is_focused_by_a_click() {
+        assert_eq!(pixel_focus_route(true), PixelFocusRoute::DeviceClick);
+        assert_eq!(pixel_focus_route(false), PixelFocusRoute::Accessibility);
+    }
 }
 
 /// Default long-edge cap for screenshots; see [`DriverConfig::max_image_dimension`].
